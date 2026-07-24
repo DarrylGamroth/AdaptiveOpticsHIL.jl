@@ -6,4 +6,9 @@ simulations.
 """
 module AdaptiveOpticsHIL
 
+include("errors.jl")
+include("timing.jl")
+
+export AdaptiveOpticsHILError, Timing
+
 end
