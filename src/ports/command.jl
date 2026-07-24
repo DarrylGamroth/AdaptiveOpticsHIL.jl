@@ -661,26 +661,38 @@ outcome_credit_accounting(port::Union{
     CommandSubmissionPort,CommandCompletionPort}) =
     payload_pool_accounting(port.outcome_credit_pool)
 
+abstract type _AbstractCommandBridgeRoute end
+
+struct _DirectCommandBridgeRoute <: _AbstractCommandBridgeRoute end
+
+struct _PlantEventLoopCommandBridgeRoute{
+    L<:PreparedPlantEventLoop,
+} <: _AbstractCommandBridgeRoute
+    event_loop::L
+end
+
 struct PreparedCommandBridge{
     S<:CommandSubmissionPort,
     C<:CommandCompletionPort,
-    E<:PreparedCommandEndpoint}
+    E<:PreparedCommandEndpoint,
+    R<:_AbstractCommandBridgeRoute}
     submission::S
     completion::C
     endpoint::E
+    route::R
 end
 
+command_submission_port(bridge::PreparedCommandBridge) = bridge.submission
+command_completion_port(bridge::PreparedCommandBridge) = bridge.completion
+
 """
-Single-writer state for one command bridge and its core endpoint. Correlation
-storage is bounded by the paired completion-credit count.
+Single-writer state for one command bridge and its core command target.
+Correlation storage is bounded by the paired completion-credit count.
 """
 mutable struct CommandBridgeState{
-    E<:CommandEndpointState,
-    W<:CommandDispositionWorkspace,
+    S,
     D}
-    endpoint_state::E
-    disposition_workspace::W
-    descriptor_scratch::Base.RefValue{D}
+    target_state::S
     presentations::Memory{CommandPresentationID}
     descriptors::Memory{D}
     active::Memory{Bool}
@@ -689,10 +701,13 @@ mutable struct CommandBridgeState{
     has_stream_sequence::Bool
 end
 
-"""
-Bind a paired HIL command boundary to its exact prepared core endpoint.
-"""
-function prepare_command_bridge(
+"""Preallocated scratch for one single-writer command bridge."""
+struct CommandBridgeWorkspace{W,D}
+    disposition_workspace::W
+    descriptor_scratch::Base.RefValue{D}
+end
+
+function _validate_command_bridge_binding(
     ports::PreparedCommandPorts,
     endpoint::PreparedCommandEndpoint)
     submission = ports.submission
@@ -707,25 +722,47 @@ function prepare_command_bridge(
         command_schema_version(command_schema(endpoint)) ||
         throw(PortError(:command_bridge, :schema_version_mismatch,
             "command port schema version does not match the prepared core endpoint"))
-    return PreparedCommandBridge(
-        submission, ports.completion, endpoint)
+    return nothing
 end
 
-function CommandBridgeState(
-    bridge::PreparedCommandBridge;
-    initial_timestamp::PlantTimestamp=zero(PlantTimestamp))
-    endpoint_state =
-        CommandEndpointState(bridge.endpoint; initial_timestamp)
-    workspace = CommandDispositionWorkspace(bridge.endpoint)
+"""
+Bind a paired HIL command boundary directly to its exact standalone core
+endpoint.
+"""
+function prepare_command_bridge(
+    ports::PreparedCommandPorts,
+    endpoint::PreparedCommandEndpoint)
+    _validate_command_bridge_binding(ports, endpoint)
+    return PreparedCommandBridge(
+        ports.submission, ports.completion, endpoint,
+        _DirectCommandBridgeRoute())
+end
+
+"""
+Bind a paired HIL command boundary to the endpoint route owned by a prepared
+plant event loop. Core admission and application then share the event loop's
+single command state rather than a duplicate standalone endpoint state.
+"""
+function prepare_command_bridge(
+    ports::PreparedCommandPorts,
+    endpoint::PreparedCommandEndpoint,
+    event_loop::PreparedPlantEventLoop)
+    _validate_command_bridge_binding(ports, endpoint)
+    return PreparedCommandBridge(
+        ports.submission, ports.completion, endpoint,
+        _PlantEventLoopCommandBridgeRoute(event_loop))
+end
+
+function _command_bridge_state(
+    bridge::PreparedCommandBridge,
+    target_state)
     D = eltype(bridge.submission.ring.slots)
     capacity = payload_pool_capacity(
         bridge.submission.outcome_credit_pool)
     active = Memory{Bool}(undef, capacity)
     fill!(active, false)
     return CommandBridgeState(
-        endpoint_state,
-        workspace,
-        Ref{D}(),
+        target_state,
         Memory{CommandPresentationID}(undef, capacity),
         Memory{D}(undef, capacity),
         active,
@@ -734,10 +771,97 @@ function CommandBridgeState(
         false)
 end
 
-command_endpoint_state(state::CommandBridgeState) = state.endpoint_state
-command_disposition_workspace(state::CommandBridgeState) =
-    state.disposition_workspace
+function _command_bridge_workspace(
+    bridge::PreparedCommandBridge,
+    disposition_workspace)
+    D = eltype(bridge.submission.ring.slots)
+    return CommandBridgeWorkspace(
+        disposition_workspace, Ref{D}())
+end
+
+function CommandBridgeState(
+    bridge::PreparedCommandBridge{
+        <:Any,<:Any,<:Any,<:_DirectCommandBridgeRoute};
+    initial_timestamp::PlantTimestamp=zero(PlantTimestamp))
+    endpoint_state =
+        CommandEndpointState(bridge.endpoint; initial_timestamp)
+    return _command_bridge_state(bridge, endpoint_state)
+end
+
+function CommandBridgeWorkspace(
+    bridge::PreparedCommandBridge{
+        <:Any,<:Any,<:Any,<:_DirectCommandBridgeRoute})
+    workspace = CommandDispositionWorkspace(bridge.endpoint)
+    return _command_bridge_workspace(bridge, workspace)
+end
+
+function CommandBridgeState(
+    bridge::PreparedCommandBridge{
+        <:Any,<:Any,<:Any,<:_PlantEventLoopCommandBridgeRoute})
+    event_loop = bridge.route.event_loop
+    state = PlantEventLoopState(event_loop)
+    effective_command(event_loop, state, bridge.submission.endpoint)
+    return _command_bridge_state(bridge, state)
+end
+
+function CommandBridgeWorkspace(
+    bridge::PreparedCommandBridge{
+        <:Any,<:Any,<:Any,<:_PlantEventLoopCommandBridgeRoute})
+    event_loop = bridge.route.event_loop
+    workspace = PlantEventLoopWorkspace(event_loop)
+    return _command_bridge_workspace(bridge, workspace)
+end
+
+command_endpoint_state(
+    state::CommandBridgeState{<:CommandEndpointState}) =
+    state.target_state
+plant_event_loop_state(
+    state::CommandBridgeState{<:PlantEventLoopState}) =
+    state.target_state
+command_disposition_workspace(workspace::CommandBridgeWorkspace) =
+    workspace.disposition_workspace
+plant_event_loop_workspace(
+    workspace::CommandBridgeWorkspace{<:PlantEventLoopWorkspace}) =
+    workspace.disposition_workspace
 active_command_correlations(state::CommandBridgeState) = state.active_count
+
+command_bridge_event_loop(
+    ::PreparedCommandBridge{
+        <:Any,<:Any,<:Any,<:_DirectCommandBridgeRoute}) = nothing
+command_bridge_event_loop(
+    bridge::PreparedCommandBridge{
+        <:Any,<:Any,<:Any,<:_PlantEventLoopCommandBridgeRoute}) =
+    bridge.route.event_loop
+
+@inline function _admit_bridge_command!(
+    ::_DirectCommandBridgeRoute,
+    bridge::PreparedCommandBridge,
+    state::CommandBridgeState,
+    workspace::CommandBridgeWorkspace,
+    command::PlantCommand,
+    timestamp::PlantTimestamp)
+    return admit_plant_command!(
+        workspace.disposition_workspace,
+        bridge.endpoint,
+        state.target_state,
+        command,
+        timestamp)
+end
+
+@inline function _admit_bridge_command!(
+    route::_PlantEventLoopCommandBridgeRoute,
+    ::PreparedCommandBridge,
+    state::CommandBridgeState,
+    workspace::CommandBridgeWorkspace,
+    command::PlantCommand,
+    timestamp::PlantTimestamp)
+    return admit_plant_command!(
+        route.event_loop,
+        state.target_state,
+        workspace.disposition_workspace,
+        command,
+        timestamp)
+end
 
 @inline function _command_boundary_reason(
     bridge::PreparedCommandBridge,
@@ -856,9 +980,9 @@ end
 end
 
 function _insert_command_correlation!(
-    state::CommandBridgeState{E,W,D},
+    state::CommandBridgeState{S,D},
     presentation::CommandPresentationID,
-    descriptor::D) where {E,W,D}
+    descriptor::D) where {S,D}
     @inbounds for slot in eachindex(state.active)
         state.active[slot] && continue
         state.presentations[slot] = presentation
@@ -893,8 +1017,9 @@ credit and removes exactly one correlation record.
 function publish_command_dispositions!(
     bridge::PreparedCommandBridge,
     state::CommandBridgeState,
+    bridge_workspace::CommandBridgeWorkspace,
     publication_execution_ns::Int64)
-    workspace = state.disposition_workspace
+    workspace = bridge_workspace.disposition_workspace
     count = command_disposition_count(workspace)
 
     # Validate the whole batch before any publication so a missing correlation
@@ -925,8 +1050,9 @@ end
 
 function _try_insert_failed_admission_correlation!(
     state::CommandBridgeState,
+    bridge_workspace::CommandBridgeWorkspace,
     descriptor::CommandSubmissionDescriptor)
-    workspace = state.disposition_workspace
+    workspace = bridge_workspace.disposition_workspace
     count = command_disposition_count(workspace)
     @inbounds for index in count:-1:1
         disposition = command_disposition(workspace, index)
@@ -950,15 +1076,16 @@ then wrapped and published without making HIL types dependencies of the core.
 function process_next_command!(
     bridge::PreparedCommandBridge,
     state::CommandBridgeState,
+    workspace::CommandBridgeWorkspace,
     publication_execution_ns::Int64)
-    if command_disposition_count(state.disposition_workspace) != 0
+    if command_disposition_count(workspace.disposition_workspace) != 0
         publish_command_dispositions!(
-            bridge, state, publication_execution_ns)
+            bridge, state, workspace, publication_execution_ns)
     end
     result = try_take!(
-        state.descriptor_scratch, bridge.submission)
+        workspace.descriptor_scratch, bridge.submission)
     result.status == PortTransferSucceeded || return result
-    descriptor = state.descriptor_scratch[]
+    descriptor = workspace.descriptor_scratch[]
 
     boundary_reason =
         _command_boundary_reason(bridge, state, descriptor)
@@ -985,18 +1112,20 @@ function process_next_command!(
 
     local admission::PlantCommandAdmission
     try
-        admission = admit_plant_command!(
-            state.disposition_workspace,
-            bridge.endpoint,
-            state.endpoint_state,
+        admission = _admit_bridge_command!(
+            bridge.route,
+            bridge,
+            state,
+            workspace,
             command,
             submission.timing.receive_timestamp)
     catch
         has_core_outcome =
-            _try_insert_failed_admission_correlation!(state, descriptor)
+            _try_insert_failed_admission_correlation!(
+                state, workspace, descriptor)
         if has_core_outcome
             publish_command_dispositions!(
-                bridge, state, publication_execution_ns)
+                bridge, state, workspace, publication_execution_ns)
         else
             outcome = _boundary_command_outcome(
                 descriptor,
@@ -1011,6 +1140,6 @@ function process_next_command!(
     _insert_command_correlation!(
         state, command_presentation_id(admission), descriptor)
     publish_command_dispositions!(
-        bridge, state, publication_execution_ns)
+        bridge, state, workspace, publication_execution_ns)
     return PortResult(PortTransferSucceeded)
 end
