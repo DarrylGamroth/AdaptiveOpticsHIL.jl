@@ -719,9 +719,6 @@ function gate_report(
             counters["maximum_primary_occupancy"] >=
             contract["stall_frames"]
     end
-    maximum_lease_hold = maximum(
-        run["counters"]["maximum_product_lease_hold_ns"]
-        for run in fixed_reports)
     gates = Dict{String,Any}(
         "exact_cached_clock_replay" => Dict(
             "passed" => exact_replay["passed"]),
@@ -730,13 +727,6 @@ function gate_report(
         "fixed_arrivals_preserved_through_stall" => Dict(
             "passed" => stall_preserved,
             "stall_frames" => contract["stall_frames"]),
-        "product_lease_hold" => Dict(
-            "worst_observed_ns" => maximum_lease_hold,
-            "maximum_ns" => contract["workload"][
-                "maximum_lease_hold_time_ns"],
-            "passed" => maximum_lease_hold <=
-                contract["workload"][
-                    "maximum_lease_hold_time_ns"]),
         "instrumentation_allocation" => Dict(
             "observed_bytes" => instrumentation_bytes,
             "maximum_bytes" =>
@@ -784,6 +774,46 @@ function gate_report(
     end
     gates["all_evaluated_gates_passed"] = all(evaluated_passes)
     return gates
+end
+
+function observation_report(fixed_reports, contract)
+    maximum_lease_hold = maximum(
+        run["counters"]["maximum_product_lease_hold_ns"]
+        for run in fixed_reports)
+    maximum_primary_occupancy = maximum(
+        run["counters"]["maximum_primary_occupancy"]
+        for run in fixed_reports)
+    adapter_lead_misses = sum(
+        run["counters"]["adapter_lead_misses"]
+        for run in fixed_reports)
+    declared_lease_hold = contract["workload"][
+        "maximum_lease_hold_time_ns"]
+    return Dict{String,Any}(
+        "product_lease_hold" => Dict(
+            "worst_observed_ns" => maximum_lease_hold,
+            "declared_maximum_ns" => declared_lease_hold,
+            "within_declared_limit_in_this_campaign" =>
+                maximum_lease_hold <= declared_lease_hold,
+            "qualified_as_absolute_gate" => false,
+            "reason" =>
+                "Gate 4A records the delivery-contract maximum, but " *
+                "does not promote a single-sample maximum on an " *
+                "unpinned and non-isolated host into a production guarantee",
+        ),
+        "primary_completion_occupancy" => Dict(
+            "maximum_observed" => maximum_primary_occupancy,
+            "capacity" =>
+                contract["workload"]["primary_completion_capacity"],
+        ),
+        "adapter_lead" => Dict(
+            "misses" => adapter_lead_misses,
+            "declared_lead_time_ns" => contract["workload"][
+                "complete_product_lead_time_ns"],
+            "claim" =>
+                "observed under the deliberate RTC stall and ordinary " *
+                "unisolated-host scheduling",
+        ),
+    )
 end
 
 function summary_report(fixed_reports, saturation_reports)
@@ -964,6 +994,8 @@ function main(arguments=ARGS)
         "fixed_arrival_runs" => fixed_reports,
         "unpaced_saturation_runs" => saturation_reports,
         "gates" => gates,
+        "observations" =>
+            observation_report(fixed_reports, contract),
         "summary" =>
             summary_report(fixed_reports, saturation_reports),
     )

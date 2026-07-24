@@ -101,6 +101,14 @@ end
             1:second_result.checkpoint_count]
     @test deterministic_histogram_signature(first_result) ==
         deterministic_histogram_signature(second_result)
+    observations = observation_report(
+        [Dict("counters" => counter_snapshot(first_counters))],
+        contract)
+    @test !observations["product_lease_hold"][
+        "qualified_as_absolute_gate"]
+    @test observations["primary_completion_occupancy"][
+        "maximum_observed"] ==
+        first_counters.maximum_primary_occupancy
 
     unpaced_config = Harness.BoundaryRunConfig(
         samples=128, checkpoint_stride=128)

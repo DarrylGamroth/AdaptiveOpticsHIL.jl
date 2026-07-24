@@ -51,6 +51,7 @@ tail_claim = "p50, p90, and p99 require at least 10000 samples; p99.9 is promote
 absolute_latency_gate = "fixed-arrival p99 publication lateness and adapter observation delay must each be no more than one 500 us frame period, while product-ready to first command-responsive optical sample p99 must be no more than 1 ms"
 relative_latency_gate = "this first fixed-arrival Gate 4A artifact establishes the comparable baseline; no retroactive relative gate is evaluated"
 allocation_gate = "preconfigured clock/schedule/counter/histogram instrumentation adds zero warmed Julia heap bytes; the inclusive reduced-order core plus HIL boundary may use at most 16384 bytes per completed primary frame over a 1000-frame window"
+lease_hold_claim = "record the worst observed product-lease hold against the declared adapter-delivery maximum, but do not promote a single-sample maximum from this unpinned and non-isolated host into a Gate 4A production guarantee; exact quiescent lease accounting remains an acceptance gate"
 
 [workload]
 provider = "LinearReducedOrderAcquisitionModel"
