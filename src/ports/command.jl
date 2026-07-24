@@ -866,7 +866,7 @@ function _insert_command_correlation!(
         state.active[slot] = true
         state.active_count += 1
         return slot
-    end
+    end # COV_EXCL_LINE
     # Reserved outcome credit makes this unreachable through the public port
     # path; retain the guard for corrupted state.
     # COV_EXCL_START
@@ -937,7 +937,7 @@ function _try_insert_failed_admission_correlation!(
         _insert_command_correlation!(
             state, command_presentation_id(disposition), descriptor)
         return true
-    end
+    end # COV_EXCL_LINE
     return false
 end
 
