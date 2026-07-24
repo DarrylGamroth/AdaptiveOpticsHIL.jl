@@ -123,6 +123,38 @@ remain allocation-free. Inclusive serial event and routed-command steps have
 2 KiB allocation ceilings because they include the current core reduced-order
 event and event-loop admission work.
 
+## Qualified benchmark evidence
+
+The dedicated `benchmarks/` environment keeps HdrHistogram.jl and reporting
+dependencies out of the runtime package. Its maintained Gate 4A contract
+separates two questions over the same serial CPU, in-memory, reduced-order HIL
+boundary:
+
+- schedule-preserving 2 kHz fixed arrivals, including an injected fake-RTC
+  consumer stall while absolute offered deadlines continue; and
+- a separately labeled unpaced maximum-useful-throughput diagnostic.
+
+Fixed-arrival evidence records complete-product publication, adapter
+observation, RTC processing, command admission and application, first
+command-responsive optical sample, bounded occupancy, sequence continuity,
+drops/rejections, and quiescent lease/credit accounting. The artifact includes
+raw sparse HdrHistogram data, supported percentiles, the exact source and
+dependency revisions, machine/thread configuration, calibration, and claim
+limits. The benchmark does not qualify a transport, external RTC, GPU,
+multi-core placement, full optical propagation, or production instrument
+capacity. The
+[maintained Gate 4A artifact](benchmarks/results/gate4a/2026-07-24-serial-boundary.toml)
+contains the current qualified baseline.
+
+CI runs the short deterministic benchmark-contract suite. Durable evidence is
+generated deliberately from a clean revision with one Julia and BLAS thread:
+
+```sh
+julia --startup-file=no --project=benchmarks \
+    benchmarks/benchmark_gate4a_serial_boundary.jl \
+    --output benchmarks/results/gate4a/YYYY-MM-DD-serial-boundary.toml
+```
+
 ## Development sources
 
 This early-stage package pins its current unregistered dependencies by Git

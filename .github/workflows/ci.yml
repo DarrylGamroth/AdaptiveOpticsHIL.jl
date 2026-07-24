@@ -77,3 +77,30 @@ jobs:
 
       - name: Run two-owner ownership stress
         run: julia --project=. --startup-file=no test/ownership_concurrency.jl
+
+  benchmark-contract:
+    name: Gate 4A benchmark contract / Julia 1.12 / ubuntu
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      JULIA_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Julia
+        uses: julia-actions/setup-julia@v3
+        with:
+          version: "1.12"
+
+      - name: Cache Julia artifacts
+        uses: julia-actions/cache@v3
+
+      - name: Instantiate benchmark environment
+        run: julia --project=benchmarks --startup-file=no -e 'using Pkg; Pkg.instantiate()'
+
+      - name: Validate benchmark contract and deterministic smoke path
+        run: julia --project=benchmarks --startup-file=no benchmarks/test/runtests.jl

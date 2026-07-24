@@ -56,13 +56,14 @@ import ..AdaptiveOpticsHIL: AdaptiveOpticsHILError
 using ..Ownership: PayloadGenerationExhausted, PayloadLeaseRef
 using ..Ownership: PayloadPool, PayloadPoolExhausted, PayloadStatus
 using ..Ownership: PayloadTransitionSucceeded
-using ..Ownership: WrongPayloadSession
+using ..Ownership: RingAccounting, WrongPayloadSession
 using ..Ownership: RingClosed, RingEmpty, RingFull, RingStatus
 using ..Ownership: RingTransferSucceeded, SPSCDescriptorRing
 using ..Ownership: abort_payload!, consumer_payload, lease_payload!
 using ..Ownership: payload_pool_accounting, payload_pool_capacity
 using ..Ownership: payload_pool_id, payload_session_id, producer_payload
-using ..Ownership: queue_payload!, release_payload!, try_claim_payload!
+using ..Ownership: queue_payload!, release_payload!, ring_accounting
+using ..Ownership: try_claim_payload!
 import ..Ownership: _lease_state_status, _producer_submission_status
 import ..Ownership: _PAYLOAD_CONSUMER_LEASED, _PAYLOAD_PRODUCER_OWNED
 import ..Ownership: try_submit!, try_take!
@@ -70,6 +71,16 @@ import ..Ownership: try_submit!, try_take!
 include("ports/contracts.jl")
 include("ports/command.jl")
 include("ports/acquisition.jl")
+
+"""
+Return a point-in-time accounting snapshot for a port's bounded descriptor
+ring. The snapshot is allocation-free and does not transfer ownership.
+"""
+descriptor_accounting(port::Union{
+    CommandSubmissionPort,
+    CommandCompletionPort,
+    AcquisitionCompletionPort,
+})::RingAccounting = ring_accounting(port.ring)
 
 export PortError
 export RunSessionID, StreamSequence, PortSchemaID, PortSchemaVersion
@@ -125,6 +136,7 @@ export command_disposition_workspace, process_next_command!
 export publish_command_dispositions!, active_command_correlations
 export plant_event_loop_state, plant_event_loop_workspace
 export command_submission_port, command_completion_port
+export descriptor_accounting
 export try_submit!, try_take!
 
 export AcquisitionCompletion, AcquisitionCompletionPort

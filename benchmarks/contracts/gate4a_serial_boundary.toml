@@ -1,0 +1,100 @@
+schema_version = 1
+name = "gate4a_serial_cpu_boundary"
+evidence_class = "serial CPU in-memory reduced-order fixed-arrival and unpaced HIL boundary evidence"
+fixed_samples_per_run = 100000
+fixed_runs = 3
+saturation_samples_per_run = 100000
+saturation_runs = 3
+warmup_frames = 2000
+correctness_frames = 256
+allocation_frames = 1000
+minimum_samples_for_p99 = 10000
+minimum_samples_for_p99_9 = 100000
+histogram_lowest_ns = 1
+histogram_highest_ns = 60000000000
+histogram_significant_figures = 3
+checkpoint_stride = 1000
+stall_start_sequence = 50000
+stall_frames = 16
+max_instrumentation_alloc_bytes = 0
+max_inclusive_alloc_bytes_per_frame = 16384
+max_fixed_p99_publication_lateness_ns = 500000
+max_fixed_p99_observation_delay_ns = 500000
+max_fixed_p99_closed_loop_response_ns = 1000000
+
+scope_exclusions = [
+    "package import, preparation, first-use compilation, and durable artifact encoding",
+    "network, shared-memory, middleware, codec, or external RTC latency",
+    "progressive readout, camera-link, frame-grabber, or transport packet timing",
+    "parallel workers, CPU affinity, isolation, NUMA policy, interrupt placement, and process isolation",
+    "GPU submission, device residency, host-device transfer, and multi-GPU placement",
+    "full optical propagation, detector physics, production instrument scale, NFIRAOS, and MORFEO capacity",
+    "Gate 8 ring layout/generated-code hardening, lifecycle recovery, and soak claims",
+]
+
+[contract]
+question = "At a finite 2 kHz reduced-order WFS schedule, does the serial CPU HIL boundary retain every absolute offered deadline through an injected RTC-consumer stall, keep complete-product publication and closed-loop p99 within their declared bounds outside no hidden arrival pause, and reconcile every command outcome and payload/product lease; and what useful throughput does the identical boundary sustain when pacing is removed?"
+fixed_load_model = "schedule-preserving finite open-loop arrival schedule; simulator pacing follows absolute execution-clock deadlines while the in-memory RTC consumer is deliberately withheld for a bounded interval"
+fixed_arrival_model = "100000 absolute product-ready deadlines at first_ready_ns + (sequence - 1) * period_ns; cumulative offered work is derived from that schedule and clamped only at the declared finite run length"
+coordinated_omission_correction = false
+coordinated_omission_reason = "the absolute generator continues to count deadlines during the injected stall; no omitted arrival is reconstructed after the fact"
+saturation_load_model = "unpaced self-paced serial maximum-useful-throughput diagnostic over the same prepared plant, complete-product ports, leased command submissions, terminal outcomes, and fake controller"
+saturation_claim_limit = "unpaced results diagnose this one-process serial reduced-order boundary and are not fixed-arrival latency or external-RTC capacity evidence"
+timed_boundaries = "complete-product readiness to HIL publication; HIL publication to adapter observation; observation through command transfer; transfer through semantic admission; transfer through applied terminal outcome publication; and complete-product readiness through the first optical sample affected by the correlated command"
+unpaced_service_boundary = "adapter product observation before histogram recording and controller computation through the first optical sample affected by the correlated command"
+timer = "Clocks.SystemNanoClock for fixed-arrival pacing and execution-clock boundary timestamps; time_ns for unpaced controller service; recording a boundary value occurs after its end timestamp, while unpaced controller service and achieved throughput include instrumentation cost"
+correctness_oracle = "exact cached-clock replay; matched reduced-order control; equal-time core causality; monotonically contiguous product/command/outcome sequences; stall interval offered-count growth; bounded occupancy; and quiescent stop accounting"
+warmup_protocol = "compile the concrete SystemNanoClock boundary on a sacrificial slow schedule, discard it, then execute one unrecorded 2000-frame 2 kHz run; every recorded finite run is freshly prepared and armed afterward, while package import, preparation, compilation, and warmup are excluded"
+threading = "one Julia thread, one BLAS thread, and no package-owned worker"
+idle_policy = "the benchmark owner busy-spins on positive SerialDeadlinePending results; the runtime itself never sleeps or polls"
+tail_claim = "p50, p90, and p99 require at least 10000 samples; p99.9 is promoted only by the durable 100000-sample runs"
+absolute_latency_gate = "fixed-arrival p99 publication lateness and adapter observation delay must each be no more than one 500 us frame period, while product-ready to first command-responsive optical sample p99 must be no more than 1 ms"
+relative_latency_gate = "this first fixed-arrival Gate 4A artifact establishes the comparable baseline; no retroactive relative gate is evaluated"
+allocation_gate = "preconfigured clock/schedule/counter/histogram instrumentation adds zero warmed Julia heap bytes; the inclusive reduced-order core plus HIL boundary may use at most 16384 bytes per completed primary frame over a 1000-frame window"
+lease_hold_claim = "record the worst observed product-lease hold against the declared adapter-delivery maximum, but do not promote a single-sample maximum from this unpinned and non-isolated host into a Gate 4A production guarantee; exact quiescent lease accounting remains an acceptance gate"
+
+[workload]
+provider = "LinearReducedOrderAcquisitionModel"
+backend = "CPUBackend"
+numeric_type = "Float64"
+run_seed = 31744
+measurement_kind = "modal_residual"
+measurement_units = "metre"
+residual_kind = "modal_wavefront_error"
+calibration_revision = 1
+controller = "two-mode integral controller"
+controller_gain = 0.65
+primary_acquisition = "hil_wfs"
+primary_period_ns = 500000
+primary_exposure_ns = 100000
+optical_sample_period_ns = 100000
+feedback_acquisition = "hil_dm_feedback"
+feedback_period_ns = 750000
+feedback_phase_ns = 125000
+feedback_exposure_ns = 100000
+command_endpoint = "hil_dm"
+command_payload_elements = 2
+command_payload_bytes = 16
+command_payload_pool_capacity = 8
+command_submission_capacity = 8
+command_completion_capacity = 8
+primary_product_capacity = 64
+primary_completion_capacity = 64
+feedback_product_capacity = 64
+feedback_completion_capacity = 64
+complete_product_lead_time_ns = 500000
+maximum_lease_hold_time_ns = 2000000
+disturbance_amplitudes = [0.30, -0.22]
+disturbance_frequencies_hz = [19.0, 31.0]
+disturbance_offsets = [0.05, -0.03]
+disturbance_phases_rad = [0.2, -0.4]
+path_projection = [1.0, 0.0, 0.0, 1.0]
+sensor_operator = [1.0, 0.0, 0.0, 1.0]
+command_response = [1.0, 0.0, 0.0, 1.0]
+omitted_effects = [
+    "diffraction",
+    "spatial_aliasing",
+    "detector_noise",
+    "device_dynamics",
+    "coronagraph_propagation",
+]
