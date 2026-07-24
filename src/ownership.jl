@@ -2,9 +2,9 @@
     Ownership
 
 Fixed-capacity, transport-neutral ownership primitives for warmed HIL
-boundaries. Compact isbits descriptors cross a bounded single-producer,
-single-consumer ring; large mutable payloads remain in a separately prepared,
-generation-checked pool.
+boundaries. Compact, concrete, immutable descriptors cross a bounded
+single-producer, single-consumer ring; large mutable payloads remain in a
+separately prepared, generation-checked pool.
 
 Ring operations never wait, yield, retry, invoke callbacks, or allocate after
 preparation. An idle or retry policy belongs to the caller.
@@ -126,9 +126,11 @@ end
 """
     SPSCDescriptorRing{T}(capacity)
 
-Prepare fixed storage for `capacity` compact descriptors of isbits type `T`.
-Exactly one logical producer may call `try_submit!` and `close_ring!`; exactly
-one logical consumer may call `try_take!` or `try_take_batch!`.
+Prepare fixed storage for `capacity` compact descriptors of concrete immutable
+type `T`. The type must use Julia's inline array representation; it may contain
+immutable references such as stable `Symbol`-backed identities. Exactly one
+logical producer may call `try_submit!` and `close_ring!`; exactly one logical
+consumer may call `try_take!` or `try_take_batch!`.
 
 The owner restriction is stronger than task or thread identity: callers must
 not concurrently invoke one side from several tasks even if those tasks happen
@@ -141,10 +143,18 @@ struct SPSCDescriptorRing{T}
 end
 
 function SPSCDescriptorRing{T}(capacity::Integer) where {T}
-    isbitstype(T) || throw(OwnershipError(
+    isconcretetype(T) || throw(OwnershipError(
         :descriptor_ring,
-        :descriptor_not_isbits,
-        "SPSC descriptor type must be an isbits type"))
+        :abstract_descriptor,
+        "SPSC descriptor type must be concrete"))
+    ismutabletype(T) && throw(OwnershipError(
+        :descriptor_ring,
+        :mutable_descriptor,
+        "SPSC descriptor type must be immutable"))
+    Base.allocatedinline(T) || throw(OwnershipError(
+        :descriptor_ring,
+        :boxed_descriptor,
+        "SPSC descriptor type must use Julia's inline array representation"))
     capacity > 0 || throw(OwnershipError(
         :descriptor_ring,
         :invalid_capacity,
@@ -173,6 +183,29 @@ end
 
 """Return whether the producer has closed the ring to new submissions."""
 ring_is_closed(ring::SPSCDescriptorRing) = _ring_closed(ring.cursors)
+
+"""
+Internal producer-side availability check used to compose a descriptor-ring
+publication with other ownership transitions. The single-producer contract
+guarantees that capacity cannot decrease between this check and the producer's
+immediately following `try_submit!`; the consumer can only reclaim capacity.
+"""
+@inline function _producer_submission_status(ring::SPSCDescriptorRing)
+    cursors = ring.cursors
+    (@atomic :monotonic cursors.closed) == zero(UInt64) ||
+        return RingClosed
+
+    producer_sequence = @atomic :monotonic cursors.producer_sequence
+    consumer_sequence = cursors.producer_cached_consumer_sequence
+    occupancy = producer_sequence - consumer_sequence
+    if occupancy >= ring.capacity
+        consumer_sequence = @atomic :acquire cursors.consumer_sequence
+        cursors.producer_cached_consumer_sequence = consumer_sequence
+        occupancy = producer_sequence - consumer_sequence
+        occupancy >= ring.capacity && return RingFull
+    end
+    return RingTransferSucceeded
+end
 
 """
     close_ring!(ring)
@@ -394,7 +427,9 @@ payload_generation(lease::PayloadLeaseRef) = lease.generation
 Prepare a bounded pool over caller-supplied payload buffers. The container of
 payload references is copied, not the payload buffers themselves. The caller
 must relinquish mutation through retained aliases while a buffer is owned by
-the pool.
+the pool. `pool_id` must be unique among all pools in the same run/session;
+cross-pool uniqueness is a preparation responsibility rather than a global
+runtime registry.
 """
 struct PayloadPool{P}
     payloads::Memory{P}
