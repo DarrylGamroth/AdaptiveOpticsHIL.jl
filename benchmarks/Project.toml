@@ -1,0 +1,26 @@
+[deps]
+AdaptiveOpticsHIL = "c50291de-c366-4d66-93e5-abfdaae8bfec"
+AdaptiveOpticsSim = "002fb5eb-ad68-44a0-adbe-b299bfc2febc"
+Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
+Clocks = "6b5ade5d-6e95-4584-b343-73eec2e8782b"
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+HdrHistogram = "d0b8ac25-3072-4075-acf5-4a93ba78f71f"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[sources]
+AdaptiveOpticsHIL = {path = ".."}
+AdaptiveOpticsSim = {url = "https://github.com/DarrylGamroth/AdaptiveOpticsSim.jl.git", rev = "9ddb77d41b7bac748e62e123cf6a0ff289de3b45"}
+Clocks = {url = "https://github.com/DarrylGamroth/Clocks.jl.git", rev = "1b705421648b70b6d171f8a95d6c2d16c2444d0b"}
+HdrHistogram = {url = "https://github.com/DarrylGamroth/HdrHistogram.jl.git", rev = "5b800689d2be55bf4103fd51b38cf92859f74aa1"}
+
+[compat]
+AdaptiveOpticsHIL = "0.1"
+AdaptiveOpticsSim = "0.1"
+Clocks = "0.3"
+HdrHistogram = "0.4"
+Test = "1"
+julia = "1.12"

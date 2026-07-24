@@ -354,6 +354,15 @@ end
             completion_capacity=8)
         submission_port = command_submission_port(ports)
         completion_port = command_completion_port(ports)
+        submission_accounting =
+            @inferred descriptor_accounting(submission_port)
+        @test submission_accounting.capacity == 4
+        @test descriptor_accounting(completion_port).capacity == 8
+        @test submission_accounting.occupancy == 0
+        if !PORT_TESTS_WITH_COVERAGE
+            @test @allocated(
+                descriptor_accounting(submission_port)) == 0
+        end
         bridge = prepare_command_bridge(ports, endpoint)
         state = CommandBridgeState(bridge)
         bridge_workspace = CommandBridgeWorkspace(bridge)
@@ -1247,6 +1256,8 @@ end
     @test acquisition_delivery_contract(port) == delivery
     @test acquisition_product_contract(port) isa
         PORT_TEST_PLANT.AcquisitionProductContract
+    @test descriptor_accounting(port).capacity == 1
+    @test descriptor_accounting(port).occupancy == 0
 
     leases = (
         Ref(PayloadLeaseRef(0, 0, 0, 0)),
