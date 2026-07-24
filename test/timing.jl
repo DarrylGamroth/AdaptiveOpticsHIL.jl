@@ -59,6 +59,8 @@ end
         @test invalid_reading_error isa ExecutionClockError
         @test invalid_reading_error.component == :execution_clock
         @test invalid_reading_error.reason == :invalid_reading_type
+        @test sprint(showerror, invalid_reading_error) ==
+              "Clocks.time_nanos must return Int64 for an execution clock"
 
         clock = CachedNanoClock(0)
         mapping = arm_execution_clock(clock, PlantTimestamp(10))
