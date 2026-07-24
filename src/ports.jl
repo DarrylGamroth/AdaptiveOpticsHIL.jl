@@ -19,6 +19,8 @@ using AdaptiveOpticsSim.Plant: CommandDispositionReason
 using AdaptiveOpticsSim.Plant: CommandEndpointID, CommandEndpointState
 using AdaptiveOpticsSim.Plant: CommandDispositionWorkspace
 using AdaptiveOpticsSim.Plant: CommandPresentationID, CommandTerminalKind
+using AdaptiveOpticsSim.Plant: PlantEventLoopState
+using AdaptiveOpticsSim.Plant: PlantEventLoopWorkspace
 using AdaptiveOpticsSim.Plant: PlantCommand, PlantCommandAdmission
 using AdaptiveOpticsSim.Plant: PlantCommandDisposition
 using AdaptiveOpticsSim.Plant: PlantCommandSchemaID
@@ -26,6 +28,7 @@ using AdaptiveOpticsSim.Plant: PlantCommandSchemaVersion
 using AdaptiveOpticsSim.Plant: PlantCommandSequence
 using AdaptiveOpticsSim.Plant: PlantDuration, PlantTimestamp
 using AdaptiveOpticsSim.Plant: PreparedCommandEndpoint
+using AdaptiveOpticsSim.Plant: PreparedPlantEventLoop
 using AdaptiveOpticsSim.Plant: admit_plant_command!
 using AdaptiveOpticsSim.Plant: clear_command_dispositions!
 using AdaptiveOpticsSim.Plant: command_basis, command_basis_revision
@@ -43,6 +46,7 @@ using AdaptiveOpticsSim.Plant: command_schema_id, command_schema_version
 using AdaptiveOpticsSim.Plant: command_sequence
 using AdaptiveOpticsSim.Plant: command_terminal_kind
 using AdaptiveOpticsSim.Plant: command_terminal_timestamp
+using AdaptiveOpticsSim.Plant: effective_command
 using AdaptiveOpticsSim.Plant: plant_nanoseconds
 using AdaptiveOpticsSim.Plant: superseding_command_presentation_id
 using AdaptiveOpticsSim.Plant: validate_acquisition_product_contract
@@ -115,10 +119,11 @@ export outcome_terminal_kind, outcome_terminal_timestamp
 export outcome_requested_effective_timestamp, outcome_lateness
 export outcome_superseding_presentation_id, outcome_payload
 export release_outcome!, outcome_credit_accounting
-export PreparedCommandBridge, CommandBridgeState
+export PreparedCommandBridge, CommandBridgeState, CommandBridgeWorkspace
 export prepare_command_bridge, command_endpoint_state
 export command_disposition_workspace, process_next_command!
 export publish_command_dispositions!, active_command_correlations
+export plant_event_loop_state, plant_event_loop_workspace
 export command_submission_port, command_completion_port
 export try_submit!, try_take!
 
@@ -133,5 +138,6 @@ export try_publish!, release_product!, acquisition_product_accounting
 export acquisition_delivery_contract, acquisition_product_contract
 
 public CommandSubmissionDescriptor
+public command_bridge_event_loop
 
 end

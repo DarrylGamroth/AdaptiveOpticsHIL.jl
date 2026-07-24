@@ -103,23 +103,25 @@ end
 function finish_ready_command!(
     bridge,
     state,
+    bridge_workspace,
     timestamp,
     publication_execution_ns)
     endpoint_state = command_endpoint_state(state)
-    workspace = command_disposition_workspace(state)
+    workspace = command_disposition_workspace(bridge_workspace)
     claim = PORT_TEST_PLANT.claim_next_application_ready_command!(
         bridge.endpoint, endpoint_state, timestamp)
     @assert !isnothing(claim)
     PORT_TEST_PLANT.mark_plant_command_applied!(
         workspace, bridge.endpoint, endpoint_state, claim)
     return publish_command_dispositions!(
-        bridge, state, publication_execution_ns)
+        bridge, state, bridge_workspace, publication_execution_ns)
 end
 
 function inline_command_cycle!(
     ports,
     bridge,
     state,
+    bridge_workspace,
     outcome_ref,
     stream::Int,
     timestamp_ns::Int)
@@ -135,15 +137,15 @@ function inline_command_cycle!(
         submission,
         Int64(timestamp_ns + 1))
     process_result = process_next_command!(
-        bridge, state, Int64(timestamp_ns + 2))
+        bridge, state, bridge_workspace, Int64(timestamp_ns + 2))
     endpoint_state = command_endpoint_state(state)
-    workspace = command_disposition_workspace(state)
+    workspace = command_disposition_workspace(bridge_workspace)
     claim = PORT_TEST_PLANT.claim_next_application_ready_command!(
         bridge.endpoint, endpoint_state, timestamp)
     PORT_TEST_PLANT.mark_plant_command_applied!(
         workspace, bridge.endpoint, endpoint_state, claim)
     disposition_count = publish_command_dispositions!(
-        bridge, state, Int64(timestamp_ns + 3))
+        bridge, state, bridge_workspace, Int64(timestamp_ns + 3))
     take_result = try_take!(
         outcome_ref, command_completion_port(ports))
     payload_value =
@@ -163,6 +165,7 @@ function leased_command_cycle!(
     ports,
     bridge,
     state,
+    bridge_workspace,
     lease_ref,
     outcome_ref,
     stream::Int,
@@ -182,15 +185,16 @@ function leased_command_cycle!(
     submit_result =
         try_submit!(submission_port, submission, Int64(timestamp_ns))
     process_result =
-        process_next_command!(bridge, state, Int64(timestamp_ns + 1))
+        process_next_command!(
+            bridge, state, bridge_workspace, Int64(timestamp_ns + 1))
     endpoint_state = command_endpoint_state(state)
-    workspace = command_disposition_workspace(state)
+    workspace = command_disposition_workspace(bridge_workspace)
     claim = PORT_TEST_PLANT.claim_next_application_ready_command!(
         bridge.endpoint, endpoint_state, timestamp)
     PORT_TEST_PLANT.mark_plant_command_applied!(
         workspace, bridge.endpoint, endpoint_state, claim)
     disposition_count = publish_command_dispositions!(
-        bridge, state, Int64(timestamp_ns + 2))
+        bridge, state, bridge_workspace, Int64(timestamp_ns + 2))
     take_result = try_take!(outcome_ref, completion_port)
     release_result = release_outcome!(completion_port, outcome_ref[])
     return (
@@ -352,6 +356,7 @@ end
         completion_port = command_completion_port(ports)
         bridge = prepare_command_bridge(ports, endpoint)
         state = CommandBridgeState(bridge)
+        bridge_workspace = CommandBridgeWorkspace(bridge)
 
         timestamp = PORT_TEST_PLANT.PlantTimestamp(10)
         submission = claim_command_submission(
@@ -374,9 +379,9 @@ end
             PortTransferSucceeded
         @test outcome_credit_accounting(submission_port).queued == 1
         @test process_next_command!(
-            bridge, state, Int64(1_100)).status ==
+            bridge, state, bridge_workspace, Int64(1_100)).status ==
             PortTransferSucceeded
-        descriptor = state.descriptor_scratch[]
+        descriptor = bridge_workspace.descriptor_scratch[]
         @test submission_session(descriptor) == submission_session(submission)
         @test submission_stream_sequence(descriptor) ==
             submission_stream_sequence(submission)
@@ -394,7 +399,8 @@ end
         @test command_payload_accounting(submission_port).consumer_leased == 1
 
         @test finish_ready_command!(
-            bridge, state, timestamp, Int64(1_200)) == 1
+            bridge, state, bridge_workspace, timestamp,
+            Int64(1_200)) == 1
         @test active_command_correlations(state) == 0
         outcome = take_command_outcome(completion_port)
         @test outcome_stage(outcome) == CoreCommandOutcome
@@ -459,6 +465,7 @@ end
         completion_port = command_completion_port(ports)
         bridge = prepare_command_bridge(ports, endpoint)
         state = CommandBridgeState(bridge)
+        bridge_workspace = CommandBridgeWorkspace(bridge)
 
         wrong_session = claim_command_submission(
             submission_port,
@@ -516,7 +523,8 @@ end
                 submission_port, submission, Int64(timestamp_ns)).status ==
                 PortTransferSucceeded
             @test process_next_command!(
-                bridge, state, Int64(timestamp_ns)).status ==
+                bridge, state, bridge_workspace,
+                Int64(timestamp_ns)).status ==
                 PortTransferSucceeded
             outcome = take_command_outcome(completion_port)
             @test outcome_stage(outcome) == BoundaryCommandOutcome
@@ -542,7 +550,8 @@ end
         @test try_submit!(
             submission_port, stale, Int64(timestamp_ns)).status ==
             PortTransferSucceeded
-        process_next_command!(bridge, state, Int64(timestamp_ns))
+        process_next_command!(
+            bridge, state, bridge_workspace, Int64(timestamp_ns))
         stale_outcome = take_command_outcome(completion_port)
         @test stale_outcome.boundary_reason ==
             CommandStreamSequenceNotIncreasing
@@ -563,7 +572,8 @@ end
         @test try_submit!(
             submission_port, wrong_endpoint, Int64(timestamp_ns)).status ==
             PortTransferSucceeded
-        process_next_command!(bridge, state, Int64(timestamp_ns))
+        process_next_command!(
+            bridge, state, bridge_workspace, Int64(timestamp_ns))
         endpoint_outcome = take_command_outcome(completion_port)
         @test outcome_stage(endpoint_outcome) == CoreCommandOutcome
         @test outcome_reason(endpoint_outcome) == :endpoint_mismatch
@@ -587,7 +597,8 @@ end
             core_schema_id=
                 PORT_TEST_PLANT.PlantCommandSchemaID(:wrong_schema))
         try_submit!(submission_port, wrong_schema, Int64(timestamp_ns))
-        process_next_command!(bridge, state, Int64(timestamp_ns))
+        process_next_command!(
+            bridge, state, bridge_workspace, Int64(timestamp_ns))
         schema_outcome = take_command_outcome(completion_port)
         @test outcome_reason(schema_outcome) == :schema_mismatch
         release_outcome!(completion_port, schema_outcome)
@@ -607,7 +618,8 @@ end
                 PORT_TEST_PLANT.PlantCommandSchemaVersion(2))
         try_submit!(
             submission_port, wrong_schema_version, Int64(timestamp_ns))
-        process_next_command!(bridge, state, Int64(timestamp_ns))
+        process_next_command!(
+            bridge, state, bridge_workspace, Int64(timestamp_ns))
         version_outcome = take_command_outcome(completion_port)
         @test outcome_reason(version_outcome) ==
             :schema_version_mismatch
@@ -626,9 +638,11 @@ end
             accepted_sequence,
             accepted_timestamp)
         try_submit!(submission_port, accepted, Int64(timestamp_ns))
-        process_next_command!(bridge, state, Int64(timestamp_ns))
+        process_next_command!(
+            bridge, state, bridge_workspace, Int64(timestamp_ns))
         finish_ready_command!(
-            bridge, state, accepted_timestamp, Int64(timestamp_ns))
+            bridge, state, bridge_workspace, accepted_timestamp,
+            Int64(timestamp_ns))
         accepted_outcome = take_command_outcome(completion_port)
         @test outcome_reason(accepted_outcome) == :applied
         release_outcome!(completion_port, accepted_outcome)
@@ -642,7 +656,8 @@ end
             accepted_sequence,
             PORT_TEST_PLANT.PlantTimestamp(timestamp_ns))
         try_submit!(submission_port, duplicate, Int64(timestamp_ns))
-        process_next_command!(bridge, state, Int64(timestamp_ns))
+        process_next_command!(
+            bridge, state, bridge_workspace, Int64(timestamp_ns))
         duplicate_outcome = take_command_outcome(completion_port)
         @test outcome_stage(duplicate_outcome) == CoreCommandOutcome
         @test outcome_reason(duplicate_outcome) == :duplicate_sequence
@@ -670,6 +685,7 @@ end
         completion_port = command_completion_port(ports)
         bridge = prepare_command_bridge(ports, endpoint)
         state = CommandBridgeState(bridge)
+        bridge_workspace = CommandBridgeWorkspace(bridge)
 
         for (stream, sequence, receive_ns, effective_ns) in (
             (1, 3, 1, 100),
@@ -697,7 +713,8 @@ end
                 submission_port, submission, Int64(receive_ns)).status ==
                 PortTransferSucceeded
             @test process_next_command!(
-                bridge, state, Int64(receive_ns)).status ==
+                bridge, state, bridge_workspace,
+                Int64(receive_ns)).status ==
                 PortTransferSucceeded
         end
 
@@ -726,6 +743,7 @@ end
         @test finish_ready_command!(
             bridge,
             state,
+            bridge_workspace,
             PORT_TEST_PLANT.PlantTimestamp(90),
             Int64(90)) == 1
         applied = take_command_outcome(completion_port)
@@ -839,12 +857,15 @@ end
 
         bridge = prepare_command_bridge(ports, endpoint)
         state = CommandBridgeState(bridge)
-        process_next_command!(bridge, state, Int64(3))
+        bridge_workspace = CommandBridgeWorkspace(bridge)
+        process_next_command!(
+            bridge, state, bridge_workspace, Int64(3))
         @test PORT_TEST_PLANT.pending_command_count(
             command_endpoint_state(state)) == 1
         @test active_command_correlations(state) == 1
         finish_ready_command!(
-            bridge, state, PORT_TEST_PLANT.PlantTimestamp(1), Int64(4))
+            bridge, state, bridge_workspace,
+            PORT_TEST_PLANT.PlantTimestamp(1), Int64(4))
         outcome = take_command_outcome(command_completion_port(ports))
         release_outcome!(command_completion_port(ports), outcome)
     end
@@ -863,6 +884,7 @@ end
         submission_port = command_submission_port(ports)
         bridge = prepare_command_bridge(ports, endpoint)
         state = CommandBridgeState(bridge)
+        bridge_workspace = CommandBridgeWorkspace(bridge)
         first = claim_command_submission(
             submission_port,
             [0.1, 0.1, 0.1],
@@ -877,7 +899,8 @@ end
             PORT_TEST_PLANT.PlantTimestamp(2))
         @test try_submit!(submission_port, first, Int64(1)).status ==
             PortTransferSucceeded
-        process_next_command!(bridge, state, Int64(1))
+        process_next_command!(
+            bridge, state, bridge_workspace, Int64(1))
         no_credit = try_submit!(submission_port, second, Int64(2))
         @test no_credit.status == PortFull
         @test no_credit.reason == OutcomeCreditUnavailable
@@ -886,7 +909,8 @@ end
             submission_port, second.payload.lease) ==
             PayloadTransitionSucceeded
         finish_ready_command!(
-            bridge, state, PORT_TEST_PLANT.PlantTimestamp(1), Int64(2))
+            bridge, state, bridge_workspace,
+            PORT_TEST_PLANT.PlantTimestamp(1), Int64(2))
         outcome = take_command_outcome(command_completion_port(ports))
         release_outcome!(command_completion_port(ports), outcome)
 
@@ -900,15 +924,15 @@ end
             PORT_TEST_PLANT.PlantTimestamp(3),
             zeros(3))
         PORT_TEST_PLANT.admit_plant_command!(
-            command_disposition_workspace(state),
+            command_disposition_workspace(bridge_workspace),
             endpoint,
             command_endpoint_state(state),
             foreign_command,
             PORT_TEST_PLANT.PlantTimestamp(3))
         @test_throws PortError publish_command_dispositions!(
-            bridge, state, Int64(3))
+            bridge, state, bridge_workspace, Int64(3))
         PORT_TEST_PLANT.clear_command_dispositions!(
-            command_disposition_workspace(state))
+            command_disposition_workspace(bridge_workspace))
 
         exhausted_ports = prepare_command_ports(
             port_test_endpoint(
@@ -949,6 +973,7 @@ end
         completion_port = command_completion_port(ports)
         bridge = prepare_command_bridge(ports, endpoint)
         state = CommandBridgeState(bridge)
+        bridge_workspace = CommandBridgeWorkspace(bridge)
 
         first_time = PORT_TEST_PLANT.PlantTimestamp(1)
         first = matching_command_submission(
@@ -958,11 +983,12 @@ end
             receive_time_command_timing(first_time),
             InlineCommandPayload(0.1))
         try_submit!(submission_port, first, Int64(1))
-        process_next_command!(bridge, state, Int64(1))
+        process_next_command!(
+            bridge, state, bridge_workspace, Int64(1))
         claim = PORT_TEST_PLANT.claim_next_application_ready_command!(
             endpoint, command_endpoint_state(state), first_time)
         PORT_TEST_PLANT.mark_plant_command_applied!(
-            command_disposition_workspace(state),
+            command_disposition_workspace(bridge_workspace),
             endpoint,
             command_endpoint_state(state),
             claim)
@@ -976,13 +1002,15 @@ end
             InlineCommandPayload(0.2))
         try_submit!(submission_port, second, Int64(2))
         @test process_next_command!(
-            bridge, state, Int64(2)).status == PortTransferSucceeded
+            bridge, state, bridge_workspace,
+            Int64(2)).status == PortTransferSucceeded
         first_outcome = take_command_outcome(completion_port)
         @test outcome_command_sequence(first_outcome) ==
             PORT_TEST_PLANT.PlantCommandSequence(1)
         release_outcome!(completion_port, first_outcome)
 
-        finish_ready_command!(bridge, state, second_time, Int64(3))
+        finish_ready_command!(
+            bridge, state, bridge_workspace, second_time, Int64(3))
         second_outcome = take_command_outcome(completion_port)
         @test outcome_command_sequence(second_outcome) ==
             PORT_TEST_PLANT.PlantCommandSequence(2)
@@ -1006,6 +1034,7 @@ end
         completion_port = command_completion_port(ports)
         bridge = prepare_command_bridge(ports, endpoint)
         state = CommandBridgeState(bridge)
+        bridge_workspace = CommandBridgeWorkspace(bridge)
         submission = claim_command_submission(
             submission_port,
             [2.0, 0.0, 0.0],
@@ -1014,7 +1043,8 @@ end
             PORT_TEST_PLANT.PlantTimestamp(1))
         try_submit!(submission_port, submission, Int64(1))
         @test_throws PORT_TEST_PLANT.PlantCommandError begin
-            process_next_command!(bridge, state, Int64(2))
+            process_next_command!(
+                bridge, state, bridge_workspace, Int64(2))
         end
         outcome = take_command_outcome(completion_port)
         @test outcome_stage(outcome) == CoreCommandOutcome
@@ -1034,7 +1064,8 @@ end
             PORT_TEST_PLANT.PlantTimestamp(0))
         try_submit!(submission_port, regressed, Int64(3))
         @test_throws PORT_TEST_PLANT.PlantCommandError begin
-            process_next_command!(bridge, state, Int64(4))
+            process_next_command!(
+                bridge, state, bridge_workspace, Int64(4))
         end
         regressed_outcome = take_command_outcome(completion_port)
         @test outcome_stage(regressed_outcome) ==
@@ -1066,6 +1097,7 @@ end
         completion_port = command_completion_port(ports)
         bridge = prepare_command_bridge(ports, endpoint)
         state = CommandBridgeState(bridge)
+        bridge_workspace = CommandBridgeWorkspace(bridge)
         receive = PORT_TEST_PLANT.PlantTimestamp(10)
         timing = mapped_source_command_timing(
             domain,
@@ -1082,8 +1114,10 @@ end
             timing,
             InlineCommandPayload(0.1))
         try_submit!(submission_port, submission, Int64(10))
-        process_next_command!(bridge, state, Int64(11))
-        finish_ready_command!(bridge, state, receive, Int64(12))
+        process_next_command!(
+            bridge, state, bridge_workspace, Int64(11))
+        finish_ready_command!(
+            bridge, state, bridge_workspace, receive, Int64(12))
         outcome = take_command_outcome(completion_port)
         @test outcome_stage(outcome) == CoreCommandOutcome
         @test source_timestamp_domain(outcome_timing(outcome)) == domain
@@ -1106,7 +1140,8 @@ end
             stale_timing,
             InlineCommandPayload(0.1))
         try_submit!(submission_port, stale, Int64(13))
-        process_next_command!(bridge, state, Int64(14))
+        process_next_command!(
+            bridge, state, bridge_workspace, Int64(14))
         stale_outcome = take_command_outcome(completion_port)
         @test outcome_stage(stale_outcome) == BoundaryCommandOutcome
         @test outcome_boundary_reason(stale_outcome) ==
@@ -1126,6 +1161,7 @@ end
             outcome_credit_pool_id=UInt64(130))
         bridge = prepare_command_bridge(ports, endpoint)
         state = CommandBridgeState(bridge)
+        bridge_workspace = CommandBridgeWorkspace(bridge)
         outcome_ref = Ref{CommandOutcome{InlineCommandPayload{Float64}}}()
         expected = (
             PortTransferSucceeded,
@@ -1135,14 +1171,17 @@ end
             0.25,
             PortTransferSucceeded)
         @test inline_command_cycle!(
-            ports, bridge, state, outcome_ref, 1, 1) == expected
+            ports, bridge, state, bridge_workspace,
+            outcome_ref, 1, 1) == expected
         @test @inferred(inline_command_cycle!(
-            ports, bridge, state, outcome_ref, 2, 2)) == expected
+            ports, bridge, state, bridge_workspace,
+            outcome_ref, 2, 2)) == expected
         if PORT_TESTS_WITH_COVERAGE
             @test_skip "allocation assertions are disabled under coverage"
         else
             @test @allocated(inline_command_cycle!(
-                ports, bridge, state, outcome_ref, 3, 3)) == 0
+                ports, bridge, state, bridge_workspace,
+                outcome_ref, 3, 3)) == 0
         end
     end
 
@@ -1159,6 +1198,7 @@ end
             completion_capacity=4)
         bridge = prepare_command_bridge(ports, endpoint)
         state = CommandBridgeState(bridge)
+        bridge_workspace = CommandBridgeWorkspace(bridge)
         lease_ref = Ref(PayloadLeaseRef(0, 0, 0, 0))
         outcome_ref = Ref{CommandOutcome{LeasedCommandPayload}}()
         expected = (
@@ -1169,16 +1209,19 @@ end
             PortTransferSucceeded,
             PortTransferSucceeded)
         @test leased_command_cycle!(
-            ports, bridge, state, lease_ref, outcome_ref, 1, 1) ==
+            ports, bridge, state, bridge_workspace,
+            lease_ref, outcome_ref, 1, 1) ==
             expected
         @test @inferred(leased_command_cycle!(
-            ports, bridge, state, lease_ref, outcome_ref, 2, 2)) ==
+            ports, bridge, state, bridge_workspace,
+            lease_ref, outcome_ref, 2, 2)) ==
             expected
         if PORT_TESTS_WITH_COVERAGE
             @test_skip "allocation assertions are disabled under coverage"
         else
             @test @allocated(leased_command_cycle!(
-                ports, bridge, state, lease_ref, outcome_ref, 3, 3)) == 0
+                ports, bridge, state, bridge_workspace,
+                lease_ref, outcome_ref, 3, 3)) == 0
         end
     end
 end

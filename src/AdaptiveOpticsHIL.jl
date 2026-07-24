@@ -10,7 +10,8 @@ include("errors.jl")
 include("timing.jl")
 include("ownership.jl")
 include("ports.jl")
+include("serial.jl")
 
-export AdaptiveOpticsHILError, Ownership, Ports, Timing
+export AdaptiveOpticsHILError, Ownership, Ports, Serial, Timing
 
 end

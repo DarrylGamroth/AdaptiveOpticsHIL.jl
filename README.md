@@ -7,7 +7,7 @@ Transport-neutral hardware-in-the-loop orchestration for adaptive-optics
 simulations.
 
 AdaptiveOpticsHIL.jl is an early-stage companion to AdaptiveOpticsSim.jl. It
-will provide deterministic timing and bounded in-process interfaces without
+provides deterministic timing and bounded in-process interfaces without
 embedding an RTC-specific transport. RTC integrations remain free to use TCP,
 UDP, Aeron, iceoryx2, ZeroMQ, shared memory, or another transport appropriate
 to the target controller.
@@ -88,6 +88,40 @@ The ports contain no TCP, UDP, Aeron, iceoryx2, ZeroMQ, packet, client/server,
 or progressive-readout semantics. Integration code decodes its chosen
 transport into these descriptors and owns its own blocking, polling, or
 backoff policy.
+
+## Deterministic serial runtime
+
+`AdaptiveOpticsHIL.Serial` composes one prepared
+`AdaptiveOpticsSim.Plant` event loop with an event-loop command bridge and a
+nonempty tuple of acquisition-completion ports. The prepared run has an exact
+state/workspace binding and is armed only after the user-owned integration
+reports its adapter ready. Arming captures one immutable execution-clock
+mapping; it does not add wall-clock state to AdaptiveOpticsSim.
+
+Each `step_serial_run!` call makes one bounded, nonblocking decision:
+
+- process at most one already-transferred command;
+- report the time remaining until the next plant event; or
+- process one complete plant timestamp, publish terminal command outcomes, and
+  copy each newly complete acquisition into its prepared product pool.
+
+The runtime never sleeps, retries, polls, invokes callbacks, starts workers, or
+chooses placement or transport. A caller may advance a `CachedNanoClock`
+exactly in deterministic tests or apply its own idle policy around a
+`SystemNanoClock` in production.
+
+Sampled actuator/device feedback is simply another independently scheduled
+acquisition-completion stream. It does not share command cadence and never
+masquerades as a command outcome.
+
+The maintained vertical-slice test uses an in-memory fake RTC and a calibrated
+reduced-order plant. It verifies exact cached-clock replay, equal-time command
+causality, one terminal outcome per transferred command, complete lease
+accounting at clean stop, and better residual rejection than open-loop,
+wrong-sign, or delayed control. Warmed HIL-only port and publication operations
+remain allocation-free. Inclusive serial event and routed-command steps have
+2 KiB allocation ceilings because they include the current core reduced-order
+event and event-loop admission work.
 
 ## Development sources
 
