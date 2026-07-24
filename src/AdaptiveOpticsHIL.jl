@@ -8,7 +8,8 @@ module AdaptiveOpticsHIL
 
 include("errors.jl")
 include("timing.jl")
+include("ownership.jl")
 
-export AdaptiveOpticsHILError, Timing
+export AdaptiveOpticsHILError, Ownership, Timing
 
 end
