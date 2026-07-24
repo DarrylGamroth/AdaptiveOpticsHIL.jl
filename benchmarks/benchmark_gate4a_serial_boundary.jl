@@ -101,15 +101,32 @@ function validate_contract(contract)
         "durable saturation evidence requires at least three runs")
     contract["stall_frames"] > 0 || error(
         "fixed-arrival evidence requires a nonempty injected stall")
+    workload = contract["workload"]
+    workload["command_payload_pool_capacity"] ==
+        workload["command_submission_capacity"] ==
+        workload["command_completion_capacity"] || error(
+        "the Gate 4A command payload, submission, and completion " *
+        "capacities must match")
+    workload["primary_product_capacity"] ==
+        workload["primary_completion_capacity"] || error(
+        "the Gate 4A primary product and completion capacities must match")
+    workload["feedback_product_capacity"] ==
+        workload["feedback_completion_capacity"] || error(
+        "the Gate 4A feedback product and completion capacities must match")
+    workload["command_payload_bytes"] ==
+        workload["command_payload_elements"] * sizeof(Float64) || error(
+        "the Gate 4A command payload byte count is inconsistent")
     return true
 end
+
+_artifact_value(value::Unsigned) = Int(value)
+_artifact_value(value) = value
 
 function counter_snapshot(counters::Harness.BoundaryCounters)
     values = Dict{String,Any}()
     for field in fieldnames(typeof(counters))
         value = getfield(counters, field)
-        values[string(field)] =
-            value isa Unsigned ? Int(value) : value
+        values[string(field)] = _artifact_value(value)
     end
     return values
 end
@@ -124,9 +141,12 @@ function ring_snapshot(accounting)
     )
 end
 
-function pool_snapshot(accounting)
-    accounting === nothing && return Dict{String,Any}(
+function pool_snapshot(::Nothing)
+    return Dict{String,Any}(
         "present" => false)
+end
+
+function pool_snapshot(accounting)
     return Dict{String,Any}(
         "present" => true,
         "capacity" => accounting.capacity,
@@ -451,6 +471,21 @@ end
 
 function timer_calibration(histogram_config; samples=100_000)
     clock = Clocks.SystemNanoClock()
+    warm_timer_histogram = HdrHistogram.Histogram(
+        histogram_config.lowest_ns,
+        histogram_config.highest_ns,
+        histogram_config.significant_figures)
+    warm_record_histogram = HdrHistogram.Histogram(
+        histogram_config.lowest_ns,
+        histogram_config.highest_ns,
+        histogram_config.significant_figures)
+    for _ in 1:1_000
+        first = Clocks.time_nanos(clock)
+        second = Clocks.time_nanos(clock)
+        HdrHistogram.record_value!(
+            warm_timer_histogram, max(0, second - first))
+        HdrHistogram.record_value!(warm_record_histogram, 1)
+    end
     timer_histogram = HdrHistogram.Histogram(
         histogram_config.lowest_ns,
         histogram_config.highest_ns,
@@ -459,13 +494,6 @@ function timer_calibration(histogram_config; samples=100_000)
         histogram_config.lowest_ns,
         histogram_config.highest_ns,
         histogram_config.significant_figures)
-    for _ in 1:1_000
-        first = Clocks.time_nanos(clock)
-        second = Clocks.time_nanos(clock)
-        HdrHistogram.record_value!(
-            timer_histogram, max(0, second - first))
-        HdrHistogram.record_value!(record_histogram, 1)
-    end
     timer_wall_start = time_ns()
     for _ in 1:samples
         first = Clocks.time_nanos(clock)

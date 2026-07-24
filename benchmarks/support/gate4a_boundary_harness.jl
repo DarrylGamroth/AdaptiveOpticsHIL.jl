@@ -561,6 +561,7 @@ function _observe_primary_product!(driver::BoundaryDriver)
 
     target_sequence = sequence <= UInt64(driver.run_config.samples)
     if target_sequence
+        driver.controller_service_start_ns = time_ns()
         _record_nonnegative!(
             driver.histograms.publication_lateness,
             publication_lateness,
@@ -588,7 +589,6 @@ function _observe_primary_product!(driver::BoundaryDriver)
             plant_nanoseconds(completion_timestamp)
         driver.prepared_observation_execution_ns =
             observation_execution_ns
-        driver.controller_service_start_ns = time_ns()
         driver.phase = ControllerCommandPrepared
         driver.counters.observed_primary += UInt64(1)
         driver.counters.commands_offered += UInt64(1)

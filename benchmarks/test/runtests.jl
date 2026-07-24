@@ -3,15 +3,9 @@ using Clocks
 using HdrHistogram
 using Test
 
-const BENCHMARK_ROOT = normpath(joinpath(@__DIR__, ".."))
-
 include(joinpath(
-    BENCHMARK_ROOT, "support", "gate4a_boundary_harness.jl"))
-include(joinpath(
-    BENCHMARK_ROOT, "support", "hdr_histogram_artifact.jl"))
-
-const Harness = Gate4ABoundaryHarness
-const HistogramArtifact = HILHdrHistogramArtifact
+    normpath(joinpath(@__DIR__, "..")),
+    "benchmark_gate4a_serial_boundary.jl"))
 
 function cached_boundary_run(config)
     driver = Harness.prepare_boundary_driver(
@@ -47,6 +41,14 @@ function deterministic_histogram_signature(result)
 end
 
 @testset "Gate 4A benchmark contract" begin
+    contract = TOML.parsefile(DEFAULT_CONTRACT)
+    @test validate_contract(contract)
+    inconsistent_contract = deepcopy(contract)
+    inconsistent_contract["workload"][
+        "command_completion_capacity"] += 1
+    @test_throws ErrorException validate_contract(
+        inconsistent_contract)
+
     @test_throws ErrorException Harness.BoundaryRunConfig(samples=0)
     @test_throws ErrorException Harness.BoundaryRunConfig(
         samples=32, stall_start_sequence=16, stall_frames=17)
