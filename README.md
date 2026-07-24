@@ -40,9 +40,9 @@ are deliberately excluded from pacing and deadline measurement.
 ## Bounded in-process ownership
 
 `AdaptiveOpticsHIL.Ownership` provides the transport-neutral data-plane
-foundation for later command and acquisition ports:
+foundation for command and acquisition ports:
 
-- a fixed-capacity SPSC ring for compact isbits descriptors
+- a fixed-capacity SPSC ring for compact, concrete, immutable descriptors
 - explicit success, full, empty, and closed results with close-and-drain
   behavior
 - release/acquire sequence publication with independently written cursors
@@ -55,10 +55,39 @@ The warmed transfer operations do not block, yield, retry, invoke callbacks, or
 allocate. Caller code owns its idle/backoff policy. Mutable frame and command
 buffers stay in the prepared pool rather than being copied through ring slots;
 failed and stale transitions leave ownership unchanged.
+Pool identities are caller-declared and must be unique within one run/session;
+ports reject the most immediate payload/credit collision during preparation.
+Prepared port pools also require one concrete storage type and reject aliased
+command buffers or acquisition-product storage.
 
 These are intentionally low-level foundations, not RTC transport APIs.
-Canonical command and acquisition ports will compose them without embedding
-TCP, UDP, Aeron, iceoryx2, ZeroMQ, or another wire protocol.
+
+## RTC-facing ports
+
+`AdaptiveOpticsHIL.Ports` composes the bounded primitives into three canonical
+in-process boundaries:
+
+- `CommandSubmissionPort` transfers an inline scalar or generation-checked
+  command-buffer lease and reserves one terminal-outcome credit. Successful
+  transfer is distinct from core validation, admission, effective
+  application, and terminal disposition.
+- `CommandCompletionPort` returns exactly one correlated boundary or core
+  outcome. Consuming and releasing that outcome returns both the command
+  buffer, when leased, and its reserved outcome credit.
+- `AcquisitionCompletionPort` transfers complete
+  `AdaptiveOpticsSim.Plant.AcquisitionProducts` values through an exact
+  prepared product contract. Sampled controllable-optic/device feedback uses
+  this same acquisition contract rather than command outcomes.
+
+Command timing records either canonical plant receive time or an already
+mapped, versioned external timestamp. Mapping estimation remains the
+integration owner's responsibility. Adapter readiness, complete-product lead
+time, and maximum lease hold time are explicit orchestration data.
+
+The ports contain no TCP, UDP, Aeron, iceoryx2, ZeroMQ, packet, client/server,
+or progressive-readout semantics. Integration code decodes its chosen
+transport into these descriptors and owns its own blocking, polling, or
+backoff policy.
 
 ## Development sources
 

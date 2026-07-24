@@ -8,6 +8,17 @@ struct HugePayloadVector <: AbstractVector{UInt8} end
 Base.size(::HugePayloadVector) = (Int(typemax(UInt32)) + 1,)
 Base.getindex(::HugePayloadVector, ::Int) = UInt8(0)
 
+abstract type AbstractTestDescriptor end
+
+mutable struct MutableTestDescriptor
+    value::UInt64
+end
+
+struct SymbolicTestDescriptor
+    endpoint::Symbol
+    sequence::UInt64
+end
+
 function ring_allocation_bytes(
     ring::SPSCDescriptorRing{UInt64},
     output::Base.RefValue{UInt64})
@@ -49,6 +60,10 @@ end
 @testset "Bounded SPSC descriptor ring" begin
     @testset "Preparation and layout" begin
         @test_throws OwnershipError SPSCDescriptorRing{UInt64}(0)
+        @test_throws OwnershipError SPSCDescriptorRing{
+            AbstractTestDescriptor}(2)
+        @test_throws OwnershipError SPSCDescriptorRing{
+            MutableTestDescriptor}(2)
         @test_throws OwnershipError SPSCDescriptorRing{Vector{Int}}(2)
         @test_throws OwnershipError SPSCDescriptorRing{UInt64}(
             UInt128(typemax(Int)) + 1)
@@ -61,6 +76,26 @@ end
         accounting = ring_accounting(ring)
         @test accounting ==
               RingAccounting(3, 0, UInt64(0), UInt64(0), false)
+    end
+
+    @testset "Inline symbolic descriptors" begin
+        @test !isbitstype(SymbolicTestDescriptor)
+        @test Base.allocatedinline(SymbolicTestDescriptor)
+        ring = SPSCDescriptorRing{SymbolicTestDescriptor}(2)
+        descriptor = SymbolicTestDescriptor(:dm_command, UInt64(17))
+        output = Ref(descriptor)
+        @test try_submit!(ring, descriptor) == RingTransferSucceeded
+        @test try_take!(output, ring) == RingTransferSucceeded
+        @test output[] == descriptor
+
+        try_submit!(ring, descriptor)
+        try_take!(output, ring)
+        if OWNERSHIP_TESTS_WITH_COVERAGE
+            @test_skip "allocation assertions are disabled under coverage"
+        else
+            @test @allocated(try_submit!(ring, descriptor)) == 0
+            @test @allocated(try_take!(output, ring)) == 0
+        end
     end
 
     @testset "Empty, full, wraparound, and slot reuse" begin
