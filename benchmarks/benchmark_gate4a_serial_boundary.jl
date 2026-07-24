@@ -809,6 +809,24 @@ function summary_report(fixed_reports, saturation_reports)
     )
 end
 
+_gate_failed(::Any) = false
+_gate_failed(gate::AbstractDict) =
+    get(gate, "passed", true) === false
+
+function report_failed_gates(gates)
+    names = sort!([
+        name
+        for (name, gate) in pairs(gates)
+        if _gate_failed(gate)
+    ])
+    for name in names
+        println(stderr,
+            "Gate 4A failed gate $name: ",
+            repr(gates[name]))
+    end
+    return names
+end
+
 function write_artifact(output_path, artifact)
     mkpath(dirname(output_path))
     open(output_path, "w") do io
@@ -923,8 +941,12 @@ function main(arguments=ARGS)
         instrumentation_bytes,
         exact_replay,
         contract)
-    gates["all_evaluated_gates_passed"] || error(
-        "one or more predeclared Gate 4A evidence gates failed")
+    if !gates["all_evaluated_gates_passed"]
+        failed = report_failed_gates(gates)
+        error(
+            "predeclared Gate 4A evidence gates failed: " *
+            join(failed, ", "))
+    end
 
     artifact = Dict{String,Any}(
         "schema_version" => 1,
