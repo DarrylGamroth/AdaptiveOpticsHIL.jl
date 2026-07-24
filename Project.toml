@@ -3,8 +3,18 @@ uuid = "c50291de-c366-4d66-93e5-abfdaae8bfec"
 version = "0.1.0"
 authors = ["Darryl Gamroth <dgamroth@rubus.ca>"]
 
+[deps]
+AdaptiveOpticsSim = "002fb5eb-ad68-44a0-adbe-b299bfc2febc"
+Clocks = "6b5ade5d-6e95-4584-b343-73eec2e8782b"
+
+[sources]
+AdaptiveOpticsSim = {url = "https://github.com/DarrylGamroth/AdaptiveOpticsSim.jl.git", rev = "9ddb77d41b7bac748e62e123cf6a0ff289de3b45"}
+Clocks = {url = "https://github.com/DarrylGamroth/Clocks.jl.git", rev = "1b705421648b70b6d171f8a95d6c2d16c2444d0b"}
+
 [compat]
+AdaptiveOpticsSim = "0.1"
 Aqua = "0.8"
+Clocks = "0.3"
 Test = "1"
 julia = "1.12"
 
