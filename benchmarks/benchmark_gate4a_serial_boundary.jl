@@ -432,6 +432,12 @@ function fixed_run_report(
             1.0e9 / contract["workload"]["primary_period_ns"],
         "published_rate_hz" =>
             Int(counters.published_primary) / seconds,
+        "command_enqueued_rate_hz" =>
+            Int(counters.commands_enqueued) / seconds,
+        "command_admitted_rate_hz" =>
+            Int(counters.commands_admitted) / seconds,
+        "command_applied_rate_hz" =>
+            Int(counters.commands_applied) / seconds,
         "completed_rate_hz" =>
             Int(counters.command_responses) / seconds,
         "counters" => counter_snapshot(counters),
@@ -455,6 +461,14 @@ function saturation_run_report(
         "classification" =>
             "unpaced maximum-useful-throughput diagnostic",
         "wall_elapsed_ns" => elapsed_ns,
+        "offered_rate_hz" =>
+            Int(counters.commands_offered) / seconds,
+        "enqueued_rate_hz" =>
+            Int(counters.commands_enqueued) / seconds,
+        "admitted_rate_hz" =>
+            Int(counters.commands_admitted) / seconds,
+        "applied_rate_hz" =>
+            Int(counters.commands_applied) / seconds,
         "useful_completed_rate_hz" =>
             Int(counters.command_responses) / seconds,
         "counters" => counter_snapshot(counters),
@@ -507,6 +521,10 @@ function timer_calibration(histogram_config; samples=100_000)
         HdrHistogram.record_value!(record_histogram, 1)
     end
     record_wall_elapsed = Int(time_ns() - record_wall_start)
+    HdrHistogram.total_count(timer_histogram) == samples || error(
+        "timer calibration retained or lost samples")
+    HdrHistogram.total_count(record_histogram) == samples || error(
+        "histogram recorder calibration retained or lost samples")
     return Dict{String,Any}(
         "samples" => samples,
         "two_timer_queries_plus_record_wall_ns_per_sample" =>
@@ -559,6 +577,26 @@ function first_matching_line(path, prefix)
     return ""
 end
 
+function first_key_value(path, key)
+    isfile(path) || return ""
+    prefix = key * "="
+    for line in eachline(path)
+        startswith(line, prefix) &&
+            return strip(split(line, '='; limit=2)[2], ['"'])
+    end
+    return ""
+end
+
+function os_description()
+    description = first_key_value(
+        "/etc/os-release", "PRETTY_NAME")
+    isempty(description) || return description
+    return string(Sys.KERNEL)
+end
+
+kernel_release() = Sys.iswindows() ?
+    string(Sys.KERNEL) : readchomp(`uname -r`)
+
 function cpu_governors()
     root = "/sys/devices/system/cpu"
     isdir(root) || return String[]
@@ -597,18 +635,25 @@ function environment_snapshot(
         "julia_version" => string(VERSION),
         "julia_commit" => string(Base.GIT_VERSION_INFO.commit),
         "julia_threads" => Threads.nthreads(),
+        "julia_num_threads" =>
+            get(ENV, "JULIA_NUM_THREADS", ""),
+        "julia_cpu_target" =>
+            get(ENV, "JULIA_CPU_TARGET", ""),
         "blas_threads" => LinearAlgebra.BLAS.get_num_threads(),
         "openblas_num_threads" =>
             get(ENV, "OPENBLAS_NUM_THREADS", ""),
         "omp_num_threads" => get(ENV, "OMP_NUM_THREADS", ""),
         "mkl_num_threads" => get(ENV, "MKL_NUM_THREADS", ""),
         "kernel" => string(Sys.KERNEL),
-        "kernel_release" => readchomp(`uname -r`),
+        "kernel_release" => kernel_release(),
+        "operating_system" => os_description(),
         "machine" => Sys.MACHINE,
         "word_size" => Sys.WORD_SIZE,
         "cpu_name" => Sys.CPU_NAME,
-        "cpu_model" =>
-            first_matching_line("/proc/cpuinfo", "model name"),
+        "cpu_model" => let model =
+                first_matching_line("/proc/cpuinfo", "model name")
+            isempty(model) ? Sys.CPU_NAME : model
+        end,
         "logical_cpu_threads" => Sys.CPU_THREADS,
         "allowed_cpu_list" =>
             first_matching_line(

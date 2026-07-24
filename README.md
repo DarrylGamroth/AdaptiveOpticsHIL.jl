@@ -142,7 +142,9 @@ raw sparse HdrHistogram data, supported percentiles, the exact source and
 dependency revisions, machine/thread configuration, calibration, and claim
 limits. The benchmark does not qualify a transport, external RTC, GPU,
 multi-core placement, full optical propagation, or production instrument
-capacity.
+capacity. The
+[maintained Gate 4A artifact](benchmarks/results/gate4a/2026-07-24-serial-boundary.toml)
+contains the current qualified baseline.
 
 CI runs the short deterministic benchmark-contract suite. Durable evidence is
 generated deliberately from a clean revision with one Julia and BLAS thread:
