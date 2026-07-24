@@ -37,6 +37,29 @@ plant time, or own a scheduler. `Clocks.SystemNanoClock` is the production
 provider; `Clocks.CachedNanoClock` supports deterministic tests. Epoch clocks
 are deliberately excluded from pacing and deadline measurement.
 
+## Bounded in-process ownership
+
+`AdaptiveOpticsHIL.Ownership` provides the transport-neutral data-plane
+foundation for later command and acquisition ports:
+
+- a fixed-capacity SPSC ring for compact isbits descriptors
+- explicit success, full, empty, and closed results with close-and-drain
+  behavior
+- release/acquire sequence publication with independently written cursors
+  separated by a conservative 128-byte distance
+- a fixed payload pool with immutable pool, session, slot, and generation
+  references
+- explicit producer-owned, queued, consumer-leased, and free transitions
+
+The warmed transfer operations do not block, yield, retry, invoke callbacks, or
+allocate. Caller code owns its idle/backoff policy. Mutable frame and command
+buffers stay in the prepared pool rather than being copied through ring slots;
+failed and stale transitions leave ownership unchanged.
+
+These are intentionally low-level foundations, not RTC transport APIs.
+Canonical command and acquisition ports will compose them without embedding
+TCP, UDP, Aeron, iceoryx2, ZeroMQ, or another wire protocol.
+
 ## Development sources
 
 This early-stage package pins its current unregistered dependencies by Git
@@ -48,5 +71,7 @@ contracts live in the AdaptiveOpticsSim specifications:
 
 - [HIL package boundaries](https://github.com/DarrylGamroth/AdaptiveOpticsSim.jl/blob/main/docs/hil/package-boundaries.md)
 - [HIL time, scheduling, and causality](https://github.com/DarrylGamroth/AdaptiveOpticsSim.jl/blob/main/docs/hil/time-and-scheduling.md)
+- [HIL RTC ports and bounded handoffs](https://github.com/DarrylGamroth/AdaptiveOpticsSim.jl/blob/main/docs/hil/rtc-ports.md)
+- [HIL validation and acceptance](https://github.com/DarrylGamroth/AdaptiveOpticsSim.jl/blob/main/docs/hil/validation.md)
 
 Requires Julia 1.12 or newer.
