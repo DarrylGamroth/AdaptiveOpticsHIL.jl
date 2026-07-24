@@ -90,15 +90,9 @@ PortSchemaVersion(value::Integer) = PortSchemaVersion(
         value, :descriptor_schema, "port descriptor-schema version"),
     _POSITIVE_COUNTER_TOKEN)
 
-struct _TimestampDomainToken end
-const _TIMESTAMP_DOMAIN_TOKEN = _TimestampDomainToken()
-
 """Stable identity of one external timestamp coordinate."""
 struct ExternalTimestampDomainID
     name::Symbol
-
-    ExternalTimestampDomainID(name::Symbol, ::_TimestampDomainToken) =
-        new(name)
 
     function ExternalTimestampDomainID(name::Symbol)
         isempty(String(name)) && throw(PortError(
@@ -228,7 +222,7 @@ end
 end
 
 const _NO_TIMESTAMP_DOMAIN =
-    ExternalTimestampDomainID(Symbol(""), _TIMESTAMP_DOMAIN_TOKEN)
+    ExternalTimestampDomainID(:receive_timestamp_only)
 const _NO_MAPPING_VERSION =
     TimestampMappingVersion(UInt32(0), _POSITIVE_COUNTER_TOKEN)
 

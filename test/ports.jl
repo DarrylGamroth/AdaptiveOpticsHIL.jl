@@ -15,6 +15,8 @@ function port_test_schema(::Type{T}=Float64;
     basis_revision=1,
     value_policy=PORT_TEST_PLANT.CommandValuePolicy(),
     sequence_policy=PORT_TEST_PLANT.CommandSequencePolicy(),
+    effective_time_policy=
+        PORT_TEST_PLANT.CommandEffectiveTimePolicy(),
 ) where {T}
     return PORT_TEST_PLANT.PlantCommandSchema(
         T,
@@ -30,8 +32,7 @@ function port_test_schema(::Type{T}=Float64;
         bounds=PORT_TEST_PLANT.UniformCommandBounds(T(-1), T(1)),
         value_policy,
         sequence_policy,
-        effective_time_policy=
-            PORT_TEST_PLANT.CommandEffectiveTimePolicy(),
+        effective_time_policy,
         silence_policy=PORT_TEST_PLANT.CommandSilencePolicy())
 end
 
@@ -145,6 +146,8 @@ function inline_command_cycle!(
         bridge, state, Int64(timestamp_ns + 3))
     take_result = try_take!(
         outcome_ref, command_completion_port(ports))
+    payload_value =
+        outcome_payload(command_completion_port(ports), outcome_ref[])
     release_result = release_outcome!(
         command_completion_port(ports), outcome_ref[])
     return (
@@ -152,6 +155,7 @@ function inline_command_cycle!(
         process_result.status,
         disposition_count,
         take_result.status,
+        payload_value,
         release_result.status)
 end
 
@@ -233,25 +237,63 @@ end
         @test_throws PortError StreamSequence(false)
         @test_throws PortError PortSchemaID(Symbol(""))
         @test_throws PortError PortSchemaVersion(0)
+        @test_throws PortError PortSchemaVersion(false)
         @test_throws PortError ExternalTimestampDomainID(Symbol(""))
         @test_throws PortError TimestampMappingVersion(0)
 
+        session = RunSessionID(7)
+        schema_id = PortSchemaID(:command_submission)
+        timestamp_domain = ExternalTimestampDomainID(:rtc_ptp)
+        @test isequal(session, RunSessionID(7))
+        @test hash(session) == hash(RunSessionID(7))
+        @test isequal(schema_id, PortSchemaID(:command_submission))
+        @test hash(schema_id) == hash(PortSchemaID(:command_submission))
+        @test isequal(
+            timestamp_domain, ExternalTimestampDomainID(:rtc_ptp))
+        @test hash(timestamp_domain) ==
+            hash(ExternalTimestampDomainID(:rtc_ptp))
+        @test sprint(show, session) == "RunSessionID(7)"
+        @test sprint(show, schema_id) ==
+            "PortSchemaID(:command_submission)"
+
+        rejected = PortResult(PortRejected, SessionMismatch)
+        @test port_status(rejected) == PortRejected
+        @test port_rejection_reason(rejected) == SessionMismatch
+        @test port_payload_status(rejected) === nothing
+
         receive = PORT_TEST_PLANT.PlantTimestamp(100)
         receive_only = receive_time_command_timing(receive)
-        @test receive_only.source_kind == ReceiveTimestampOnly
-        @test receive_only.receive_timestamp == receive
+        @test source_timestamp_kind(receive_only) == ReceiveTimestampOnly
+        @test source_timestamp_domain(receive_only) === nothing
+        @test source_timestamp_nanoseconds(receive_only) === nothing
+        @test timestamp_mapping_version(receive_only) === nothing
+        @test mapped_source_timestamp(receive_only) == receive
+        @test command_receive_timestamp(receive_only) == receive
+        @test command_effective_timestamp(receive_only) == receive
+        @test timestamp_mapping_uncertainty(receive_only) ==
+            zero(PORT_TEST_PLANT.PlantDuration)
 
         mapped = mapped_source_command_timing(
-            ExternalTimestampDomainID(:rtc_ptp),
+            timestamp_domain,
             Int64(9_000),
             TimestampMappingVersion(3),
             PORT_TEST_PLANT.PlantTimestamp(95),
             receive;
             mapping_uncertainty=PORT_TEST_PLANT.PlantDuration(5))
-        @test mapped.source_kind == MappedSourceTimestamp
-        @test mapped.mapping_version == TimestampMappingVersion(3)
+        @test source_timestamp_kind(mapped) == MappedSourceTimestamp
+        @test source_timestamp_domain(mapped) == timestamp_domain
+        @test source_timestamp_nanoseconds(mapped) == 9_000
+        @test timestamp_mapping_version(mapped) ==
+            TimestampMappingVersion(3)
+        @test mapped_source_timestamp(mapped) ==
+            PORT_TEST_PLANT.PlantTimestamp(95)
+        @test command_receive_timestamp(mapped) == receive
+        @test command_effective_timestamp(mapped) ==
+            PORT_TEST_PLANT.PlantTimestamp(95)
+        @test timestamp_mapping_uncertainty(mapped) ==
+            PORT_TEST_PLANT.PlantDuration(5)
         mapped_from_narrow_integer = mapped_source_command_timing(
-            ExternalTimestampDomainID(:rtc_ptp),
+            timestamp_domain,
             Int32(9_001),
             TimestampMappingVersion(3),
             PORT_TEST_PLANT.PlantTimestamp(95),
@@ -272,12 +314,23 @@ end
             TimestampMappingVersion(3),
             receive,
             receive)
+        @test_throws PortError mapped_source_command_timing(
+            timestamp_domain,
+            true,
+            TimestampMappingVersion(3),
+            receive,
+            receive)
 
         delivery = AdapterDeliveryContract(
             PORT_TEST_PLANT.PlantDuration(25),
             PORT_TEST_PLANT.PlantDuration(1_000))
-        @test delivery.complete_product_lead_time ==
+        readiness = AdapterReadinessSnapshot(AdapterReady, receive)
+        @test adapter_readiness_status(readiness) == AdapterReady
+        @test adapter_readiness_timestamp(readiness) == receive
+        @test complete_product_lead_time(delivery) ==
             PORT_TEST_PLANT.PlantDuration(25)
+        @test maximum_lease_hold_time(delivery) ==
+            PORT_TEST_PLANT.PlantDuration(1_000)
         @test_throws PortError AdapterDeliveryContract(
             PORT_TEST_PLANT.PlantDuration(0),
             PORT_TEST_PLANT.PlantDuration(0))
@@ -303,6 +356,19 @@ end
         timestamp = PORT_TEST_PLANT.PlantTimestamp(10)
         submission = claim_command_submission(
             submission_port, [0.1, 0.2, 0.3], 1, 1, timestamp)
+        @test submission_session(submission) == session
+        @test submission_stream_sequence(submission) == StreamSequence(1)
+        @test submission_endpoint(submission) ==
+            PORT_TEST_PLANT.CommandEndpointID(:hil_dm)
+        @test submission_schema_id(submission) ==
+            PORT_TEST_PLANT.command_schema_id(schema)
+        @test submission_schema_version(submission) ==
+            PORT_TEST_PLANT.command_schema_version(schema)
+        @test submission_command_sequence(submission) ==
+            PORT_TEST_PLANT.PlantCommandSequence(1)
+        @test submission_timing(submission) ==
+            receive_time_command_timing(timestamp)
+        @test submission_payload(submission) == submission.payload
         @test try_submit!(
             submission_port, submission, Int64(1_000)).status ==
             PortTransferSucceeded
@@ -310,6 +376,20 @@ end
         @test process_next_command!(
             bridge, state, Int64(1_100)).status ==
             PortTransferSucceeded
+        descriptor = state.descriptor_scratch[]
+        @test submission_session(descriptor) == submission_session(submission)
+        @test submission_stream_sequence(descriptor) ==
+            submission_stream_sequence(submission)
+        @test submission_endpoint(descriptor) ==
+            submission_endpoint(submission)
+        @test submission_schema_id(descriptor) ==
+            submission_schema_id(submission)
+        @test submission_schema_version(descriptor) ==
+            submission_schema_version(submission)
+        @test submission_command_sequence(descriptor) ==
+            submission_command_sequence(submission)
+        @test submission_timing(descriptor) == submission_timing(submission)
+        @test submission_payload(descriptor) == submission_payload(submission)
         @test active_command_correlations(state) == 1
         @test command_payload_accounting(submission_port).consumer_leased == 1
 
@@ -320,12 +400,20 @@ end
         @test outcome_stage(outcome) == CoreCommandOutcome
         @test outcome_boundary_reason(outcome) == NoPortRejection
         @test outcome_reason(outcome) == :applied
+        @test outcome_session(outcome) == session
+        @test outcome_stream_sequence(outcome) == StreamSequence(1)
         @test outcome_terminal_kind(outcome) ==
             PORT_TEST_PLANT.AppliedCommand
+        @test outcome_presentation_id(outcome) !== nothing
+        @test outcome_superseding_presentation_id(outcome) === nothing
         @test outcome_endpoint(outcome) ==
             PORT_TEST_PLANT.CommandEndpointID(:hil_dm)
         @test outcome_model_endpoint(outcome) == outcome_endpoint(outcome)
         @test outcome_timing(outcome) == submission.timing
+        @test outcome_requested_effective_timestamp(outcome) == timestamp
+        @test outcome_terminal_timestamp(outcome) == timestamp
+        @test outcome_lateness(outcome) ==
+            zero(PORT_TEST_PLANT.PlantDuration)
         @test outcome_ingress_execution_ns(outcome) == 1_000
         @test outcome_publication_execution_ns(outcome) == 1_200
         @test outcome_payload(completion_port, outcome) ≈
@@ -433,6 +521,8 @@ end
             outcome = take_command_outcome(completion_port)
             @test outcome_stage(outcome) == BoundaryCommandOutcome
             @test outcome.boundary_reason == expected_reason
+            @test outcome_presentation_id(outcome) === nothing
+            @test outcome_superseding_presentation_id(outcome) === nothing
             @test release_outcome!(completion_port, outcome).status ==
                 PortTransferSucceeded
             stream += 1
@@ -559,6 +649,93 @@ end
         release_outcome!(completion_port, duplicate_outcome)
     end
 
+    @testset "Core supersession preserves HIL correlation" begin
+        schema = port_test_schema(
+            sequence_policy=PORT_TEST_PLANT.CommandSequencePolicy(
+                reordered=PORT_TEST_PLANT.AcceptSequence),
+            effective_time_policy=
+                PORT_TEST_PLANT.CommandEffectiveTimePolicy(
+                    supersession=
+                        PORT_TEST_PLANT.SupersedeOlderPendingCommands))
+        endpoint = port_test_endpoint(schema; capacity=3)
+        ports = prepare_command_ports(
+            endpoint,
+            [zeros(3) for _ in 1:3];
+            session=RunSessionID(57),
+            payload_pool_id=UInt64(116),
+            outcome_credit_pool_id=UInt64(117),
+            submission_capacity=3,
+            completion_capacity=3)
+        submission_port = command_submission_port(ports)
+        completion_port = command_completion_port(ports)
+        bridge = prepare_command_bridge(ports, endpoint)
+        state = CommandBridgeState(bridge)
+
+        for (stream, sequence, receive_ns, effective_ns) in (
+            (1, 3, 1, 100),
+            (2, 2, 2, 80),
+            (3, 4, 3, 90),
+        )
+            lease_ref = Ref(PayloadLeaseRef(0, 0, 0, 0))
+            @test try_claim_command_payload!(lease_ref, submission_port) ==
+                PayloadTransitionSucceeded
+            fill!(
+                producer_command_payload(submission_port, lease_ref[]),
+                sequence / 10)
+            receive = PORT_TEST_PLANT.PlantTimestamp(receive_ns)
+            timing = receive_time_command_timing(
+                receive;
+                requested_effective_timestamp=
+                    PORT_TEST_PLANT.PlantTimestamp(effective_ns))
+            submission = matching_command_submission(
+                submission_port,
+                StreamSequence(stream),
+                PORT_TEST_PLANT.PlantCommandSequence(sequence),
+                timing,
+                LeasedCommandPayload(lease_ref[]))
+            @test try_submit!(
+                submission_port, submission, Int64(receive_ns)).status ==
+                PortTransferSucceeded
+            @test process_next_command!(
+                bridge, state, Int64(receive_ns)).status ==
+                PortTransferSucceeded
+        end
+
+        @test active_command_correlations(state) == 1
+        superseded = (
+            take_command_outcome(completion_port),
+            take_command_outcome(completion_port),
+        )
+        @test Set(map(outcome_command_sequence, superseded)) == Set((
+            PORT_TEST_PLANT.PlantCommandSequence(2),
+            PORT_TEST_PLANT.PlantCommandSequence(3),
+        ))
+        superseding_presentations =
+            map(outcome_superseding_presentation_id, superseded)
+        @test all(!isnothing, superseding_presentations)
+        @test superseding_presentations[1] ==
+            superseding_presentations[2]
+        for outcome in superseded
+            @test outcome_terminal_kind(outcome) ==
+                PORT_TEST_PLANT.SupersededCommand
+            @test outcome_presentation_id(outcome) !== nothing
+            @test release_outcome!(completion_port, outcome).status ==
+                PortTransferSucceeded
+        end
+
+        @test finish_ready_command!(
+            bridge,
+            state,
+            PORT_TEST_PLANT.PlantTimestamp(90),
+            Int64(90)) == 1
+        applied = take_command_outcome(completion_port)
+        @test outcome_command_sequence(applied) ==
+            PORT_TEST_PLANT.PlantCommandSequence(4)
+        @test outcome_superseding_presentation_id(applied) === nothing
+        @test release_outcome!(completion_port, applied).status ==
+            PortTransferSucceeded
+    end
+
     @testset "Preparation, lease, and full backpressure" begin
         schema = port_test_schema()
         endpoint = port_test_endpoint(schema)
@@ -583,6 +760,12 @@ end
             session,
             payload_pool_id=UInt64(120),
             outcome_credit_pool_id=UInt64(121))
+        @test_throws PortError prepare_command_ports(
+            endpoint,
+            [1.0, 2.0];
+            session,
+            payload_pool_id=UInt64(120),
+            outcome_credit_pool_id=UInt64(121))
         shared_command_buffer = zeros(3)
         @test_throws PortError prepare_command_ports(
             endpoint,
@@ -596,6 +779,13 @@ end
             session,
             payload_pool_id=UInt64(120),
             outcome_credit_pool_id=UInt64(120))
+        @test_throws PortError prepare_command_ports(
+            endpoint,
+            [zeros(3)];
+            session,
+            payload_pool_id=UInt64(120),
+            outcome_credit_pool_id=UInt64(121),
+            submission_capacity=true)
 
         ports = prepare_command_ports(
             endpoint,
@@ -942,6 +1132,7 @@ end
             PortTransferSucceeded,
             1,
             PortTransferSucceeded,
+            0.25,
             PortTransferSucceeded)
         @test inline_command_cycle!(
             ports, bridge, state, outcome_ref, 1, 1) == expected
@@ -1039,6 +1230,14 @@ end
         readiness,
         leases[2][],
         Int64(2_000))
+    @test acquisition_completion_session(first) == session
+    @test acquisition_completion_sequence(first) == StreamSequence(1)
+    @test acquisition_completion_id(first) ==
+        PORT_TEST_PLANT.AcquisitionID(:wfs_pixels)
+    @test acquisition_completion_timestamp(first) ==
+        PORT_TEST_PLANT.PlantTimestamp(100)
+    @test acquisition_completion_readiness(first) == readiness
+    @test acquisition_completion_publication_ns(first) == 1_000
     @test try_publish!(port, first).status == PortTransferSucceeded
     @test try_publish!(port, second).status == PortFull
     @test producer_product(port, leases[2][]).observation ==
@@ -1146,6 +1345,64 @@ end
         PayloadTransitionSucceeded
     @test abort_product!(port, abort_ref[]) ==
         PayloadTransitionSucceeded
+
+    @testset "Product-storage alias dispatch" begin
+        storage = zeros(Float32, 2, 2)
+        plane_metadata = AdaptiveOpticsSim.OpticalPlaneMetadata(
+            AdaptiveOpticsSim.DetectorPlane(),
+            storage;
+            coordinate_domain=AdaptiveOpticsSim.MetricCoordinates(),
+            sampling=(1.0f0, 1.0f0))
+        intensity = AdaptiveOpticsSim.IntensityMap(
+            plane_metadata, storage)
+        observation = AdaptiveOpticsSim.WFSObservation(
+            storage; units=:electrons, layout=:detector_pixels)
+        measurement = AdaptiveOpticsSim.WFSMeasurement(
+            storage; units=:radian, kind=:wavefront_estimate)
+        product_storage =
+            AdaptiveOpticsHIL.Ports._acquisition_product_storage
+        @test Base.invokelatest(product_storage, intensity) === storage
+        @test Base.invokelatest(product_storage, observation) === storage
+        @test Base.invokelatest(product_storage, measurement) === storage
+
+        # A dispatch barrier prevents the compiler from folding these
+        # constant-false ambiguity resolvers out of coverage instrumentation.
+        may_alias = AdaptiveOpticsHIL.Ports._product_storage_may_alias
+        @test !Base.invokelatest(may_alias, nothing, nothing)
+        @test !Base.invokelatest(may_alias, nothing, ())
+        @test !Base.invokelatest(may_alias, (), nothing)
+        @test !Base.invokelatest(may_alias, nothing, Ref(1))
+        @test !Base.invokelatest(may_alias, Ref(1), nothing)
+        shared_ref = Ref(1)
+        @test Base.invokelatest(may_alias, shared_ref, shared_ref)
+        shared_array = zeros(1)
+        @test Base.invokelatest(
+            may_alias, (shared_array,), shared_array)
+        @test Base.invokelatest(
+            may_alias, shared_array, (shared_array,))
+        @test !Base.invokelatest(
+            may_alias, (zeros(1),), zeros(1))
+        @test !Base.invokelatest(
+            may_alias, zeros(1), (zeros(1),))
+        @test !Base.invokelatest(may_alias, :left, :right)
+
+        shared_observation = AdaptiveOpticsSim.WFSObservation(
+            zeros(Float32, 2, 2);
+            units=:electrons,
+            layout=:detector_pixels)
+        wrapped_aliases = [
+            PORT_TEST_PLANT.AcquisitionProducts(
+                shared_observation; metadata=(kind=:wfs_pixels,)),
+            PORT_TEST_PLANT.AcquisitionProducts(
+                shared_observation; metadata=(kind=:wfs_pixels,)),
+        ]
+        @test_throws PortError prepare_acquisition_completion_port(
+            PORT_TEST_PLANT.AcquisitionID(:wrapped_aliases),
+            wrapped_aliases;
+            session,
+            product_pool_id=UInt64(144),
+            delivery_contract=delivery)
+    end
 
     bad_products = [
         PORT_TEST_PLANT.AcquisitionProducts(

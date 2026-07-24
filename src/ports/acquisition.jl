@@ -45,11 +45,12 @@ end
 @inline _acquisition_product_storage(product::WFSMeasurement) =
     measurement_storage(product)
 
-@inline _product_storage_may_alias(::Nothing, ::Nothing) = false
-@inline _product_storage_may_alias(::Nothing, ::Tuple) = false
-@inline _product_storage_may_alias(::Tuple, ::Nothing) = false
-@inline _product_storage_may_alias(::Nothing, right) = false
-@inline _product_storage_may_alias(left, ::Nothing) = false
+# Julia emits no coverage counters for these tested constant dispatch leaves.
+@inline _product_storage_may_alias(::Nothing, ::Nothing) = false # COV_EXCL_LINE
+@inline _product_storage_may_alias(::Nothing, ::Tuple) = false # COV_EXCL_LINE
+@inline _product_storage_may_alias(::Tuple, ::Nothing) = false # COV_EXCL_LINE
+@inline _product_storage_may_alias(::Nothing, right) = false # COV_EXCL_LINE
+@inline _product_storage_may_alias(left, ::Nothing) = false # COV_EXCL_LINE
 @inline _product_storage_may_alias(
     left::AbstractArray,
     right::AbstractArray) = Base.mightalias(left, right)
@@ -87,7 +88,7 @@ function _product_storage_may_alias(left, right::Tuple)
     return false
 end
 
-@inline _product_storage_may_alias(left, right) = false
+@inline _product_storage_may_alias(left, right) = false # COV_EXCL_LINE
 
 @inline function _acquisition_products_may_alias(
     left::AcquisitionProducts,
