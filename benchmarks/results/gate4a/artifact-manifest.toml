@@ -1,5 +1,5 @@
 artifact_file = "2026-07-24-serial-boundary.toml"
-artifact_sha256 = "870fdfb7fe89bb102d36949d2a98f08cf2c54ef9315a37aed48c157f405788f3"
+artifact_sha256 = "967898d7f541c4063581ac896233a76aecee4d289f47fae47703ee852e3e3a66"
 contract_sha256 = "5e3b1d0bfa25553d9ee23c1fde204916c5f757b2ea9482165b2f1867c93ddfc7"
 schema_version = 1
-source_revision = "6ce4b8b883fab42293951f3dcc5cdc11fbeccabf"
+source_revision = "891c4060e0845650aadcb3f2a320ab22affb4af2"
