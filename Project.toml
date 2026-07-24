@@ -2,3 +2,15 @@ name = "AdaptiveOpticsHIL"
 uuid = "c50291de-c366-4d66-93e5-abfdaae8bfec"
 version = "0.1.0"
 authors = ["Darryl Gamroth <dgamroth@rubus.ca>"]
+
+[compat]
+Aqua = "0.8"
+Test = "1"
+julia = "1.12"
+
+[extras]
+Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Aqua", "Test"]
