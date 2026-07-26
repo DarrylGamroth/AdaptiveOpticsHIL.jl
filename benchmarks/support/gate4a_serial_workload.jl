@@ -6,6 +6,7 @@ using AdaptiveOpticsHIL.Serial
 using AdaptiveOpticsSim
 using AdaptiveOpticsSim.Plant
 using AdaptiveOpticsSim.Plant: AbsoluteCommand, ClipInvalidCommand
+using AdaptiveOpticsSim.Plant: AllPathVisibility
 using AdaptiveOpticsSim.Plant: ColdPlantModelDefinition
 using AdaptiveOpticsSim.Plant: CommandEffectiveTimePolicy
 using AdaptiveOpticsSim.Plant: CommandSequencePolicy
@@ -13,6 +14,7 @@ using AdaptiveOpticsSim.Plant: CommandSilencePolicy, CommandValuePolicy
 using AdaptiveOpticsSim.Plant: EnforceOnApplication
 using AdaptiveOpticsSim.Plant: PreservePendingCommands
 using AdaptiveOpticsSim.Plant: PreparedPathExecutor
+using AdaptiveOpticsSim.Plant: PupilPlanePlacement
 using AdaptiveOpticsSim.Plant: UniformCommandBounds
 using AdaptiveOpticsSim.Plant: acquisition_product_sequence
 using AdaptiveOpticsSim.Plant: acquisition_products
@@ -350,7 +352,9 @@ function _prepare_gate4a_plant(config::Gate4AWorkloadConfig)
     optic = ControllableOpticDefinition(
         :hil_dm,
         Gate4AReducedOrderOpticModel(),
-        (schema,))
+        (schema,);
+        placement=PupilPlanePlacement(),
+        visibility=AllPathVisibility())
     definition = PlantDefinition(
         ;
         telescope,

@@ -14,7 +14,7 @@ Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [sources]
 AdaptiveOpticsHIL = {path = ".."}
-AdaptiveOpticsSim = {url = "https://github.com/DarrylGamroth/AdaptiveOpticsSim.jl.git", rev = "9ddb77d41b7bac748e62e123cf6a0ff289de3b45"}
+AdaptiveOpticsSim = {url = "https://github.com/DarrylGamroth/AdaptiveOpticsSim.jl.git", rev = "29019a0c9e4ede2f8a821203a5430411c2886fa0"}
 Clocks = {url = "https://github.com/DarrylGamroth/Clocks.jl.git", rev = "1b705421648b70b6d171f8a95d6c2d16c2444d0b"}
 HdrHistogram = {url = "https://github.com/DarrylGamroth/HdrHistogram.jl.git", rev = "5b800689d2be55bf4103fd51b38cf92859f74aa1"}
 
