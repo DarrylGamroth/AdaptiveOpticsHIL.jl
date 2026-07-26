@@ -5,6 +5,7 @@ using AdaptiveOpticsHIL.Ports: command_bridge_event_loop
 using AdaptiveOpticsSim
 using AdaptiveOpticsSim.Plant
 using AdaptiveOpticsSim.Plant: AbsoluteCommand, ClipInvalidCommand
+using AdaptiveOpticsSim.Plant: AllPathVisibility
 using AdaptiveOpticsSim.Plant: ColdPlantModelDefinition
 using AdaptiveOpticsSim.Plant: CommandEffectiveTimePolicy
 using AdaptiveOpticsSim.Plant: CommandSequencePolicy
@@ -13,6 +14,7 @@ using AdaptiveOpticsSim.Plant: EnforceOnApplication
 using AdaptiveOpticsSim.Plant: PreservePendingCommands
 using AdaptiveOpticsSim.Plant: PlantEventLoopState
 using AdaptiveOpticsSim.Plant: PreparedPathExecutor
+using AdaptiveOpticsSim.Plant: PupilPlanePlacement
 using AdaptiveOpticsSim.Plant: UniformCommandBounds
 using AdaptiveOpticsSim.Plant: acquisition_products
 using AdaptiveOpticsSim.Plant: command_basis, command_basis_revision
@@ -265,7 +267,9 @@ function serial_test_plant()
     optic = ControllableOpticDefinition(
         :hil_dm,
         HILReducedOrderOpticModel(),
-        (schema,))
+        (schema,);
+        placement=PupilPlanePlacement(),
+        visibility=AllPathVisibility())
     definition = PlantDefinition(
         ;
         telescope,
