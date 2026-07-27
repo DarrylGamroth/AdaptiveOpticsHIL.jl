@@ -1,10 +1,81 @@
 using AdaptiveOpticsHIL.Ownership
+using AdaptiveOpticsHIL.Timing
+using AdaptiveOpticsSim.Plant: PlantTimestamp, plant_nanoseconds
 using Test
 
 struct LeasedStressDescriptor
     sequence::UInt64
     lease::PayloadLeaseRef
     guard::UInt64
+end
+
+function run_timestamp_mapping_publication_stress(
+    iterations::Int=20_000)
+    owner = TimestampMappingOwnerID(:stress_mapping_owner)
+    domain = ExternalTimestampDomainID(:stress_clock)
+    registry = prepare_timestamp_mappings(iterations; owner)
+    startup_gate = Threads.Atomic{UInt8}(0)
+    writer_state = Threads.Atomic{UInt8}(0)
+
+    reader = Threads.@spawn begin
+        startup_gate[] = UInt8(1)
+        last_version = UInt32(0)
+        valid = true
+        while last_version < UInt32(iterations)
+            count = timestamp_mapping_count(registry)
+            if iszero(count)
+                state = writer_state[]
+                state == UInt8(2) && return false
+                state == UInt8(1) &&
+                    iszero(timestamp_mapping_count(registry)) &&
+                    return false
+                yield()
+                continue
+            end
+            mapping = timestamp_mapping_at(registry, count)
+            mapped = map_external_timestamp(mapping, Int64(0))
+            version = timestamp_mapping_version(mapped).value
+            valid &= external_timestamp_domain(mapped) == domain
+            valid &= version >= last_version
+            valid &= plant_nanoseconds(mapped_plant_timestamp(mapped)) ==
+                     Int64(version)
+            valid || break
+            last_version = version
+            if writer_state[] == UInt8(2)
+                return false
+            end
+            yield()
+        end
+        return valid && last_version == UInt32(iterations)
+    end
+
+    writer = Threads.@spawn begin
+        valid = false
+        try
+            while startup_gate[] != UInt8(1)
+                yield()
+            end
+            valid = true
+            for version in 1:iterations
+                mapping = ExternalTimestampMapping(
+                    domain,
+                    TimestampMappingVersion(version),
+                    Int64(0),
+                    PlantTimestamp(version);
+                    valid_from_ticks=Int64(0),
+                    valid_through_ticks=Int64(1))
+                valid &= install_timestamp_mapping!(
+                    registry, owner, mapping) === mapping
+                valid || break
+                iszero(version % 64) && yield()
+            end
+        finally
+            writer_state[] = valid ? UInt8(1) : UInt8(2)
+        end
+        return valid
+    end
+
+    return fetch(writer), fetch(reader), timestamp_mapping_count(registry)
 end
 
 const STRESS_GUARD = UInt64(0xd1ce_cafe_a05c_5a5a)
@@ -36,6 +107,15 @@ function publish_stress_descriptor!(
         submit_status == RingFull || return false
         yield()
     end
+end
+
+@testset "Timestamp-mapping release/acquire publication" begin
+    @test Threads.nthreads() >= 2
+    writer_valid, reader_valid, published =
+        run_timestamp_mapping_publication_stress()
+    @test writer_valid
+    @test reader_valid
+    @test published == 20_000
 end
 
 function run_two_owner_stress(
