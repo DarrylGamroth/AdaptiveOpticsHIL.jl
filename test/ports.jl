@@ -1,10 +1,39 @@
+import AdaptiveOpticsHIL
 using AdaptiveOpticsHIL.Ownership
 using AdaptiveOpticsHIL.Ports
+using AdaptiveOpticsHIL.Timing
 import AdaptiveOpticsSim
 
 const PORT_TEST_PLANT = AdaptiveOpticsSim.Plant
 const PORT_TESTS_WITH_COVERAGE =
     Base.JLOptions().code_coverage != 0
+
+function port_test_mapped_timestamp(
+    domain::ExternalTimestampDomainID,
+    source_timestamp_ticks::Integer,
+    version::TimestampMappingVersion,
+    plant_timestamp::PORT_TEST_PLANT.PlantTimestamp;
+    uncertainty::PORT_TEST_PLANT.PlantDuration=
+        zero(PORT_TEST_PLANT.PlantDuration))
+    mapping = ExternalTimestampMapping(
+        domain,
+        version,
+        source_timestamp_ticks,
+        plant_timestamp;
+        uncertainty,
+        valid_from_ticks=source_timestamp_ticks,
+        valid_through_ticks=source_timestamp_ticks)
+    return map_external_timestamp(mapping, source_timestamp_ticks)
+end
+
+function port_value_bytes(reference::Ref{T}) where {T}
+    bytes = Vector{UInt8}(undef, sizeof(T))
+    GC.@preserve reference unsafe_copyto!(
+        pointer(bytes),
+        Ptr{UInt8}(Base.unsafe_convert(Ptr{T}, reference)),
+        sizeof(T))
+    return bytes
+end
 
 function port_test_schema(::Type{T}=Float64;
     id=:hil_command,
@@ -237,6 +266,14 @@ end
 
 @testset "Port contracts and command bridge" begin
     @testset "Canonical identities and timing" begin
+        @test Base.isexported(
+            AdaptiveOpticsHIL.Timing, :ExternalTimestampDomainID)
+        @test Base.isexported(
+            AdaptiveOpticsHIL.Timing, :TimestampMappingVersion)
+        @test !Base.isexported(
+            AdaptiveOpticsHIL.Ports, :ExternalTimestampDomainID)
+        @test !Base.isexported(
+            AdaptiveOpticsHIL.Ports, :TimestampMappingVersion)
         @test_throws PortError PortResourcePolicy(
             true, 1, RetainProducerOnFull())
         @test_throws PortError PortResourcePolicy(
@@ -250,9 +287,6 @@ end
         @test_throws PortError PortSchemaID(Symbol(""))
         @test_throws PortError PortSchemaVersion(0)
         @test_throws PortError PortSchemaVersion(false)
-        @test_throws PortError ExternalTimestampDomainID(Symbol(""))
-        @test_throws PortError TimestampMappingVersion(0)
-
         session = RunSessionID(7)
         schema_id = PortSchemaID(:command_submission)
         timestamp_domain = ExternalTimestampDomainID(:rtc_ptp)
@@ -277,7 +311,7 @@ end
         receive_only = receive_time_command_timing(receive)
         @test source_timestamp_kind(receive_only) == ReceiveTimestampOnly
         @test source_timestamp_domain(receive_only) === nothing
-        @test source_timestamp_nanoseconds(receive_only) === nothing
+        @test source_timestamp_ticks(receive_only) === nothing
         @test timestamp_mapping_version(receive_only) === nothing
         @test mapped_source_timestamp(receive_only) == receive
         @test command_receive_timestamp(receive_only) == receive
@@ -285,16 +319,30 @@ end
         @test timestamp_mapping_uncertainty(receive_only) ==
             zero(PORT_TEST_PLANT.PlantDuration)
 
-        mapped = mapped_source_command_timing(
+        mapped_result = port_test_mapped_timestamp(
             timestamp_domain,
             Int64(9_000),
             TimestampMappingVersion(3),
-            PORT_TEST_PLANT.PlantTimestamp(95),
+            PORT_TEST_PLANT.PlantTimestamp(95);
+            uncertainty=PORT_TEST_PLANT.PlantDuration(5))
+        mapped = mapped_source_command_timing(
+            mapped_result,
             receive;
-            mapping_uncertainty=PORT_TEST_PLANT.PlantDuration(5))
+            requested_effective_timestamp=
+                PORT_TEST_PLANT.PlantTimestamp(95))
+        @test Base.allocatedinline(CommandTimingMetadata)
+        if PORT_TESTS_WITH_COVERAGE
+            @test_skip "allocation assertions are disabled under coverage"
+        else
+            @test @allocated(mapped_source_command_timing(
+                mapped_result,
+                receive;
+                requested_effective_timestamp=
+                    PORT_TEST_PLANT.PlantTimestamp(95))) == 0
+        end
         @test source_timestamp_kind(mapped) == MappedSourceTimestamp
         @test source_timestamp_domain(mapped) == timestamp_domain
-        @test source_timestamp_nanoseconds(mapped) == 9_000
+        @test source_timestamp_ticks(mapped) == 9_000
         @test timestamp_mapping_version(mapped) ==
             TimestampMappingVersion(3)
         @test mapped_source_timestamp(mapped) ==
@@ -304,33 +352,44 @@ end
             PORT_TEST_PLANT.PlantTimestamp(95)
         @test timestamp_mapping_uncertainty(mapped) ==
             PORT_TEST_PLANT.PlantDuration(5)
+        exact_uncertainty_lead = mapped_source_command_timing(
+            port_test_mapped_timestamp(
+                timestamp_domain,
+                Int64(9_002),
+                TimestampMappingVersion(3),
+                PORT_TEST_PLANT.PlantTimestamp(105);
+                uncertainty=PORT_TEST_PLANT.PlantDuration(5)),
+            receive)
+        @test mapped_source_timestamp(exact_uncertainty_lead) ==
+            PORT_TEST_PLANT.PlantTimestamp(105)
         mapped_from_narrow_integer = mapped_source_command_timing(
-            timestamp_domain,
-            Int32(9_001),
-            TimestampMappingVersion(3),
-            PORT_TEST_PLANT.PlantTimestamp(95),
+            port_test_mapped_timestamp(
+                timestamp_domain,
+                Int32(9_001),
+                TimestampMappingVersion(3),
+                PORT_TEST_PLANT.PlantTimestamp(95);
+                uncertainty=PORT_TEST_PLANT.PlantDuration(5)),
             receive;
-            mapping_uncertainty=PORT_TEST_PLANT.PlantDuration(5))
-        @test source_timestamp_nanoseconds(
+            requested_effective_timestamp=
+                PORT_TEST_PLANT.PlantTimestamp(95))
+        @test source_timestamp_ticks(
             mapped_from_narrow_integer) == 9_001
         @test_throws PortError mapped_source_command_timing(
-            ExternalTimestampDomainID(:rtc_ptp),
+            port_test_mapped_timestamp(
+                ExternalTimestampDomainID(:rtc_ptp),
+                Int64(9_000),
+                TimestampMappingVersion(3),
+                PORT_TEST_PLANT.PlantTimestamp(106);
+                uncertainty=PORT_TEST_PLANT.PlantDuration(5)),
+            receive;
+            requested_effective_timestamp=
+                PORT_TEST_PLANT.PlantTimestamp(106))
+        @test !applicable(
+            mapped_source_command_timing,
+            timestamp_domain,
             Int64(9_000),
             TimestampMappingVersion(3),
-            PORT_TEST_PLANT.PlantTimestamp(106),
-            receive;
-            mapping_uncertainty=PORT_TEST_PLANT.PlantDuration(5))
-        @test_throws PortError mapped_source_command_timing(
-            ExternalTimestampDomainID(:rtc_ptp),
-            typemax(UInt64),
-            TimestampMappingVersion(3),
-            receive,
-            receive)
-        @test_throws PortError mapped_source_command_timing(
-            timestamp_domain,
-            true,
-            TimestampMappingVersion(3),
-            receive,
+            PORT_TEST_PLANT.PlantTimestamp(95),
             receive)
 
         delivery = AdapterDeliveryContract(
@@ -556,12 +615,13 @@ end
             (CommandTimestampMismatch,
              s -> replace_submission(
                  s; timing=mapped_source_command_timing(
-                     ExternalTimestampDomainID(:rtc),
-                     Int64(20),
-                     TimestampMappingVersion(1),
-                     PORT_TEST_PLANT.PlantTimestamp(
-                         PORT_TEST_PLANT.plant_nanoseconds(
-                             s.timing.receive_timestamp) - 1),
+                     port_test_mapped_timestamp(
+                         ExternalTimestampDomainID(:rtc),
+                         Int64(20),
+                         TimestampMappingVersion(1),
+                         PORT_TEST_PLANT.PlantTimestamp(
+                             PORT_TEST_PLANT.plant_nanoseconds(
+                                 s.timing.receive_timestamp) - 1)),
                      s.timing.receive_timestamp))),
         )
         stream = 2
@@ -1170,20 +1230,68 @@ end
         state = CommandBridgeState(bridge)
         bridge_workspace = CommandBridgeWorkspace(bridge)
         receive = PORT_TEST_PLANT.PlantTimestamp(10)
-        timing = mapped_source_command_timing(
+        mapping_owner = TimestampMappingOwnerID(:rtc_synchronization)
+        mappings = prepare_timestamp_mappings(2; owner=mapping_owner)
+        mapping_v2 = ExternalTimestampMapping(
             domain,
-            Int64(5_000),
             TimestampMappingVersion(2),
-            PORT_TEST_PLANT.PlantTimestamp(9),
+            Int64(5_000),
+            PORT_TEST_PLANT.PlantTimestamp(9);
+            uncertainty=PORT_TEST_PLANT.PlantDuration(1),
+            valid_from_ticks=Int64(5_000),
+            valid_through_ticks=Int64(5_000))
+        install_timestamp_mapping!(mappings, mapping_owner, mapping_v2)
+        accounting_before_mapping_failure =
+            descriptor_accounting(submission_port)
+        @test_throws TimestampMappingError map_external_timestamp(
+            mappings,
+            domain,
+            TimestampMappingVersion(1),
+            Int64(5_000))
+        accounting_after_mapping_failure =
+            descriptor_accounting(submission_port)
+        @test accounting_after_mapping_failure.capacity ==
+            accounting_before_mapping_failure.capacity
+        @test accounting_after_mapping_failure.occupancy ==
+            accounting_before_mapping_failure.occupancy
+        @test accounting_after_mapping_failure.producer_sequence ==
+            accounting_before_mapping_failure.producer_sequence
+        @test accounting_after_mapping_failure.consumer_sequence ==
+            accounting_before_mapping_failure.consumer_sequence
+        timing = mapped_source_command_timing(
+            map_external_timestamp(
+                mappings,
+                domain,
+                TimestampMappingVersion(2),
+                Int64(5_000)),
             receive;
-            requested_effective_timestamp=receive,
-            mapping_uncertainty=PORT_TEST_PLANT.PlantDuration(1))
+            requested_effective_timestamp=receive)
+        timing_reference = Ref(timing)
+        timing_bytes = port_value_bytes(timing_reference)
         submission = matching_command_submission(
             submission_port,
             StreamSequence(1),
             PORT_TEST_PLANT.PlantCommandSequence(1),
             timing,
             InlineCommandPayload(0.1))
+        mapping_v3 = ExternalTimestampMapping(
+            domain,
+            TimestampMappingVersion(3),
+            Int64(5_000),
+            PORT_TEST_PLANT.PlantTimestamp(8);
+            uncertainty=PORT_TEST_PLANT.PlantDuration(1),
+            valid_from_ticks=Int64(5_000),
+            valid_through_ticks=Int64(5_000))
+        install_timestamp_mapping!(mappings, mapping_owner, mapping_v3)
+        @test port_value_bytes(timing_reference) == timing_bytes
+        @test mapped_source_timestamp(timing) ==
+            PORT_TEST_PLANT.PlantTimestamp(9)
+        @test timestamp_mapping_version(timing) ==
+            TimestampMappingVersion(2)
+        @test timestamp_mapping_version(submission_timing(submission)) ==
+            TimestampMappingVersion(2)
+        @test mapped_source_timestamp(submission_timing(submission)) ==
+            PORT_TEST_PLANT.PlantTimestamp(9)
         try_submit!(submission_port, submission, Int64(10))
         process_next_command!(
             bridge, state, bridge_workspace, Int64(11))
@@ -1194,13 +1302,16 @@ end
         @test source_timestamp_domain(outcome_timing(outcome)) == domain
         @test timestamp_mapping_version(outcome_timing(outcome)) ==
             TimestampMappingVersion(2)
+        @test mapped_source_timestamp(outcome_timing(outcome)) ==
+            PORT_TEST_PLANT.PlantTimestamp(9)
         release_outcome!(completion_port, outcome)
 
         stale_timing = mapped_source_command_timing(
-            domain,
-            Int64(5_001),
-            TimestampMappingVersion(1),
-            PORT_TEST_PLANT.PlantTimestamp(10),
+            port_test_mapped_timestamp(
+                domain,
+                Int64(5_001),
+                TimestampMappingVersion(1),
+                PORT_TEST_PLANT.PlantTimestamp(10)),
             PORT_TEST_PLANT.PlantTimestamp(11);
             requested_effective_timestamp=
                 PORT_TEST_PLANT.PlantTimestamp(11))

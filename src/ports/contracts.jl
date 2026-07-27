@@ -169,36 +169,10 @@ PortSchemaVersion(value::Integer) = PortSchemaVersion(
         value, :descriptor_schema, "port descriptor-schema version"),
     _POSITIVE_COUNTER_TOKEN)
 
-"""Stable identity of one external timestamp coordinate."""
-struct ExternalTimestampDomainID
-    name::Symbol
-
-    function ExternalTimestampDomainID(name::Symbol)
-        isempty(String(name)) && throw(PortError(
-            :timestamp_domain, :empty_id,
-            "external timestamp-domain identity must not be empty"))
-        return new(name)
-    end
-end
-
-"""Positive version of the mapping from an external domain into plant time."""
-struct TimestampMappingVersion
-    value::UInt32
-
-    TimestampMappingVersion(value::UInt32, ::_PositiveCounterToken) =
-        new(value)
-end
-
-TimestampMappingVersion(value::Integer) = TimestampMappingVersion(
-    _checked_positive_uint32(
-        value, :timestamp_mapping, "timestamp-mapping version"),
-    _POSITIVE_COUNTER_TOKEN)
-
 const _PortCounter = Union{
     RunSessionID,
     StreamSequence,
     PortSchemaVersion,
-    TimestampMappingVersion,
 }
 
 Base.:(==)(left::T, right::T) where {T<:_PortCounter} =
@@ -215,19 +189,11 @@ Base.isequal(left::PortSchemaID, right::PortSchemaID) =
 Base.hash(value::PortSchemaID, seed::UInt) =
     hash(value.name, hash(PortSchemaID, seed))
 
-Base.:(==)(left::ExternalTimestampDomainID,
-    right::ExternalTimestampDomainID) = left.name == right.name
-Base.isequal(left::ExternalTimestampDomainID,
-    right::ExternalTimestampDomainID) = isequal(left.name, right.name)
-Base.hash(value::ExternalTimestampDomainID, seed::UInt) =
-    hash(value.name, hash(ExternalTimestampDomainID, seed))
-
 function Base.show(io::IO, value::_PortCounter)
     print(io, nameof(typeof(value)), "(", value.value, ")")
 end
 
-function Base.show(io::IO, value::Union{
-    PortSchemaID,ExternalTimestampDomainID})
+function Base.show(io::IO, value::PortSchemaID)
     print(io, nameof(typeof(value)), "(", repr(value.name), ")")
 end
 
@@ -301,22 +267,18 @@ end
     MappedSourceTimestamp = 0x02
 end
 
-const _NO_TIMESTAMP_DOMAIN =
-    ExternalTimestampDomainID(:receive_timestamp_only)
-const _NO_MAPPING_VERSION =
-    TimestampMappingVersion(UInt32(0), _POSITIVE_COUNTER_TOKEN)
-
 struct _CommandTimingToken end
 const _COMMAND_TIMING_TOKEN = _CommandTimingToken()
 
 """
-Canonical command timing after any external timestamp has already been mapped
-onto the plant timeline. Mapping estimation remains user-integration work.
+Canonical command timing after the HIL timing boundary has mapped any external
+timestamp onto the plant timeline. User integration supplies synchronization
+observations; it does not supply an arbitrary mapped plant timestamp.
 """
 struct CommandTimingMetadata
     source_kind::SourceTimestampKind
     source_domain::ExternalTimestampDomainID
-    source_timestamp_ns::Int64
+    source_timestamp_ticks::Int64
     mapping_version::TimestampMappingVersion
     mapped_source_timestamp::PlantTimestamp
     receive_timestamp::PlantTimestamp
@@ -327,7 +289,7 @@ struct CommandTimingMetadata
         ::_CommandTimingToken,
         source_kind::SourceTimestampKind,
         source_domain::ExternalTimestampDomainID,
-        source_timestamp_ns::Int64,
+        source_timestamp_ticks::Int64,
         mapping_version::TimestampMappingVersion,
         mapped_source_timestamp::PlantTimestamp,
         receive_timestamp::PlantTimestamp,
@@ -336,7 +298,7 @@ struct CommandTimingMetadata
         return new(
             source_kind,
             source_domain,
-            source_timestamp_ns,
+            source_timestamp_ticks,
             mapping_version,
             mapped_source_timestamp,
             receive_timestamp,
@@ -358,9 +320,9 @@ function receive_time_command_timing(
     return CommandTimingMetadata(
         _COMMAND_TIMING_TOKEN,
         ReceiveTimestampOnly,
-        _NO_TIMESTAMP_DOMAIN,
+        _NO_EXTERNAL_TIMESTAMP_DOMAIN,
         Int64(0),
-        _NO_MAPPING_VERSION,
+        _NO_TIMESTAMP_MAPPING_VERSION,
         receive_timestamp,
         receive_timestamp,
         requested_effective_timestamp,
@@ -368,22 +330,20 @@ function receive_time_command_timing(
 end
 
 """
-    mapped_source_command_timing(domain, source_timestamp_ns, mapping_version,
-        mapped_source_timestamp, receive_timestamp;
-        requested_effective_timestamp=mapped_source_timestamp,
-        mapping_uncertainty=zero(PlantDuration))
+    mapped_source_command_timing(mapped, receive_timestamp;
+        requested_effective_timestamp=mapped_plant_timestamp(mapped))
 
-Carry a user-supplied, versioned mapping of an external timestamp. A mapped
-source instant may lead receive time only within the declared uncertainty.
+Carry the exact result of a HIL-owned, versioned external timestamp mapping. A
+mapped source instant may lead receive time only within the mapping's declared
+uncertainty.
 """
 function mapped_source_command_timing(
-    source_domain::ExternalTimestampDomainID,
-    source_timestamp_ns::Int64,
-    mapping_version::TimestampMappingVersion,
-    mapped_source_timestamp::PlantTimestamp,
+    mapped::MappedExternalTimestamp,
     receive_timestamp::PlantTimestamp;
-    requested_effective_timestamp::PlantTimestamp=mapped_source_timestamp,
-    mapping_uncertainty::PlantDuration=zero(PlantDuration))
+    requested_effective_timestamp::PlantTimestamp=
+        mapped_plant_timestamp(mapped))
+    mapped_source_timestamp = mapped_plant_timestamp(mapped)
+    mapping_uncertainty = timestamp_mapping_uncertainty(mapped)
     mapped_ns = Int128(plant_nanoseconds(mapped_source_timestamp))
     receive_ns = Int128(plant_nanoseconds(receive_timestamp))
     uncertainty_ns = Int128(plant_nanoseconds(mapping_uncertainty))
@@ -394,43 +354,14 @@ function mapped_source_command_timing(
     return CommandTimingMetadata(
         _COMMAND_TIMING_TOKEN,
         MappedSourceTimestamp,
-        source_domain,
-        source_timestamp_ns,
-        mapping_version,
+        external_timestamp_domain(mapped),
+        source_timestamp_ticks(mapped),
+        timestamp_mapping_version(mapped),
         mapped_source_timestamp,
         receive_timestamp,
         requested_effective_timestamp,
         mapping_uncertainty)
 end
-
-function mapped_source_command_timing(
-    source_domain::ExternalTimestampDomainID,
-    source_timestamp_ns::Integer,
-    mapping_version::TimestampMappingVersion,
-    mapped_source_timestamp::PlantTimestamp,
-    receive_timestamp::PlantTimestamp;
-    kwargs...)
-    typemin(Int64) <= source_timestamp_ns <= typemax(Int64) ||
-        throw(PortError(:command_timing, :source_timestamp_overflow,
-            "external source timestamp exceeds Int64 range"))
-    return mapped_source_command_timing(
-        source_domain,
-        Int64(source_timestamp_ns),
-        mapping_version,
-        mapped_source_timestamp,
-        receive_timestamp;
-        kwargs...)
-end
-
-mapped_source_command_timing(
-    ::ExternalTimestampDomainID,
-    ::Bool,
-    ::TimestampMappingVersion,
-    ::PlantTimestamp,
-    ::PlantTimestamp;
-    kwargs...) =
-    throw(PortError(:command_timing, :invalid_source_timestamp,
-        "external source timestamp must be an integer count, not Bool"))
 
 source_timestamp_kind(timing::CommandTimingMetadata) = timing.source_kind
 
@@ -439,9 +370,9 @@ source_timestamp_kind(timing::CommandTimingMetadata) = timing.source_kind
     return timing.source_domain
 end
 
-@inline function source_timestamp_nanoseconds(timing::CommandTimingMetadata)
+@inline function source_timestamp_ticks(timing::CommandTimingMetadata)
     timing.source_kind == ReceiveTimestampOnly && return nothing
-    return timing.source_timestamp_ns
+    return timing.source_timestamp_ticks
 end
 
 @inline function timestamp_mapping_version(timing::CommandTimingMetadata)
@@ -495,7 +426,7 @@ end
         return CommandTimestampMismatch
     timing.source_domain == contract.source_domain ||
         return CommandTimestampMismatch
-    timing.mapping_version.value >= contract.minimum_mapping_version.value ||
+    timing.mapping_version >= contract.minimum_mapping_version ||
         return CommandTimestampMismatch
     return NoPortRejection
 end

@@ -53,6 +53,13 @@ using AdaptiveOpticsSim.Plant: validate_acquisition_product_contract
 import AdaptiveOpticsSim.Plant: acquisition_product_contract
 
 import ..AdaptiveOpticsHIL: AdaptiveOpticsHILError
+using ..Timing: ExternalTimestampDomainID, MappedExternalTimestamp
+using ..Timing: TimestampMappingVersion
+using ..Timing: _NO_EXTERNAL_TIMESTAMP_DOMAIN
+using ..Timing: _NO_TIMESTAMP_MAPPING_VERSION
+using ..Timing: external_timestamp_domain, mapped_plant_timestamp
+import ..Timing: source_timestamp_ticks, timestamp_mapping_uncertainty
+import ..Timing: timestamp_mapping_version
 using ..Ownership: PayloadLeaseRef
 using ..Ownership: PayloadPool, PayloadPoolExhausted, PayloadStatus
 using ..Ownership: PayloadPoolDeficit
@@ -245,7 +252,6 @@ end
 
 export PortError
 export RunSessionID, StreamSequence, PortSchemaID, PortSchemaVersion
-export ExternalTimestampDomainID, TimestampMappingVersion
 export run_session_value, stream_sequence_value
 export PortStatus, PortTransferSucceeded, PortFull, PortEmpty, PortClosed
 export PortRejected, PortRejectionReason, NoPortRejection
@@ -275,7 +281,7 @@ export SourceTimestampKind, ReceiveTimestampOnly, MappedSourceTimestamp
 export CommandTimingMetadata, receive_time_command_timing
 export mapped_source_command_timing
 export source_timestamp_kind, source_timestamp_domain
-export source_timestamp_nanoseconds, timestamp_mapping_version
+export source_timestamp_ticks, timestamp_mapping_version
 export mapped_source_timestamp, command_receive_timestamp
 export command_effective_timestamp, timestamp_mapping_uncertainty
 export AbstractCommandTimingContract, ReceiveTimeTimingContract

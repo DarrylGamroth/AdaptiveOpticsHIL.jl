@@ -79,7 +79,7 @@ jobs:
       - name: Instantiate
         run: julia --project=. --startup-file=no -e 'using Pkg; Pkg.instantiate()'
 
-      - name: Run two-owner ownership stress
+      - name: Run two-owner ownership and timing stress
         run: julia --project=. --startup-file=no test/ownership_concurrency.jl
 
   benchmark-contract:
