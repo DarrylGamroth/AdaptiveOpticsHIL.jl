@@ -39,6 +39,64 @@ const SERIAL_IDENTITY_2X2 = [1.0 0.0; 0.0 1.0]
 const SERIAL_DUE_STEP_ALLOCATION_BUDGET = 2_048
 const SERIAL_COMMAND_STEP_ALLOCATION_BUDGET = 2_048
 
+struct SerialTestLifecycleFailureConfiguration <:
+    AbstractOpticalExecutionConfiguration
+    phase::Symbol
+    failure::ExecutionOwnerError
+end
+
+mutable struct SerialTestLifecycleFailureExecutor <:
+    AdaptiveOpticsSim.Plant.AbstractOpticalPathBatchExecutor
+    configuration::SerialTestLifecycleFailureConfiguration
+    armed::Bool
+    failed::Bool
+end
+
+function AdaptiveOpticsHIL.Execution._prepare_optical_execution(
+    configuration::SerialTestLifecycleFailureConfiguration,
+    ::AdaptiveOpticsSim.Plant.PreparedPlantEventLoop,
+    ::AdaptiveOpticsSim.Plant.PlantEventLoopState,
+    ::AdaptiveOpticsSim.Plant.PlantEventLoopWorkspace,
+    ::RunSessionID,
+)
+    return SerialTestLifecycleFailureExecutor(
+        configuration, false, false)
+end
+
+AdaptiveOpticsHIL.Execution._execution_is_quiescent(
+    ::SerialTestLifecycleFailureExecutor) = true
+AdaptiveOpticsHIL.Execution._execution_accounting(
+    ::SerialTestLifecycleFailureExecutor) = nothing
+AdaptiveOpticsHIL.Execution._execution_is_armed(
+    executor::SerialTestLifecycleFailureExecutor) = executor.armed
+
+function AdaptiveOpticsHIL.Execution._arm_optical_execution!(
+    executor::SerialTestLifecycleFailureExecutor,
+)
+    executor.configuration.phase == :arm &&
+        throw(executor.configuration.failure)
+    executor.armed = true
+    return executor
+end
+
+function AdaptiveOpticsHIL.Execution._start_optical_execution!(
+    executor::SerialTestLifecycleFailureExecutor,
+)
+    executor.configuration.phase == :start &&
+        throw(executor.configuration.failure)
+    return executor
+end
+
+AdaptiveOpticsHIL.Execution._stop_optical_execution!(
+    executor::SerialTestLifecycleFailureExecutor) = executor
+
+function AdaptiveOpticsHIL.Execution._mark_optical_execution_failed!(
+    executor::SerialTestLifecycleFailureExecutor,
+)
+    executor.failed = true
+    return executor
+end
+
 function serial_test_execution_owner_configuration(
     mode::AbstractExecutionOwnerMode;
     outer_owner_count::Integer=1,
@@ -1026,6 +1084,65 @@ end
         @test invalid_execution isa SerialRunError
         @test invalid_execution.reason ==
             :invalid_optical_execution
+
+        arm_failure = ExecutionOwnerError(
+            :execution_owners,
+            :test_arm_failure,
+            "test execution-owner arm failure")
+        arm_failure_fixture = serial_test_fixture(
+            session=RunSessionID(0x7c30),
+            optical_execution=
+                SerialTestLifecycleFailureConfiguration(
+                    :arm, arm_failure),
+            arm=false,
+            start=false,
+        )
+        arm_attempt = begin_serial_arm!(
+            arm_failure_fixture.run,
+            arm_failure_fixture.clock)
+        arm_readiness = AdapterReadinessSnapshot(
+            run_session(arm_failure_fixture.run),
+            execution_clock_identity(arm_failure_fixture.clock),
+            AdapterReady,
+            Clocks.time_nanos(arm_failure_fixture.clock))
+        observed_arm_failure = captured_serial_error() do
+            arm_serial_run!(arm_attempt, arm_readiness)
+        end
+        @test observed_arm_failure === arm_failure
+        @test run_phase(arm_failure_fixture.run) == RunFailed
+        @test run_termination_component(
+            run_termination(
+                arm_failure_fixture.run)) == :serial_run
+        @test run_termination_reason(
+            run_termination(
+                arm_failure_fixture.run)) == :ExecutionOwnerError
+        @test serial_optical_execution(
+            arm_failure_fixture.run).failed
+
+        start_failure = ExecutionOwnerError(
+            :execution_owners,
+            :test_start_failure,
+            "test execution-owner start failure")
+        start_failure_fixture = serial_test_fixture(
+            session=RunSessionID(0x7c31),
+            optical_execution=
+                SerialTestLifecycleFailureConfiguration(
+                    :start, start_failure),
+            start=false,
+        )
+        observed_start_failure = captured_serial_error() do
+            start_serial_run!(start_failure_fixture.armed)
+        end
+        @test observed_start_failure === start_failure
+        @test run_phase(start_failure_fixture.run) == RunFailed
+        @test run_termination_component(
+            run_termination(
+                start_failure_fixture.run)) == :serial_run
+        @test run_termination_reason(
+            run_termination(
+                start_failure_fixture.run)) == :ExecutionOwnerError
+        @test serial_optical_execution(
+            start_failure_fixture.run).failed
 
         serial_oracle = run_fake_rtc(frame_count=8)
         owner_oracle = run_fake_rtc(

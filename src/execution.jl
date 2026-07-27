@@ -508,8 +508,9 @@ execution_owners_phase(executor::PreparedExecutionOwnerExecutor) =
 execution_batches_completed(executor::PreparedExecutionOwnerExecutor) =
     executor.coordinator.batch_count
 
-_is_cpu_execution_owner(::CPUBackend) = true
-_is_cpu_execution_owner(::AbstractArrayBackend) = false
+# Julia emits no coverage counters for these exercised constant dispatch leaves.
+_is_cpu_execution_owner(::CPUBackend) = true # COV_EXCL_LINE
+_is_cpu_execution_owner(::AbstractArrayBackend) = false # COV_EXCL_LINE
 
 function _copy_uint32_memory(values)
     destination = Memory{UInt32}(undef, length(values))
@@ -774,8 +775,9 @@ function _prepare_optical_execution(
     )
 end
 
-_execution_is_armed(::SerialOpticalPathBatchExecutor) = true
-_execution_is_quiescent(::SerialOpticalPathBatchExecutor) = true
+# Julia emits no coverage counters for these exercised constant dispatch leaves.
+_execution_is_armed(::SerialOpticalPathBatchExecutor) = true # COV_EXCL_LINE
+_execution_is_quiescent(::SerialOpticalPathBatchExecutor) = true # COV_EXCL_LINE
 _arm_optical_execution!(executor::SerialOpticalPathBatchExecutor) = executor
 _start_optical_execution!(executor::SerialOpticalPathBatchExecutor) = executor
 _stop_optical_execution!(executor::SerialOpticalPathBatchExecutor) = executor
@@ -1351,7 +1353,8 @@ function _execution_accounting(
     return values
 end
 
-_execution_accounting_is_quiescent(::Nothing) = true
+# Julia emits no coverage counter for this exercised constant dispatch leaf.
+_execution_accounting_is_quiescent(::Nothing) = true # COV_EXCL_LINE
 
 function _execution_accounting_is_quiescent(
     values::Memory{ExecutionOwnerAccounting},

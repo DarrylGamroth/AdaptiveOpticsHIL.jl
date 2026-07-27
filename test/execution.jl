@@ -584,6 +584,22 @@ end
 @testset "Long-lived optical execution owners" begin
     @test_throws ExecutionOwnerError ExecutionOwnerID(0)
     @test_throws ExecutionOwnerError ExecutionOwnerID(true)
+    owner_id = ExecutionOwnerID(7)
+    equivalent_owner_id = ExecutionOwnerID(7)
+    @test isequal(owner_id, equivalent_owner_id)
+    @test hash(owner_id) == hash(equivalent_owner_id)
+    @test AdaptiveOpticsHIL.Execution._is_cpu_execution_owner(
+        CPUBackend())
+    @test !AdaptiveOpticsHIL.Execution._is_cpu_execution_owner(
+        AdaptiveOpticsSim.CUDABackend())
+    serial_executor =
+        EXECUTION_TEST_PLANT.SerialOpticalPathBatchExecutor()
+    @test AdaptiveOpticsHIL.Execution._execution_is_armed(
+        serial_executor)
+    @test AdaptiveOpticsHIL.Execution._execution_is_quiescent(
+        serial_executor)
+    @test AdaptiveOpticsHIL.Execution._execution_accounting_is_quiescent(
+        nothing)
     @test_throws ExecutionOwnerError HybridExecutionOwnerIdle(0)
     @test_throws ExecutionOwnerError HybridExecutionOwnerIdle(true)
     @test HybridExecutionOwnerIdle(4).spin_count == 4
