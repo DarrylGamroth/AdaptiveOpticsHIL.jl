@@ -14,11 +14,11 @@ module Ownership
 import ..AdaptiveOpticsHIL: AdaptiveOpticsHILError
 
 export OwnershipError
-export CONSERVATIVE_CACHE_LINE_BYTES
 export RingStatus, RingTransferSucceeded, RingFull, RingEmpty, RingClosed
-export RingBatchResult, RingAccounting, SPSCDescriptorRing
-export close_ring!, ring_accounting, ring_capacity, ring_cursor_separation_bytes
-export ring_is_closed, try_submit!, try_take!, try_take_batch!
+export RingBatchResult, RingAccounting
+export SPSCLayoutContract, SPSCDescriptorRing
+export close_ring!, ring_accounting, ring_capacity, ring_is_closed
+export try_submit!, try_take!, try_take_batch!
 export PayloadStatus
 export PayloadTransitionSucceeded, PayloadPoolExhausted
 export WrongPayloadPool, WrongPayloadSession, InvalidPayloadSlot
@@ -30,6 +30,9 @@ export payload_pool_accounting, payload_pool_capacity, payload_pool_id
 export payload_session_id, payload_slot, producer_payload, queue_payload!
 export release_payload!, try_claim_payload!, validate_quiescent_pool
 
+public MAX_SUPPORTED_CACHE_LINE_BYTES, SPSCLayoutEvidence
+public maximum_cache_line_bytes, ring_layout_contract, validate_ring_layout
+
 """Invalid ownership configuration, access, state, or accounting."""
 struct OwnershipError <: AdaptiveOpticsHILError
     component::Symbol
@@ -38,20 +41,77 @@ struct OwnershipError <: AdaptiveOpticsHILError
 end
 
 """
-Conservative separation, in bytes, maintained between independently written
-ring publication fields.
+Largest cache-line size, in bytes, supported by the prepared SPSC cursor
+layout.
 
-This Gate 4A constant intentionally does not claim target-specific cache
-topology or generated-code validation; those remain later promotion evidence.
+The maintained x86-64 and Apple Silicon targets use 64- or 128-byte cache
+lines. A target with a larger line requires a different cursor layout.
 """
-const CONSERVATIVE_CACHE_LINE_BYTES = 128
+const MAX_SUPPORTED_CACHE_LINE_BYTES = 128
+const _MIN_SUPPORTED_CACHE_LINE_BYTES = 64
 
 const _WORD_BYTES = sizeof(UInt64)
-const _PREFIX_WORDS = CONSERVATIVE_CACHE_LINE_BYTES ÷ _WORD_BYTES
-const _BETWEEN_FIELD_WORDS = _PREFIX_WORDS - 2
+const _PREFIX_WORDS = MAX_SUPPORTED_CACHE_LINE_BYTES ÷ _WORD_BYTES
+const _OWNER_SECTION_WORDS = 2 * _PREFIX_WORDS
+const _BETWEEN_OWNER_WORDS = _OWNER_SECTION_WORDS - 3
 
 @inline _zero_words(::Val{N}) where {N} =
     ntuple(_ -> zero(UInt64), Val(N))
+
+"""
+    SPSCLayoutContract([maximum_cache_line_bytes])
+
+Prepared target contract for an `SPSCDescriptorRing`. The declared value is an
+upper bound on the target's coherent cache-line size, not a runtime discovery
+mechanism. Maintained contracts accept power-of-two bounds from 64 through 128
+bytes. Proving the layout against 128 bytes also proves isolation for a
+64-byte-line target.
+"""
+struct SPSCLayoutContract
+    maximum_cache_line_bytes::Int
+
+    function SPSCLayoutContract(
+        maximum_cache_line_bytes::Integer=
+            MAX_SUPPORTED_CACHE_LINE_BYTES)
+        (
+            maximum_cache_line_bytes >=
+                _MIN_SUPPORTED_CACHE_LINE_BYTES &&
+            maximum_cache_line_bytes <=
+                MAX_SUPPORTED_CACHE_LINE_BYTES &&
+            ispow2(maximum_cache_line_bytes)
+        ) || throw(OwnershipError(
+            :descriptor_ring_layout,
+            :invalid_cache_line_upper_bound,
+            "cache-line upper bound must be a power of two from 64 through 128 bytes"))
+        return new(Int(maximum_cache_line_bytes))
+    end
+end
+
+"""Return the cache-line upper bound declared by `contract`."""
+maximum_cache_line_bytes(contract::SPSCLayoutContract) =
+    contract.maximum_cache_line_bytes
+
+"""
+Cold structural evidence returned by `validate_ring_layout`.
+
+`object_base_modulo` records the actual cursor-object address modulo the
+declared cache-line upper bound. The remaining offsets are byte offsets from
+that address. Together they permit independent reconstruction of field
+alignment, line membership, separation, and boundary padding without exposing
+an unstable absolute address.
+"""
+struct SPSCLayoutEvidence
+    maximum_cache_line_bytes::Int
+    cursor_storage_bytes::Int
+    object_base_modulo::Int
+    producer_sequence_offset::Int
+    producer_cached_consumer_sequence_offset::Int
+    producer_slot_offset::Int
+    consumer_sequence_offset::Int
+    consumer_cached_producer_sequence_offset::Int
+    consumer_slot_offset::Int
+    closed_offset::Int
+end
 
 """
 Result of one nonblocking descriptor-ring operation.
@@ -93,38 +153,43 @@ struct RingAccounting
 end
 
 # The prefix and suffix keep every independently accessed atomic field at least
-# one conservative line from the allocation boundary. The two owner-local cache
-# fields share only their respective owner's publication line. Lifecycle state
-# occupies a third line.
+# one maximum line from the allocation boundary. Each owner section spans two
+# maximum lines so its cached remote cursor and local slot cannot spill into the
+# next owner's publication line under a merely word-aligned object allocation.
+# Lifecycle state occupies a separately written line after both owner sections.
 mutable struct _SPSCCursors
     prefix::NTuple{_PREFIX_WORDS,UInt64}
     @atomic producer_sequence::UInt64
     producer_cached_consumer_sequence::UInt64
-    producer_consumer_gap::NTuple{_BETWEEN_FIELD_WORDS,UInt64}
+    producer_slot::UInt64
+    producer_consumer_gap::NTuple{_BETWEEN_OWNER_WORDS,UInt64}
     @atomic consumer_sequence::UInt64
     consumer_cached_producer_sequence::UInt64
-    consumer_closed_gap::NTuple{_BETWEEN_FIELD_WORDS,UInt64}
+    consumer_slot::UInt64
+    consumer_closed_gap::NTuple{_BETWEEN_OWNER_WORDS,UInt64}
     @atomic closed::UInt64
     suffix::NTuple{_PREFIX_WORDS,UInt64}
 end
 
 function _SPSCCursors()
     prefix_padding = _zero_words(Val(_PREFIX_WORDS))
-    between_field_padding = _zero_words(Val(_BETWEEN_FIELD_WORDS))
+    between_owner_padding = _zero_words(Val(_BETWEEN_OWNER_WORDS))
     return _SPSCCursors(
         prefix_padding,
         zero(UInt64),
         zero(UInt64),
-        between_field_padding,
+        one(UInt64),
+        between_owner_padding,
         zero(UInt64),
         zero(UInt64),
-        between_field_padding,
+        one(UInt64),
+        between_owner_padding,
         zero(UInt64),
         prefix_padding)
 end
 
 """
-    SPSCDescriptorRing{T}(capacity)
+    SPSCDescriptorRing{T}(capacity[, layout_contract])
 
 Prepare fixed storage for `capacity` compact descriptors of concrete immutable
 type `T`. The type must use Julia's inline array representation; it may contain
@@ -134,15 +199,20 @@ consumer may call `try_take!` or `try_take_batch!`.
 
 The owner restriction is stronger than task or thread identity: callers must
 not concurrently invoke one side from several tasks even if those tasks happen
-to execute on one thread.
+to execute on one thread. Preparation validates the actual cursor-object
+address against `layout_contract` before returning.
 """
 struct SPSCDescriptorRing{T}
     slots::Memory{T}
     capacity::UInt64
     cursors::_SPSCCursors
+    layout_contract::SPSCLayoutContract
 end
 
-function SPSCDescriptorRing{T}(capacity::Integer) where {T}
+function SPSCDescriptorRing{T}(
+    capacity::Integer,
+    layout_contract::SPSCLayoutContract=
+        SPSCLayoutContract()) where {T}
     isconcretetype(T) || throw(OwnershipError(
         :descriptor_ring,
         :abstract_descriptor,
@@ -165,17 +235,30 @@ function SPSCDescriptorRing{T}(capacity::Integer) where {T}
         "SPSC descriptor-ring capacity exceeds the addressable or signed sequence bound"))
 
     capacity_int = Int(capacity)
-    return SPSCDescriptorRing{T}(
+    ring = SPSCDescriptorRing{T}(
         Memory{T}(undef, capacity_int),
         UInt64(capacity_int),
-        _SPSCCursors())
+        _SPSCCursors(),
+        layout_contract)
+    validate_ring_layout(ring)
+    return ring
 end
 
 """Return the prepared descriptor capacity."""
 ring_capacity(ring::SPSCDescriptorRing) = Int(ring.capacity)
 
-@inline _ring_slot(sequence::UInt64, capacity::UInt64) =
-    Int(rem(sequence, capacity)) + 1
+"""Return the prepared cache-line contract for `ring`."""
+ring_layout_contract(ring::SPSCDescriptorRing) = ring.layout_contract
+
+# Prepared slot cursors are always in `1:ring.capacity`, and capacity is
+# constructor-checked against `typemax(Int)`. Keeping slot traversal separate
+# from the wrapping publication sequence makes arbitrary capacities correct at
+# the UInt64 sequence boundary and removes division from descriptor transfer.
+@inline _ring_slot_index(slot::UInt64) =
+    signed(slot)
+
+@inline _next_ring_slot(slot::UInt64, capacity::UInt64) =
+    ifelse(slot == capacity, one(UInt64), slot + one(UInt64))
 
 @inline function _ring_closed(cursors::_SPSCCursors)
     return (@atomic :acquire cursors.closed) != zero(UInt64)
@@ -245,8 +328,11 @@ function try_submit!(ring::SPSCDescriptorRing{T}, descriptor::T) where {T}
         occupancy >= ring.capacity && return RingFull
     end
 
-    slot = _ring_slot(producer_sequence, ring.capacity)
+    producer_slot = cursors.producer_slot
+    slot = _ring_slot_index(producer_slot)
     @inbounds ring.slots[slot] = descriptor
+    cursors.producer_slot =
+        _next_ring_slot(producer_slot, ring.capacity)
     @atomic :release cursors.producer_sequence =
         producer_sequence + one(UInt64)
     return RingTransferSucceeded
@@ -291,8 +377,11 @@ function try_take!(
     _, status = _consumer_availability(cursors, consumer_sequence)
     status == RingTransferSucceeded || return status
 
-    slot = _ring_slot(consumer_sequence, ring.capacity)
+    consumer_slot = cursors.consumer_slot
+    slot = _ring_slot_index(consumer_slot)
     @inbounds output[] = ring.slots[slot]
+    cursors.consumer_slot =
+        _next_ring_slot(consumer_slot, ring.capacity)
     @atomic :release cursors.consumer_sequence =
         consumer_sequence + one(UInt64)
     return RingTransferSucceeded
@@ -322,11 +411,14 @@ function try_take_batch!(
     available = producer_sequence - consumer_sequence
     count = Int(min(available, UInt64(max_items)))
     destination_index = firstindex(destination)
+    consumer_slot = cursors.consumer_slot
     @inbounds for offset in 0:(count - 1)
-        sequence = consumer_sequence + UInt64(offset)
-        slot = _ring_slot(sequence, ring.capacity)
+        slot = _ring_slot_index(consumer_slot)
         destination[destination_index + offset] = ring.slots[slot]
+        consumer_slot =
+            _next_ring_slot(consumer_slot, ring.capacity)
     end
+    cursors.consumer_slot = consumer_slot
     @atomic :release cursors.consumer_sequence =
         consumer_sequence + UInt64(count)
     return RingBatchResult(RingTransferSucceeded, count)
@@ -355,21 +447,156 @@ function ring_accounting(ring::SPSCDescriptorRing)
         _ring_closed(cursors))
 end
 
-"""
-    ring_cursor_separation_bytes()
+@inline function _cursor_field_offset(field::Symbol)
+    index = Base.fieldindex(_SPSCCursors, field)
+    return Int(fieldoffset(_SPSCCursors, index))
+end
 
-Return the byte distance between the producer-published and consumer-released
-sequence fields. Gate 4A verifies this structural lower bound; allocation
-alignment, target cache topology, and generated atomics remain Gate 8 evidence.
+@noinline function _layout_error(reason::Symbol, msg::String)
+    throw(OwnershipError(:descriptor_ring_layout, reason, msg))
+end
+
+@inline _layout_line(
+    evidence::SPSCLayoutEvidence,
+    offset::Int) =
+    fld(evidence.object_base_modulo + offset,
+        evidence.maximum_cache_line_bytes)
+
+function _validate_spsc_layout_evidence(
+    contract::SPSCLayoutContract,
+    evidence::SPSCLayoutEvidence)
+    line_bytes = maximum_cache_line_bytes(contract)
+    evidence.maximum_cache_line_bytes == line_bytes ||
+        _layout_error(
+            :layout_contract_mismatch,
+            "layout evidence does not match the prepared cache-line contract")
+    0 <= evidence.object_base_modulo < line_bytes ||
+        _layout_error(
+            :invalid_object_address_modulo,
+            "cursor-object address modulo is outside the declared cache line")
+
+    storage_bytes = evidence.cursor_storage_bytes
+    storage_bytes >= 6 * line_bytes ||
+        _layout_error(
+            :insufficient_cursor_storage,
+            "cursor storage is too small for isolated owner sections, lifecycle state, and boundary padding")
+
+    producer_sequence = evidence.producer_sequence_offset
+    producer_cache =
+        evidence.producer_cached_consumer_sequence_offset
+    producer_slot = evidence.producer_slot_offset
+    consumer_sequence = evidence.consumer_sequence_offset
+    consumer_cache =
+        evidence.consumer_cached_producer_sequence_offset
+    consumer_slot = evidence.consumer_slot_offset
+    closed = evidence.closed_offset
+
+    for offset in (
+        producer_sequence,
+        producer_cache,
+        producer_slot,
+        consumer_sequence,
+        consumer_cache,
+        consumer_slot,
+        closed)
+        (
+            offset >= 0 &&
+            offset <= storage_bytes - _WORD_BYTES
+        ) || _layout_error(
+            :atomic_field_outside_storage,
+            "cursor field falls outside the cursor object")
+        (evidence.object_base_modulo + offset) % _WORD_BYTES == 0 ||
+            _layout_error(
+                :misaligned_atomic_field,
+                "cursor field is not naturally aligned for UInt64 atomic access")
+        _layout_line(evidence, offset) ==
+            _layout_line(evidence, offset + _WORD_BYTES - 1) ||
+            _layout_error(
+                :atomic_field_straddles_cache_line,
+                "cursor field straddles the declared cache-line boundary")
+    end
+
+    (
+        producer_sequence + _WORD_BYTES <= producer_cache &&
+        producer_cache + _WORD_BYTES <= producer_slot &&
+        producer_slot + _WORD_BYTES <= consumer_sequence &&
+        consumer_sequence + _WORD_BYTES <= consumer_cache &&
+        consumer_cache + _WORD_BYTES <= consumer_slot &&
+        consumer_slot + _WORD_BYTES <= closed
+    ) || _layout_error(
+        :overlapping_cursor_fields,
+        "cursor fields overlap or are not in producer/consumer/lifecycle order")
+
+    producer_line = _layout_line(evidence, producer_sequence)
+    producer_cache_line = _layout_line(evidence, producer_cache)
+    producer_slot_line = _layout_line(evidence, producer_slot)
+    consumer_line = _layout_line(evidence, consumer_sequence)
+    consumer_cache_line = _layout_line(evidence, consumer_cache)
+    consumer_slot_line = _layout_line(evidence, consumer_slot)
+    closed_line = _layout_line(evidence, closed)
+
+    (
+        consumer_sequence - producer_sequence >= 2 * line_bytes &&
+        closed - consumer_sequence >= 2 * line_bytes &&
+        producer_line != consumer_line &&
+        producer_line != consumer_cache_line &&
+        producer_line != consumer_slot_line &&
+        producer_cache_line != consumer_line &&
+        producer_cache_line != consumer_cache_line &&
+        producer_cache_line != consumer_slot_line &&
+        producer_slot_line != consumer_line &&
+        producer_slot_line != consumer_cache_line &&
+        producer_slot_line != consumer_slot_line &&
+        producer_line != closed_line &&
+        producer_cache_line != closed_line &&
+        producer_slot_line != closed_line &&
+        consumer_line != closed_line &&
+        consumer_cache_line != closed_line &&
+        consumer_slot_line != closed_line
+    ) || _layout_error(
+        :insufficient_publication_separation,
+        "producer-owned, consumer-owned, and closure fields do not occupy isolated cache lines")
+
+    (
+        producer_sequence >= line_bytes &&
+        storage_bytes - (closed + _WORD_BYTES) >= line_bytes
+    ) || _layout_error(
+        :insufficient_boundary_padding,
+        "publication fields are not isolated from both cursor-object boundaries")
+
+    return evidence
+end
+
 """
-function ring_cursor_separation_bytes()
-    producer_field =
-        Base.fieldindex(_SPSCCursors, :producer_sequence)
-    consumer_field =
-        Base.fieldindex(_SPSCCursors, :consumer_sequence)
-    return Int(
-        fieldoffset(_SPSCCursors, consumer_field) -
-        fieldoffset(_SPSCCursors, producer_field))
+    validate_ring_layout(ring)
+
+Verify the actual cursor-object address, field offsets, natural atomic
+alignment, cache-line membership, publication-field separation, and boundary
+padding against the prepared contract. This is a cold preparation/diagnostic
+operation; it is not part of descriptor transfer. The evidence remains valid
+because maintained Julia runtimes use nonmoving heap storage for the mutable
+cursor object.
+"""
+function validate_ring_layout(ring::SPSCDescriptorRing)
+    contract = ring.layout_contract
+    line_bytes = maximum_cache_line_bytes(contract)
+    cursors = ring.cursors
+    object_base_modulo = GC.@preserve cursors begin
+        address = UInt(pointer_from_objref(cursors))
+        Int(rem(address, UInt(line_bytes)))
+    end
+    evidence = SPSCLayoutEvidence(
+        line_bytes,
+        sizeof(_SPSCCursors),
+        object_base_modulo,
+        _cursor_field_offset(:producer_sequence),
+        _cursor_field_offset(:producer_cached_consumer_sequence),
+        _cursor_field_offset(:producer_slot),
+        _cursor_field_offset(:consumer_sequence),
+        _cursor_field_offset(:consumer_cached_producer_sequence),
+        _cursor_field_offset(:consumer_slot),
+        _cursor_field_offset(:closed))
+    return _validate_spsc_layout_evidence(contract, evidence)
 end
 
 """
