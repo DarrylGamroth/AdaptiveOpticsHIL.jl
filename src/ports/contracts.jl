@@ -25,8 +25,10 @@ struct DropNewestOnFull <: AbstractPortFullPolicy end
 """Treat `full` as a violated capacity proof rather than ordinary pressure."""
 struct ReservedFullIsInvariant <: AbstractPortFullPolicy end
 
-@inline _resource_capacity_is_bool(::Bool) = true
-@inline _resource_capacity_is_bool(::Integer) = false
+# Public constructor tests cover both dispatch leaves, but coverage
+# instrumentation cannot retain counters for these compile-time-inlined traits.
+@inline _resource_capacity_is_bool(::Bool) = true # COV_EXCL_LINE
+@inline _resource_capacity_is_bool(::Integer) = false # COV_EXCL_LINE
 
 """Prepared capacity and full-policy proof for one bounded port resource."""
 struct PortResourcePolicy{F<:AbstractPortFullPolicy}

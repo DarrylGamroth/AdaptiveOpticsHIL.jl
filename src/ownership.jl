@@ -697,8 +697,10 @@ struct PayloadPool{P}
     owner_state::_PayloadPoolOwnerState
 end
 
-@inline _payload_capacity_is_bool(::Bool) = true
-@inline _payload_capacity_is_bool(::Integer) = false
+# Public constructor tests cover both dispatch leaves, but coverage
+# instrumentation cannot retain counters for these compile-time-inlined traits.
+@inline _payload_capacity_is_bool(::Bool) = true # COV_EXCL_LINE
+@inline _payload_capacity_is_bool(::Integer) = false # COV_EXCL_LINE
 
 function PayloadPool(
     payloads::AbstractVector{P},

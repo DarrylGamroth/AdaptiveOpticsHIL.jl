@@ -970,6 +970,14 @@ end
         @test Base.invokelatest(
             AdaptiveOpticsHIL.Serial._serial_command_payload_accounting,
             command_submission_port(inline_ports)) === nothing
+        @test Base.invokelatest(
+            AdaptiveOpticsHIL.Serial.
+                _reclaim_serial_command_payload_returns!,
+            command_submission_port(inline_ports)) == 0
+        @test Base.invokelatest(
+            AdaptiveOpticsHIL.Serial.
+                _reclaim_serial_acquisition_returns!,
+            ()) == 0
         accounting_state = SerialRunState(fixture.run)
         accounting_workspace = SerialRunWorkspace(fixture.run)
         accounting = serial_run_accounting(

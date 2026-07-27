@@ -147,7 +147,7 @@ end
         ReservedFullIsInvariant())
 end
 
-@inline _optional_payload_policy(::Nothing) = nothing
+@inline _optional_payload_policy(::Nothing) = nothing # COV_EXCL_LINE
 @inline _optional_payload_policy(pool::PayloadPool) =
     _payload_resource_policy(pool)
 
@@ -155,15 +155,15 @@ end
 @inline _optional_payload_lifecycle(pool::PayloadPool) =
     payload_pool_lifecycle_state(pool)
 
-@inline _optional_lease_return_policy(::Nothing) = nothing
+@inline _optional_lease_return_policy(::Nothing) = nothing # COV_EXCL_LINE
 @inline _optional_lease_return_policy(pool::PayloadPool) =
     _lease_return_policy(pool)
 
 @inline _optional_return_lifecycle(::Nothing) = nothing
 @inline _optional_return_lifecycle(pool::PayloadPool) =
-    _return_lifecycle_state(pool)
+    _return_lifecycle_state(pool) # COV_EXCL_LINE
 
-@inline _optional_payload_deficit(::Nothing) = nothing
+@inline _optional_payload_deficit(::Nothing) = nothing # COV_EXCL_LINE
 @inline _optional_payload_deficit(pool::PayloadPool) =
     payload_pool_deficit(pool)
 

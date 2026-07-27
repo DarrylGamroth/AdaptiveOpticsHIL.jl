@@ -182,7 +182,7 @@ end
 command_submission_port(ports::PreparedCommandPorts) = ports.submission
 command_completion_port(ports::PreparedCommandPorts) = ports.completion
 
-@inline _command_payload_capacity(::Nothing) = typemax(Int)
+@inline _command_payload_capacity(::Nothing) = typemax(Int) # COV_EXCL_LINE
 @inline _command_payload_capacity(pool::PayloadPool) =
     payload_pool_capacity(pool)
 
@@ -783,7 +783,7 @@ outcome_credit_accounting(port::Union{
     CommandSubmissionPort,CommandCompletionPort}) =
     payload_pool_accounting(port.outcome_credit_pool)
 
-@inline _command_payload_returns_can_close(::Nothing) = true
+@inline _command_payload_returns_can_close(::Nothing) = true # COV_EXCL_LINE
 
 @inline function _command_payload_returns_can_close(pool::PayloadPool)
     accounting = payload_pool_accounting(pool)
@@ -797,7 +797,7 @@ end
 
 @inline _close_command_payload_returns!(::Nothing) = nothing
 @inline _close_command_payload_returns!(pool::PayloadPool) =
-    close_payload_returns!(pool)
+    close_payload_returns!(pool) # COV_EXCL_LINE
 
 """
 Close command-payload and terminal-outcome-credit return paths after completion

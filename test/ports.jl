@@ -495,7 +495,14 @@ end
         @test command_payload_accounting(completion_port).free == 8
         @test outcome_credit_accounting(completion_port).free == 8
         @test release_outcome!(completion_port, outcome).status ==
-            PortRejected
+              PortRejected
+        @test close_command_ingress!(ports).status ==
+              PortTransferSucceeded
+        @test close_command_completion!(ports).status ==
+              PortTransferSucceeded
+        leased_close = close_command_return_paths!(ports)
+        @test leased_close.payload_status == RingTransferSucceeded
+        @test leased_close.credit_status == RingTransferSucceeded
     end
 
     @testset "Boundary and core mismatch outcomes" begin
@@ -1304,6 +1311,20 @@ end
         bridge = prepare_command_bridge(ports, endpoint)
         state = CommandBridgeState(bridge)
         workspace = CommandBridgeWorkspace(bridge)
+        inline_policy = port_resource_policy(submission_port)
+        @test maximum_outstanding(inline_policy) == 2
+        inline_payload_policy = payload_resource_policy(submission_port)
+        @test inline_payload_policy.payload === nothing
+        inline_return_policy = lease_return_policy(completion_port)
+        @test inline_return_policy.payload === nothing
+        @test lease_return_lifecycle_state(
+            completion_port).payload === nothing
+        @test payload_ownership_deficit(
+            completion_port).payload === nothing
+        @test Base.invokelatest(
+            reclaim_command_payload_returns!,
+            submission_port,
+            1) === nothing
         @test_throws PortError close_command_completion!(ports)
 
         for sequence in 1:2
@@ -1462,6 +1483,17 @@ end
         end
         @test publication_error isa PortError
         @test publication_error.reason == :publication_after_close
+        capacity_error = try
+            Base.invokelatest(
+                AdaptiveOpticsHIL.Ports.
+                    _command_outcome_publication_error,
+                RingFull)
+            nothing
+        catch error
+            error
+        end
+        @test capacity_error isa PortError
+        @test capacity_error.reason == :credit_capacity_invariant
     end
 end
 
