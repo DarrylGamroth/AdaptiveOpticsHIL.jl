@@ -574,6 +574,7 @@ function run_fake_rtc(;
             break
         end
     end
+    reclaim_serial_returns!(fixture.run)
     accounting = stop_serial_run!(
         fixture.armed, fixture.state, fixture.workspace)
     return (; fixture, trace, accounting)
@@ -969,6 +970,14 @@ end
         @test Base.invokelatest(
             AdaptiveOpticsHIL.Serial._serial_command_payload_accounting,
             command_submission_port(inline_ports)) === nothing
+        @test Base.invokelatest(
+            AdaptiveOpticsHIL.Serial.
+                _reclaim_serial_command_payload_returns!,
+            command_submission_port(inline_ports)) == 0
+        @test Base.invokelatest(
+            AdaptiveOpticsHIL.Serial.
+                _reclaim_serial_acquisition_returns!,
+            ()) == 0
         accounting_state = SerialRunState(fixture.run)
         accounting_workspace = SerialRunWorkspace(fixture.run)
         accounting = serial_run_accounting(
@@ -1005,6 +1014,7 @@ end
         @test port_status(release_product!(
             busy.wfs_port, completion_ref[])) ==
             PortTransferSucceeded
+        @test reclaim_serial_returns!(busy.run) == 1
         @test serial_run_is_quiescent(
             stop_serial_run!(
                 busy.armed, busy.state, busy.workspace))

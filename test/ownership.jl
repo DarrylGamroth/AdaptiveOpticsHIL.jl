@@ -126,13 +126,15 @@ function payload_allocation_bytes(
     lease_bytes = @allocated lease_payload!(pool, lease)
     consumer_access_bytes = @allocated consumer_payload(pool, lease)
     release_bytes = @allocated release_payload!(pool, lease)
+    reclaim_bytes = @allocated reclaim_payload_returns!(pool)
     return (
         claim_bytes,
         producer_access_bytes,
         queue_bytes,
         lease_bytes,
         consumer_access_bytes,
-        release_bytes)
+        release_bytes,
+        reclaim_bytes)
 end
 
 @testset "Bounded SPSC descriptor ring" begin
@@ -501,6 +503,16 @@ end
             [Ref(UInt64(0))], UInt64(0), UInt64(1))
         @test_throws OwnershipError PayloadPool(
             [Ref(UInt64(0))], UInt64(1), UInt64(0))
+        @test_throws OwnershipError PayloadPool(
+            [Ref(UInt64(0)), Ref(UInt64(0))],
+            UInt64(1),
+            UInt64(1);
+            return_capacity=1)
+        @test_throws OwnershipError PayloadPool(
+            [Ref(UInt64(0))],
+            UInt64(1),
+            UInt64(1);
+            return_capacity=true)
 
         payloads = [Ref(UInt64(0)), Ref(UInt64(0))]
         pool = PayloadPool(payloads, UInt64(17), UInt64(23))
@@ -508,9 +520,16 @@ end
         @test payload_pool_id(pool) == 17
         @test payload_session_id(pool) == 23
         @test isbitstype(PayloadLeaseRef)
+        capacity_contract = payload_pool_capacity_contract(pool)
+        @test capacity_contract.capacity == 2
+        @test capacity_contract.maximum_consumer_leases == 2
+        @test capacity_contract.return_capacity == 2
+        @test payload_pool_lifecycle_state(pool) ==
+              PayloadPoolAccepting
+        @test_throws OwnershipError close_payload_returns!(pool)
         accounting = validate_quiescent_pool(pool)
         @test accounting ==
-              PayloadPoolAccounting(2, 2, 0, 0, 0)
+              PayloadPoolAccounting(2, 2, 0, 0, 0, 0, UInt64(0))
     end
 
     @testset "Legal ownership lifecycle" begin
@@ -528,26 +547,37 @@ end
         @test @inferred(producer_payload(pool, lease)) === payloads[1]
         producer_payload(pool, lease)[] = UInt64(42)
         @test payload_pool_accounting(pool) ==
-              PayloadPoolAccounting(2, 1, 1, 0, 0)
+              PayloadPoolAccounting(
+                  2, 1, 1, 0, 0, 0, UInt64(0))
 
         @test @inferred(queue_payload!(pool, lease)) ==
               PayloadTransitionSucceeded
         @test payload_pool_accounting(pool) ==
-              PayloadPoolAccounting(2, 1, 0, 1, 0)
+              PayloadPoolAccounting(
+                  2, 1, 0, 1, 0, 0, UInt64(0))
         @test_throws OwnershipError producer_payload(pool, lease)
 
         @test @inferred(lease_payload!(pool, lease)) ==
               PayloadTransitionSucceeded
         @test @inferred(consumer_payload(pool, lease))[] == 42
         @test payload_pool_accounting(pool) ==
-              PayloadPoolAccounting(2, 1, 0, 0, 1)
+              PayloadPoolAccounting(
+                  2, 1, 0, 0, 1, 0, UInt64(0))
 
         @test @inferred(release_payload!(pool, lease)) ==
               PayloadTransitionSucceeded
         @test release_payload!(pool, lease) ==
               DuplicatePayloadRelease
         @test_throws OwnershipError consumer_payload(pool, lease)
+        @test payload_pool_accounting(pool) ==
+              PayloadPoolAccounting(
+                  2, 1, 0, 0, 0, 1, UInt64(0))
+        @test_throws OwnershipError validate_quiescent_pool(pool)
+        @test @inferred(reclaim_payload_returns!(pool)) ==
+              RingBatchResult(RingTransferSucceeded, 1)
+        @test payload_return_accounting(pool).occupancy == 0
         @test validate_quiescent_pool(pool).free == 2
+        @test payload_pool_accounting(pool).reclaimed == 1
     end
 
     @testset "Abort, exhaustion, and generation reuse" begin
@@ -640,6 +670,8 @@ end
         @test lease_payload!(pool, lease) == WrongPayloadOwner
         @test abort_payload!(pool, lease) == WrongPayloadOwner
         @test release_payload!(pool, lease) == PayloadTransitionSucceeded
+        @test reclaim_payload_returns!(pool) ==
+              RingBatchResult(RingTransferSucceeded, 1)
         @test validate_quiescent_pool(pool).free == 1
     end
 
@@ -669,12 +701,141 @@ end
               Base.RefValue{UInt64}
         @test @inferred(release_payload!(pool, lease)) ==
               PayloadTransitionSucceeded
+        @test @inferred(reclaim_payload_returns!(pool)) ==
+              RingBatchResult(RingTransferSucceeded, 1)
 
         if OWNERSHIP_TESTS_WITH_COVERAGE
             @test_skip "allocation assertions are disabled under coverage"
         else
             @test payload_allocation_bytes(pool, output) ==
-                  (0, 0, 0, 0, 0, 0)
+                  (0, 0, 0, 0, 0, 0, 0)
         end
+
+        pool_type = PayloadPool{Base.RefValue{UInt64}}
+        release_llvm = llvm_text(
+            release_payload!,
+            Tuple{pool_type,PayloadLeaseRef})
+        reclaim_llvm = llvm_text(
+            reclaim_payload_returns!,
+            Tuple{pool_type,Int})
+        for generated_code in (release_llvm, reclaim_llvm)
+            @test occursin(
+                r"load atomic .* acquire",
+                generated_code)
+            @test occursin(
+                r"store atomic .* release",
+                generated_code)
+            @test !occursin("jl_apply_generic", generated_code)
+            @test !occursin("jl_gc_alloc", generated_code)
+            @test !occursin(" urem ", generated_code)
+        end
+    end
+
+    @testset "Reserved return credit, closure, and deficit" begin
+        pool = PayloadPool(
+            [Ref(UInt64(0)), Ref(UInt64(0))],
+            UInt64(71),
+            UInt64(73))
+        leases = [Ref{PayloadLeaseRef}(), Ref{PayloadLeaseRef}()]
+        for output in leases
+            @test try_claim_payload!(output, pool) ==
+                  PayloadTransitionSucceeded
+            @test queue_payload!(pool, output[]) ==
+                  PayloadTransitionSucceeded
+            @test lease_payload!(pool, output[]) ==
+                  PayloadTransitionSucceeded
+        end
+        @test close_payload_pool!(pool) ==
+              PayloadPoolCloseSucceeded
+        @test close_payload_pool!(pool) == PayloadPoolAlreadyClosed
+        @test payload_pool_lifecycle_state(pool) ==
+              PayloadPoolDraining
+        closed_claim = Ref(PayloadLeaseRef(1, 1, 1, 1))
+        @test try_claim_payload!(closed_claim, pool) ==
+              PayloadPoolClosed
+        @test closed_claim[] == PayloadLeaseRef(1, 1, 1, 1)
+        @test_throws OwnershipError close_payload_returns!(pool)
+
+        for output in leases
+            @test release_payload!(pool, output[]) ==
+                  PayloadTransitionSucceeded
+        end
+        accounting = payload_pool_accounting(pool)
+        @test accounting.return_queued == 2
+        @test accounting.consumer_leased == 0
+        @test payload_return_accounting(pool).occupancy == 2
+        @test payload_pool_deficit(pool) ==
+              PayloadPoolDeficit(2, 2, 0, 0, 0, 2)
+
+        @test close_payload_returns!(pool) ==
+              RingTransferSucceeded
+        @test reclaim_payload_returns!(pool, 1) ==
+              RingBatchResult(RingTransferSucceeded, 1)
+        @test payload_return_accounting(pool).closed
+        @test payload_return_accounting(pool).occupancy == 1
+        @test reclaim_payload_returns!(pool, 2) ==
+              RingBatchResult(RingTransferSucceeded, 1)
+        @test reclaim_payload_returns!(pool) ==
+              RingBatchResult(RingClosed, 0)
+        @test validate_quiescent_pool(pool).free == 2
+        @test payload_pool_accounting(pool).reclaimed == 2
+        @test payload_pool_deficit(pool).deficit == 0
+        @test payload_pool_lifecycle_state(pool) ==
+              PayloadPoolDrained
+
+        closed_pool =
+            PayloadPool([Ref(UInt64(0))], UInt64(79), UInt64(83))
+        closed_output = Ref{PayloadLeaseRef}()
+        @test try_claim_payload!(closed_output, closed_pool) ==
+              PayloadTransitionSucceeded
+        @test queue_payload!(closed_pool, closed_output[]) ==
+              PayloadTransitionSucceeded
+        @test lease_payload!(closed_pool, closed_output[]) ==
+              PayloadTransitionSucceeded
+        @test close_ring!(closed_pool.return_ring) ==
+              RingTransferSucceeded
+        @test release_payload!(closed_pool, closed_output[]) ==
+              PayloadReturnPathClosed
+        closed_deficit = payload_pool_deficit(closed_pool)
+        @test closed_deficit.deficit == 1
+        @test closed_deficit.consumer_leased == 1
+
+        full_pool =
+            PayloadPool([Ref(UInt64(0))], UInt64(89), UInt64(97))
+        full_output = Ref{PayloadLeaseRef}()
+        @test try_claim_payload!(full_output, full_pool) ==
+              PayloadTransitionSucceeded
+        @test queue_payload!(full_pool, full_output[]) ==
+              PayloadTransitionSucceeded
+        @test lease_payload!(full_pool, full_output[]) ==
+              PayloadTransitionSucceeded
+        @test try_submit!(full_pool.return_ring, full_output[]) ==
+              RingTransferSucceeded
+        @test release_payload!(full_pool, full_output[]) ==
+              PayloadReturnCreditUnavailable
+        @test payload_pool_accounting(full_pool).consumer_leased == 1
+        @test_throws OwnershipError reclaim_payload_returns!(full_pool)
+        @test_throws ArgumentError reclaim_payload_returns!(pool, 0)
+        @test_throws ArgumentError reclaim_payload_returns!(
+            pool, typemax(UInt128))
+        @test_throws ArgumentError reclaim_payload_returns!(pool, false)
+
+        publication_pool =
+            PayloadPool([Ref(UInt64(0))], UInt64(101), UInt64(103))
+        publication_output = Ref{PayloadLeaseRef}()
+        @test try_claim_payload!(publication_output, publication_pool) ==
+              PayloadTransitionSucceeded
+        @test queue_payload!(
+            publication_pool, publication_output[]) ==
+              PayloadTransitionSucceeded
+        @test lease_payload!(
+            publication_pool, publication_output[]) ==
+              PayloadTransitionSucceeded
+        @test close_ring!(publication_pool.return_ring) ==
+              RingTransferSucceeded
+        publish_return =
+            AdaptiveOpticsHIL.Ownership._publish_payload_return!
+        @test_throws OwnershipError Base.invokelatest(
+            publish_return, publication_pool, publication_output[])
     end
 end

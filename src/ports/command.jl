@@ -165,6 +165,8 @@ end
 struct CommandCompletionPort{P,L}
     session::RunSessionID
     endpoint::CommandEndpointID
+    submission_ring::SPSCDescriptorRing{
+        CommandSubmissionDescriptor{P}}
     ring::SPSCDescriptorRing{CommandOutcome{P}}
     payload_pool::L
     outcome_credit_pool::PayloadPool{Nothing}
@@ -179,6 +181,87 @@ end
 
 command_submission_port(ports::PreparedCommandPorts) = ports.submission
 command_completion_port(ports::PreparedCommandPorts) = ports.completion
+
+@inline _command_payload_capacity(::Nothing) = typemax(Int) # COV_EXCL_LINE
+@inline _command_payload_capacity(pool::PayloadPool) =
+    payload_pool_capacity(pool)
+
+"""Return the prepared descriptor capacity and full policy for `port`."""
+function port_resource_policy(port::CommandSubmissionPort)
+    capacity = ring_capacity(port.ring)
+    maximum = min(
+        capacity,
+        payload_pool_capacity(port.outcome_credit_pool),
+        _command_payload_capacity(port.payload_pool))
+    return PortResourcePolicy(
+        capacity,
+        maximum,
+        RetainProducerOnFull())
+end
+
+function port_resource_policy(port::CommandCompletionPort)
+    capacity = ring_capacity(port.ring)
+    maximum = payload_pool_capacity(port.outcome_credit_pool)
+    return PortResourcePolicy(
+        capacity,
+        maximum,
+        ReservedFullIsInvariant())
+end
+
+@inline _close_command_payload_pool!(::Nothing) =
+    PayloadPoolCloseSucceeded
+@inline _close_command_payload_pool!(pool::PayloadPool) =
+    close_payload_pool!(pool)
+
+@inline _payload_pool_close_succeeded(status::PayloadPoolCloseStatus) =
+    status == PayloadPoolCloseSucceeded ||
+    status == PayloadPoolAlreadyClosed
+
+"""
+Close command ingress and its producer claim pools; transferred submissions
+remain drainable and existing producer-owned payloads may still be aborted.
+"""
+function close_command_ingress!(port::CommandSubmissionPort)
+    ring_status = close_ring!(port.ring)
+    payload_status = _close_command_payload_pool!(port.payload_pool)
+    credit_status = close_payload_pool!(port.outcome_credit_pool)
+    (
+        _payload_pool_close_succeeded(payload_status) &&
+        _payload_pool_close_succeeded(credit_status)
+    ) || throw(PortError(
+        :command_submission,
+        :payload_close_invariant,
+        "command ingress could not close its producer claim pools"))
+    return _ring_port_result(ring_status)
+end
+
+close_command_ingress!(ports::PreparedCommandPorts) =
+    close_command_ingress!(ports.submission)
+
+"""
+Close terminal-outcome publication after command ingress is closed and every
+transferred command has reached one published outcome. Already published
+outcomes remain drainable.
+"""
+function close_command_completion!(port::CommandCompletionPort)
+    ring_is_closed(port.submission_ring) || throw(PortError(
+        :command_completion,
+        :ingress_still_accepting,
+        "command ingress must close before terminal-outcome publication"))
+    descriptors = ring_accounting(port.ring)
+    credits = payload_pool_accounting(port.outcome_credit_pool)
+    (
+        iszero(credits.producer_owned) &&
+        credits.queued == descriptors.occupancy
+    ) || throw(PortError(
+        :command_completion,
+        :outcomes_not_published,
+        "every transferred command must have one published terminal outcome before completion closure"))
+    return _ring_port_result(close_ring!(port.ring))
+end
+
+close_command_completion!(ports::PreparedCommandPorts) =
+    close_command_completion!(ports.completion)
 
 @inline function _checked_port_capacity(capacity::Integer, component::Symbol)
     capacity > 0 || throw(PortError(component, :invalid_capacity,
@@ -259,6 +342,7 @@ function _prepare_command_ports(
     session::RunSessionID,
     submission_capacity,
     completion_capacity,
+    outcome_return_capacity,
     outcome_credit_pool_id::UInt64,
     descriptor_schema_id::PortSchemaID,
     descriptor_schema_version::PortSchemaVersion,
@@ -271,7 +355,8 @@ function _prepare_command_ports(
     credits = PayloadPool(
         fill(nothing, checked_completion_capacity),
         outcome_credit_pool_id,
-        run_session_value(session))
+        run_session_value(session);
+        return_capacity=outcome_return_capacity)
     submission = CommandSubmissionPort{P,L,T}(
         session,
         descriptor_schema_id,
@@ -290,6 +375,7 @@ function _prepare_command_ports(
     completion = CommandCompletionPort{P,L}(
         session,
         command_endpoint_id(endpoint),
+        submission.ring,
         SPSCDescriptorRing{CommandOutcome{P}}(
             checked_completion_capacity),
         payload_pool,
@@ -309,6 +395,7 @@ function prepare_command_ports(
     session::RunSessionID,
     submission_capacity,
     completion_capacity=submission_capacity,
+    outcome_return_capacity=completion_capacity,
     outcome_credit_pool_id::UInt64,
     descriptor_schema_id::PortSchemaID=
         PortSchemaID(:command_submission),
@@ -323,6 +410,7 @@ function prepare_command_ports(
         session,
         submission_capacity,
         completion_capacity,
+        outcome_return_capacity,
         outcome_credit_pool_id,
         descriptor_schema_id,
         descriptor_schema_version,
@@ -344,6 +432,8 @@ function prepare_command_ports(
     outcome_credit_pool_id::UInt64,
     submission_capacity=length(payload_buffers),
     completion_capacity=length(payload_buffers),
+    payload_return_capacity=length(payload_buffers),
+    outcome_return_capacity=completion_capacity,
     descriptor_schema_id::PortSchemaID=
         PortSchemaID(:command_submission),
     descriptor_schema_version::PortSchemaVersion=PortSchemaVersion(1),
@@ -363,7 +453,10 @@ function prepare_command_ports(
     end
     _validate_distinct_command_buffers(payload_buffers)
     pool = PayloadPool(
-        payload_buffers, payload_pool_id, run_session_value(session))
+        payload_buffers,
+        payload_pool_id,
+        run_session_value(session);
+        return_capacity=payload_return_capacity)
     return _prepare_command_ports(
         LeasedCommandPayload,
         pool,
@@ -371,6 +464,7 @@ function prepare_command_ports(
         session,
         submission_capacity,
         completion_capacity,
+        outcome_return_capacity,
         outcome_credit_pool_id,
         descriptor_schema_id,
         descriptor_schema_version,
@@ -420,6 +514,22 @@ abort_command_payload!(
     port::CommandSubmissionPort{LeasedCommandPayload},
     lease::PayloadLeaseRef) =
     abort_payload!(port.payload_pool, lease)
+
+"""Reclaim released leased-command buffers for the command-pool owner."""
+reclaim_command_payload_returns!(
+    port::CommandSubmissionPort{LeasedCommandPayload},
+    max_items::Integer=payload_pool_capacity(port.payload_pool)) =
+    reclaim_payload_returns!(port.payload_pool, max_items)
+
+reclaim_command_payload_returns!(
+    ::CommandSubmissionPort{<:InlineCommandPayload},
+    ::Integer=1) = nothing
+
+"""Reclaim consumed terminal-outcome credits for the submission owner."""
+reclaim_outcome_credit_returns!(
+    port::Union{CommandSubmissionPort,CommandCompletionPort},
+    max_items::Integer=payload_pool_capacity(port.outcome_credit_pool)) =
+    reclaim_payload_returns!(port.outcome_credit_pool, max_items)
 
 command_payload_accounting(
     port::Union{
@@ -611,22 +721,27 @@ end
 @inline function _outcome_payload_release_status(
     port::CommandCompletionPort{LeasedCommandPayload},
     outcome::CommandOutcome{LeasedCommandPayload})
-    return _lease_state_status(
-        port.payload_pool,
-        outcome.payload.lease,
-        _PAYLOAD_CONSUMER_LEASED)
+    return _payload_return_status(port.payload_pool, outcome.payload.lease)
 end
 
 @inline function _release_outcome_payload!(
     port::CommandCompletionPort{LeasedCommandPayload},
     outcome::CommandOutcome{LeasedCommandPayload})
-    return release_payload!(port.payload_pool, outcome.payload.lease)
+    return _publish_payload_return!(port.payload_pool, outcome.payload.lease)
+end
+
+@inline function _lease_return_rejection_reason(
+    status::PayloadStatus)
+    return (
+        status == PayloadReturnCreditUnavailable ||
+        status == PayloadReturnPathClosed
+    ) ? LeaseReturnUnavailable : PayloadLeaseMismatch
 end
 
 """
-Release a consumed outcome. For leased commands this atomically prevalidates
-both resources, then returns the command buffer and its reserved outcome credit
-to their pools.
+Release a consumed outcome. For leased commands this prevalidates both return
+paths without mutation, then release-publishes the command buffer and its
+reserved outcome credit for their respective pool owners to reclaim.
 """
 function release_outcome!(
     port::CommandCompletionPort{P},
@@ -637,20 +752,27 @@ function release_outcome!(
         return PortResult(PortRejected, CommandEndpointMismatch)
     payload_status = _outcome_payload_release_status(port, outcome)
     payload_status == PayloadTransitionSucceeded || return PortResult(
-        PortRejected, PayloadLeaseMismatch, payload_status)
-    credit_status = _lease_state_status(
+        PortRejected,
+        _lease_return_rejection_reason(payload_status),
+        payload_status)
+    credit_status = _payload_return_status(
         port.outcome_credit_pool,
-        outcome.outcome_credit,
-        _PAYLOAD_CONSUMER_LEASED)
+        outcome.outcome_credit)
     credit_status == PayloadTransitionSucceeded || return PortResult(
-        PortRejected, OutcomeCreditUnavailable, credit_status)
+        PortRejected,
+        credit_status in (
+            PayloadReturnCreditUnavailable,
+            PayloadReturnPathClosed,
+        ) ? LeaseReturnUnavailable : OutcomeCreditUnavailable,
+        credit_status)
 
     payload_status = _release_outcome_payload!(port, outcome)
     payload_status == PayloadTransitionSucceeded || throw(PortError(
         :command_completion, :payload_release_invariant,
         "prevalidated command payload could not be released"))
     credit_status =
-        release_payload!(port.outcome_credit_pool, outcome.outcome_credit)
+        _publish_payload_return!(
+            port.outcome_credit_pool, outcome.outcome_credit)
     credit_status == PayloadTransitionSucceeded || throw(PortError(
         :command_completion, :credit_release_invariant,
         "prevalidated terminal-outcome credit could not be released"))
@@ -660,6 +782,48 @@ end
 outcome_credit_accounting(port::Union{
     CommandSubmissionPort,CommandCompletionPort}) =
     payload_pool_accounting(port.outcome_credit_pool)
+
+@inline _command_payload_returns_can_close(::Nothing) = true # COV_EXCL_LINE
+
+@inline function _command_payload_returns_can_close(pool::PayloadPool)
+    accounting = payload_pool_accounting(pool)
+    return (
+        payload_pool_lifecycle_state(pool) != PayloadPoolAccepting &&
+        iszero(accounting.producer_owned) &&
+        iszero(accounting.queued) &&
+        iszero(accounting.consumer_leased)
+    )
+end
+
+@inline _close_command_payload_returns!(::Nothing) = nothing
+@inline _close_command_payload_returns!(pool::PayloadPool) =
+    close_payload_returns!(pool) # COV_EXCL_LINE
+
+"""
+Close command-payload and terminal-outcome-credit return paths after completion
+drain and after no future release is possible. Already published returns remain
+reclaimable. Both paths are prevalidated before either is closed.
+"""
+function close_command_return_paths!(
+    port::CommandCompletionPort)
+    _require_drained_completion(port, :command_return)
+    _command_payload_returns_can_close(port.payload_pool) ||
+        throw(PortError(
+            :command_return,
+            :outstanding_payload_returns,
+            "command payload claims remain open or ownership may still create lease returns"))
+    _command_payload_returns_can_close(port.outcome_credit_pool) ||
+        throw(PortError(
+            :command_return,
+            :outstanding_outcome_credit_returns,
+            "terminal-outcome credit claims remain open or ownership may still create lease returns"))
+    payload_status = _close_command_payload_returns!(port.payload_pool)
+    credit_status = close_payload_returns!(port.outcome_credit_pool)
+    return (; payload_status, credit_status)
+end
+
+close_command_return_paths!(ports::PreparedCommandPorts) =
+    close_command_return_paths!(ports.completion)
 
 abstract type _AbstractCommandBridgeRoute end
 
@@ -973,10 +1137,23 @@ end
     completion::CommandCompletionPort,
     outcome::CommandOutcome)
     status = try_submit!(completion.ring, outcome)
-    status == RingTransferSucceeded || throw(PortError(
-        :command_completion, :credit_capacity_invariant,
-        "reserved terminal-outcome credit did not guarantee completion capacity"))
+    status == RingTransferSucceeded ||
+        _command_outcome_publication_error(status)
     return nothing
+end
+
+@noinline function _command_outcome_publication_error(
+    status::RingStatus)
+    if status == RingClosed
+        throw(PortError(
+            :command_completion,
+            :publication_after_close,
+            "terminal-outcome publication was closed before every transferred command completed"))
+    end
+    throw(PortError(
+        :command_completion,
+        :credit_capacity_invariant,
+        "reserved terminal-outcome credit did not guarantee completion capacity"))
 end
 
 function _insert_command_correlation!(

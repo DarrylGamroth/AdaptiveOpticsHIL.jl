@@ -21,14 +21,26 @@ export close_ring!, ring_accounting, ring_capacity, ring_is_closed
 export try_submit!, try_take!, try_take_batch!
 export PayloadStatus
 export PayloadTransitionSucceeded, PayloadPoolExhausted
+export PayloadPoolClosed
 export WrongPayloadPool, WrongPayloadSession, InvalidPayloadSlot
 export StalePayloadLease, WrongPayloadOwner, DuplicatePayloadRelease
 export PayloadGenerationExhausted
+export PayloadReturnCreditUnavailable, PayloadReturnPathClosed
 export PayloadLeaseRef, PayloadPool, PayloadPoolAccounting
+export PayloadPoolCapacityContract, PayloadPoolDeficit
+export PayloadPoolCloseStatus
+export PayloadPoolCloseSucceeded, PayloadPoolAlreadyClosed
+export PayloadPoolLifecycleState
+export PayloadPoolAccepting, PayloadPoolDraining, PayloadPoolDrained
 export abort_payload!, consumer_payload, lease_payload!, payload_generation
+export close_payload_pool!
 export payload_pool_accounting, payload_pool_capacity, payload_pool_id
+export payload_pool_lifecycle_state
 export payload_session_id, payload_slot, producer_payload, queue_payload!
-export release_payload!, try_claim_payload!, validate_quiescent_pool
+export close_payload_returns!, payload_pool_capacity_contract
+export payload_pool_deficit, payload_return_accounting
+export reclaim_payload_returns!, release_payload!, try_claim_payload!
+export validate_quiescent_pool
 
 public MAX_SUPPORTED_CACHE_LINE_BYTES, SPSCLayoutEvidence
 public maximum_cache_line_bytes, ring_layout_contract, validate_ring_layout
@@ -615,12 +627,16 @@ both the payload state and any caller-owned output reference.
     WrongPayloadOwner = 0x07
     DuplicatePayloadRelease = 0x08
     PayloadGenerationExhausted = 0x09
+    PayloadReturnCreditUnavailable = 0x0a
+    PayloadReturnPathClosed = 0x0b
+    PayloadPoolClosed = 0x0c
 end
 
 const _PAYLOAD_FREE = UInt8(0)
 const _PAYLOAD_PRODUCER_OWNED = UInt8(1)
 const _PAYLOAD_QUEUED = UInt8(2)
 const _PAYLOAD_CONSUMER_LEASED = UInt8(3)
+const _PAYLOAD_RETURN_QUEUED = UInt8(4)
 
 """
 Immutable reference to one payload-pool slot in one run session.
@@ -649,7 +665,8 @@ payload_slot(lease::PayloadLeaseRef) = lease.slot
 payload_generation(lease::PayloadLeaseRef) = lease.generation
 
 """
-    PayloadPool(payloads, pool_id, session_id)
+    PayloadPool(payloads, pool_id, session_id;
+        return_capacity=length(payloads))
 
 Prepare a bounded pool over caller-supplied payload buffers. The container of
 payload references is copied, not the payload buffers themselves. The caller
@@ -657,19 +674,43 @@ must relinquish mutation through retained aliases while a buffer is owned by
 the pool. `pool_id` must be unique among all pools in the same run/session;
 cross-pool uniqueness is a preparation responsibility rather than a global
 runtime registry.
+
+The pool prepares one SPSC lease-return descriptor for every payload slot.
+The final consumer release-publishes into that ring, and the single pool owner
+reclaims returned leases before reusing storage. `return_capacity` may be
+larger than the payload capacity but never smaller: every legal simultaneous
+consumer lease has reserved return credit.
 """
+mutable struct _PayloadPoolOwnerState
+    return_scratch::Base.RefValue{PayloadLeaseRef}
+    reclaimed::UInt64
+    @atomic claims_closed::UInt64
+end
+
 struct PayloadPool{P}
     payloads::Memory{P}
     generations::Memory{UInt64}
     states::AtomicMemory{UInt8}
     pool_id::UInt64
     session_id::UInt64
+    return_ring::SPSCDescriptorRing{PayloadLeaseRef}
+    owner_state::_PayloadPoolOwnerState
 end
+
+# Public constructor tests cover both dispatch leaves, but coverage
+# instrumentation cannot retain counters for these compile-time-inlined traits.
+@inline _payload_capacity_is_bool(::Bool) = true # COV_EXCL_LINE
+@inline _payload_capacity_is_bool(::Integer) = false # COV_EXCL_LINE
 
 function PayloadPool(
     payloads::AbstractVector{P},
     pool_id::UInt64,
-    session_id::UInt64) where {P}
+    session_id::UInt64;
+    return_capacity::Integer=length(payloads)) where {P}
+    _payload_capacity_is_bool(return_capacity) && throw(OwnershipError(
+        :payload_pool,
+        :invalid_return_capacity,
+        "lease-return capacity must be an integer count, not Bool"))
     isempty(payloads) && throw(OwnershipError(
         :payload_pool,
         :invalid_capacity,
@@ -688,6 +729,14 @@ function PayloadPool(
         "payload-pool session identity must be nonzero"))
 
     capacity = length(payloads)
+    return_capacity >= capacity || throw(OwnershipError(
+        :payload_pool,
+        :insufficient_return_capacity,
+        "lease-return capacity must cover every payload slot that may be consumer-leased"))
+    return_capacity <= typemax(Int) || throw(OwnershipError(
+        :payload_pool,
+        :return_capacity_exceeds_address_space,
+        "lease-return capacity exceeds the addressable range"))
     payload_storage = Memory{P}(undef, capacity)
     copyto!(payload_storage, payloads)
     generations = Memory{UInt64}(undef, capacity)
@@ -697,7 +746,16 @@ function PayloadPool(
         @atomic :monotonic states[slot] = _PAYLOAD_FREE
     end
     return PayloadPool{P}(
-        payload_storage, generations, states, pool_id, session_id)
+        payload_storage,
+        generations,
+        states,
+        pool_id,
+        session_id,
+        SPSCDescriptorRing{PayloadLeaseRef}(Int(return_capacity)),
+        _PayloadPoolOwnerState(
+            Ref(PayloadLeaseRef(0, 0, 0, 0)),
+            zero(UInt64),
+            zero(UInt64)))
 end
 
 """Return the number of prepared payload slots."""
@@ -708,6 +766,76 @@ payload_pool_id(pool::PayloadPool) = pool.pool_id
 
 """Return the stable run/session identity of `pool`."""
 payload_session_id(pool::PayloadPool) = pool.session_id
+
+"""
+Prepared capacity proof for one payload pool and its lease-return path.
+
+`maximum_consumer_leases` equals the pool capacity because every slot may
+legally reach the consumer-owned state. `return_capacity` is therefore at
+least that large.
+"""
+struct PayloadPoolCapacityContract
+    capacity::Int
+    maximum_consumer_leases::Int
+    return_capacity::Int
+end
+
+"""Return the prepared slot and lease-return capacity proof."""
+function payload_pool_capacity_contract(pool::PayloadPool)
+    capacity = payload_pool_capacity(pool)
+    return PayloadPoolCapacityContract(
+        capacity,
+        capacity,
+        ring_capacity(pool.return_ring))
+end
+
+"""Return a cold snapshot of the pool's reserved lease-return ring."""
+payload_return_accounting(pool::PayloadPool) =
+    ring_accounting(pool.return_ring)
+
+"""
+Lifecycle of producer claims for one payload pool.
+
+Closing claims prevents new producer ownership but does not revoke any existing
+producer, queued, consumer, or return-queued ownership.
+"""
+@enum PayloadPoolLifecycleState::UInt8 begin
+    PayloadPoolAccepting = 0x01
+    PayloadPoolDraining = 0x02
+    PayloadPoolDrained = 0x03
+end
+
+"""Result of closing a payload pool to new producer claims."""
+@enum PayloadPoolCloseStatus::UInt8 begin
+    PayloadPoolCloseSucceeded = 0x01
+    PayloadPoolAlreadyClosed = 0x02
+end
+
+@inline function _payload_claims_are_closed(pool::PayloadPool)
+    return (@atomic :acquire pool.owner_state.claims_closed) !=
+        zero(UInt64)
+end
+
+"""Close a pool to new producer claims without revoking existing ownership."""
+function close_payload_pool!(pool::PayloadPool)
+    owner_state = pool.owner_state
+    (@atomic :monotonic owner_state.claims_closed) == zero(UInt64) ||
+        return PayloadPoolAlreadyClosed
+    @atomic :release owner_state.claims_closed = one(UInt64)
+    return PayloadPoolCloseSucceeded
+end
+
+"""Return the cold accepting/draining/drained producer-claim lifecycle."""
+function payload_pool_lifecycle_state(pool::PayloadPool)
+    _payload_claims_are_closed(pool) || return PayloadPoolAccepting
+    accounting = payload_pool_accounting(pool)
+    returns = payload_return_accounting(pool)
+    (
+        accounting.free == accounting.capacity &&
+        iszero(returns.occupancy)
+    ) && return PayloadPoolDrained
+    return PayloadPoolDraining
+end
 
 @inline function _lease_identity_status(
     pool::PayloadPool,
@@ -746,6 +874,9 @@ no compare-and-swap retry: only the producer claims free slots.
 function try_claim_payload!(
     output::Base.RefValue{PayloadLeaseRef},
     pool::PayloadPool)
+    (@atomic :acquire pool.owner_state.claims_closed) ==
+        zero(UInt64) || return PayloadPoolClosed
+    reclaim_payload_returns!(pool)
     for slot in eachindex(pool.payloads)
         state = @atomic :acquire pool.states[slot]
         state == _PAYLOAD_FREE || continue
@@ -764,6 +895,44 @@ function try_claim_payload!(
         return PayloadTransitionSucceeded
     end
     return PayloadPoolExhausted
+end
+
+@inline function _payload_return_status(
+    pool::PayloadPool,
+    lease::PayloadLeaseRef)
+    identity_status = _lease_identity_status(pool, lease)
+    identity_status == PayloadTransitionSucceeded || return identity_status
+
+    slot = Int(lease.slot)
+    state = @atomic :acquire pool.states[slot]
+    @inbounds generation = pool.generations[slot]
+    generation == lease.generation || return StalePayloadLease
+    (state == _PAYLOAD_FREE || state == _PAYLOAD_RETURN_QUEUED) &&
+        return DuplicatePayloadRelease
+    state == _PAYLOAD_CONSUMER_LEASED || return WrongPayloadOwner
+
+    return_status = _producer_submission_status(pool.return_ring)
+    return_status == RingFull && return PayloadReturnCreditUnavailable
+    return_status == RingClosed && return PayloadReturnPathClosed
+    return PayloadTransitionSucceeded
+end
+
+@inline function _publish_payload_return!(
+    pool::PayloadPool,
+    lease::PayloadLeaseRef)
+    slot = Int(lease.slot)
+    @atomic :release pool.states[slot] = _PAYLOAD_RETURN_QUEUED
+    return_status = try_submit!(pool.return_ring, lease)
+    return_status == RingTransferSucceeded ||
+        _payload_return_publication_error()
+    return PayloadTransitionSucceeded
+end
+
+@noinline function _payload_return_publication_error()
+    throw(OwnershipError(
+        :payload_pool,
+        :return_publication_invariant,
+        "reserved lease-return publication failed after successful preflight"))
 end
 
 function _payload_access_error(
@@ -854,29 +1023,105 @@ end
 """
     release_payload!(pool, lease)
 
-Release one consumer lease back to the pool. Wrong pool, wrong session, invalid
-slot, stale generation, duplicate release, and wrong ownership all return
-distinct non-mutating statuses.
+Release-publish one consumer lease into its reserved return path. The payload
+becomes reusable only when the pool owner reclaims it. Wrong pool, wrong
+session, invalid slot, stale generation, duplicate release, wrong ownership,
+and return-path invariant failures return distinct non-mutating statuses.
 """
 function release_payload!(
     pool::PayloadPool,
     lease::PayloadLeaseRef)
-    identity_status = _lease_identity_status(pool, lease)
-    identity_status == PayloadTransitionSucceeded || return identity_status
-
-    slot = Int(lease.slot)
-    state = @atomic :acquire pool.states[slot]
-    @inbounds generation = pool.generations[slot]
-    generation == lease.generation || return StalePayloadLease
-    state == _PAYLOAD_FREE && return DuplicatePayloadRelease
-    state == _PAYLOAD_CONSUMER_LEASED || return WrongPayloadOwner
-
-    @atomic :release pool.states[slot] = _PAYLOAD_FREE
-    return PayloadTransitionSucceeded
+    status = _payload_return_status(pool, lease)
+    status == PayloadTransitionSucceeded || return status
+    return _publish_payload_return!(pool, lease)
 end
 
 """
-Cold snapshot of the four payload ownership states.
+    reclaim_payload_returns!(pool[, max_items])
+
+Drain at most `max_items` already published lease returns for the single pool
+owner. Reclamation is bounded, nonblocking, and allocation-free after
+preparation. A successful result reports the number reclaimed; an empty or
+closed result reports zero.
+"""
+function reclaim_payload_returns!(
+    pool::PayloadPool,
+    max_items::Integer=payload_pool_capacity(pool))
+    max_items > 0 || _payload_reclaim_count_error(:not_positive)
+    max_items <= typemax(Int) ||
+        _payload_reclaim_count_error(:exceeds_address_space)
+    maximum = min(Int(max_items), payload_pool_capacity(pool))
+    reclaimed = 0
+    scratch = pool.owner_state
+    while reclaimed < maximum
+        status = try_take!(scratch.return_scratch, pool.return_ring)
+        if status != RingTransferSucceeded
+            return reclaimed == 0 ?
+                RingBatchResult(status, 0) :
+                RingBatchResult(RingTransferSucceeded, reclaimed)
+        end
+        lease = scratch.return_scratch[]
+        lease_status =
+            _lease_state_status(pool, lease, _PAYLOAD_RETURN_QUEUED)
+        lease_status == PayloadTransitionSucceeded ||
+            _payload_return_reclamation_error()
+        @atomic :release pool.states[Int(lease.slot)] = _PAYLOAD_FREE
+        scratch.reclaimed += one(UInt64)
+        reclaimed += 1
+    end
+    return RingBatchResult(RingTransferSucceeded, reclaimed)
+end
+
+@noinline function _payload_reclaim_count_error(reason::Symbol)
+    message = reason == :not_positive ?
+        "max_items must be positive" :
+        "max_items exceeds the addressable range"
+    throw(ArgumentError(message))
+end
+
+@noinline function _payload_return_reclamation_error()
+    throw(OwnershipError(
+        :payload_pool,
+        :return_reclamation_invariant,
+        "lease-return descriptor does not identify a return-queued payload"))
+end
+
+reclaim_payload_returns!(
+    ::PayloadPool,
+    ::Bool) =
+    _payload_reclaim_bool_error()
+
+@noinline _payload_reclaim_bool_error() =
+    throw(ArgumentError("max_items must be an integer count, not Bool"))
+
+"""
+    close_payload_returns!(pool)
+
+Close the consumer-to-owner return path only after producer claims are closed
+and no producer-owned, queued, or consumer-leased slot can create another
+return. Already published returns remain drainable by
+`reclaim_payload_returns!`.
+"""
+function close_payload_returns!(pool::PayloadPool)
+    _payload_claims_are_closed(pool) || throw(OwnershipError(
+        :payload_pool,
+        :claims_still_accepting,
+        "payload-pool claims must close before its lease-return path"))
+    accounting = payload_pool_accounting(pool)
+    (
+        iszero(accounting.producer_owned) &&
+        iszero(accounting.queued) &&
+        iszero(accounting.consumer_leased)
+    ) || throw(OwnershipError(
+        :payload_pool,
+        :outstanding_return_obligations,
+        "lease-return path cannot close while a payload may still require return"))
+    return close_ring!(pool.return_ring)
+end
+
+"""
+Cold snapshot of the five payload ownership states plus successful owner
+reclamation counted modulo `UInt64`.
 """
 struct PayloadPoolAccounting
     capacity::Int
@@ -884,19 +1129,24 @@ struct PayloadPoolAccounting
     producer_owned::Int
     queued::Int
     consumer_leased::Int
+    return_queued::Int
+    reclaimed::UInt64
 end
 
 """
     payload_pool_accounting(pool)
 
 Inspect every slot atomically and return a cold accounting snapshot. The sum of
-the four state counts always equals capacity unless internal state is corrupt.
+the five state counts always equals capacity unless internal state is corrupt.
+External quiescence is required to compare `return_queued` with the return-ring
+occupancy.
 """
 function payload_pool_accounting(pool::PayloadPool)
     free = 0
     producer_owned = 0
     queued = 0
     consumer_leased = 0
+    return_queued = 0
     for slot in eachindex(pool.states)
         state = @atomic :acquire pool.states[slot]
         if state == _PAYLOAD_FREE
@@ -907,6 +1157,8 @@ function payload_pool_accounting(pool::PayloadPool)
             queued += 1
         elseif state == _PAYLOAD_CONSUMER_LEASED
             consumer_leased += 1
+        elseif state == _PAYLOAD_RETURN_QUEUED
+            return_queued += 1
         else
             throw(OwnershipError(
                 :payload_pool,
@@ -919,7 +1171,38 @@ function payload_pool_accounting(pool::PayloadPool)
         free,
         producer_owned,
         queued,
-        consumer_leased)
+        consumer_leased,
+        return_queued,
+        pool.owner_state.reclaimed)
+end
+
+"""
+Bounded cold ownership-deficit report.
+
+`deficit` is the number of slots not yet free. During an active run that
+number is ordinary in-flight ownership; it becomes a shutdown deficit only
+after orchestration has ended publication and bounded draining. The individual
+state counts preserve where each missing slot remains.
+"""
+struct PayloadPoolDeficit
+    capacity::Int
+    deficit::Int
+    producer_owned::Int
+    queued::Int
+    consumer_leased::Int
+    return_queued::Int
+end
+
+"""Return a bounded cold report of every slot not currently free."""
+function payload_pool_deficit(pool::PayloadPool)
+    accounting = payload_pool_accounting(pool)
+    return PayloadPoolDeficit(
+        accounting.capacity,
+        accounting.capacity - accounting.free,
+        accounting.producer_owned,
+        accounting.queued,
+        accounting.consumer_leased,
+        accounting.return_queued)
 end
 
 """
@@ -930,10 +1213,14 @@ structured ownership error. External orchestration establishes quiescence.
 """
 function validate_quiescent_pool(pool::PayloadPool)
     accounting = payload_pool_accounting(pool)
-    accounting.free == accounting.capacity || throw(OwnershipError(
+    returns = payload_return_accounting(pool)
+    (
+        accounting.free == accounting.capacity &&
+        iszero(returns.occupancy)
+    ) || throw(OwnershipError(
         :payload_pool,
         :not_quiescent,
-        "payload pool still owns or leases one or more payloads"))
+        "payload pool still owns, leases, or queues one or more payloads"))
     return accounting
 end
 

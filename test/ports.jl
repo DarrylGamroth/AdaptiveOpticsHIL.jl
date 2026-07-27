@@ -237,6 +237,14 @@ end
 
 @testset "Port contracts and command bridge" begin
     @testset "Canonical identities and timing" begin
+        @test_throws PortError PortResourcePolicy(
+            true, 1, RetainProducerOnFull())
+        @test_throws PortError PortResourcePolicy(
+            1, true, RetainProducerOnFull())
+        @test_throws PortError PortResourcePolicy(
+            0, 0, RetainProducerOnFull())
+        @test_throws PortError PortResourcePolicy(
+            1, 2, RetainProducerOnFull())
         @test_throws PortError RunSessionID(0)
         @test_throws PortError StreamSequence(false)
         @test_throws PortError PortSchemaID(Symbol(""))
@@ -359,6 +367,29 @@ end
         @test submission_accounting.capacity == 4
         @test descriptor_accounting(completion_port).capacity == 8
         @test submission_accounting.occupancy == 0
+        @test port_lifecycle_state(submission_port) == PortAccepting
+        submission_policy = port_resource_policy(submission_port)
+        @test resource_capacity(submission_policy) == 4
+        @test maximum_outstanding(submission_policy) == 4
+        @test resource_full_policy(submission_policy) isa
+              RetainProducerOnFull
+        completion_policy = port_resource_policy(completion_port)
+        @test resource_capacity(completion_policy) == 8
+        @test maximum_outstanding(completion_policy) == 8
+        @test resource_full_policy(completion_policy) isa
+              ReservedFullIsInvariant
+        payload_policy = payload_resource_policy(submission_port)
+        @test resource_capacity(payload_policy.payload) == 8
+        @test resource_capacity(payload_policy.outcome_credit) == 8
+        payload_lifecycle = payload_lifecycle_state(submission_port)
+        @test payload_lifecycle.payload == PayloadPoolAccepting
+        @test payload_lifecycle.outcome_credit == PayloadPoolAccepting
+        returns_policy = lease_return_policy(completion_port)
+        @test resource_capacity(returns_policy.payload) == 8
+        @test maximum_outstanding(returns_policy.payload) == 8
+        @test resource_full_policy(returns_policy.payload) isa
+              ReservedFullIsInvariant
+        @test resource_capacity(returns_policy.outcome_credit) == 8
         if !PORT_TESTS_WITH_COVERAGE
             @test @allocated(
                 descriptor_accounting(submission_port)) == 0
@@ -452,10 +483,26 @@ end
             PortTransferSucceeded
         empty_outcome = Ref{CommandOutcome{LeasedCommandPayload}}()
         @test try_take!(empty_outcome, completion_port).status == PortEmpty
+        @test command_payload_accounting(completion_port).return_queued == 1
+        @test outcome_credit_accounting(completion_port).return_queued == 1
+        command_deficit = payload_ownership_deficit(completion_port)
+        @test command_deficit.payload.deficit == 1
+        @test command_deficit.outcome_credit.deficit == 1
+        @test reclaim_command_payload_returns!(submission_port) ==
+              RingBatchResult(RingTransferSucceeded, 1)
+        @test reclaim_outcome_credit_returns!(submission_port) ==
+              RingBatchResult(RingTransferSucceeded, 1)
         @test command_payload_accounting(completion_port).free == 8
         @test outcome_credit_accounting(completion_port).free == 8
         @test release_outcome!(completion_port, outcome).status ==
-            PortRejected
+              PortRejected
+        @test close_command_ingress!(ports).status ==
+              PortTransferSucceeded
+        @test close_command_completion!(ports).status ==
+              PortTransferSucceeded
+        leased_close = close_command_return_paths!(ports)
+        @test leased_close.payload_status == RingTransferSucceeded
+        @test leased_close.credit_status == RingTransferSucceeded
     end
 
     @testset "Boundary and core mismatch outcomes" begin
@@ -813,6 +860,21 @@ end
             payload_pool_id=UInt64(120),
             outcome_credit_pool_id=UInt64(121),
             submission_capacity=true)
+        @test_throws OwnershipError prepare_command_ports(
+            endpoint,
+            [zeros(3), zeros(3)];
+            session,
+            payload_pool_id=UInt64(120),
+            outcome_credit_pool_id=UInt64(121),
+            payload_return_capacity=1)
+        @test_throws OwnershipError prepare_command_ports(
+            endpoint,
+            [zeros(3), zeros(3)];
+            session,
+            payload_pool_id=UInt64(120),
+            outcome_credit_pool_id=UInt64(121),
+            completion_capacity=2,
+            outcome_return_capacity=1)
 
         ports = prepare_command_ports(
             endpoint,
@@ -1233,6 +1295,206 @@ end
                 lease_ref, outcome_ref, 3, 3)) == 0
         end
     end
+
+    @testset "Command close and bounded drain ordering" begin
+        schema = port_test_schema(Float64; dimensions=())
+        endpoint = port_test_endpoint(schema; capacity=2)
+        ports = prepare_command_ports(
+            endpoint,
+            Float64;
+            session=RunSessionID(73),
+            submission_capacity=2,
+            completion_capacity=2,
+            outcome_credit_pool_id=UInt64(134))
+        submission_port = command_submission_port(ports)
+        completion_port = command_completion_port(ports)
+        bridge = prepare_command_bridge(ports, endpoint)
+        state = CommandBridgeState(bridge)
+        workspace = CommandBridgeWorkspace(bridge)
+        inline_policy = port_resource_policy(submission_port)
+        @test maximum_outstanding(inline_policy) == 2
+        inline_payload_policy = payload_resource_policy(submission_port)
+        @test inline_payload_policy.payload === nothing
+        inline_return_policy = lease_return_policy(completion_port)
+        @test inline_return_policy.payload === nothing
+        @test lease_return_lifecycle_state(
+            completion_port).payload === nothing
+        @test payload_ownership_deficit(
+            completion_port).payload === nothing
+        @test Base.invokelatest(
+            reclaim_command_payload_returns!,
+            submission_port,
+            1) === nothing
+        @test_throws PortError close_command_completion!(ports)
+
+        for sequence in 1:2
+            timestamp = PORT_TEST_PLANT.PlantTimestamp(sequence)
+            submission = matching_command_submission(
+                submission_port,
+                StreamSequence(sequence),
+                PORT_TEST_PLANT.PlantCommandSequence(sequence),
+                receive_time_command_timing(timestamp),
+                InlineCommandPayload(0.1 * sequence))
+            submission = replace_submission(
+                submission;
+                descriptor_schema_version=PortSchemaVersion(2))
+            @test try_submit!(
+                submission_port,
+                submission,
+                Int64(sequence)).status == PortTransferSucceeded
+        end
+        @test close_command_ingress!(ports).status ==
+              PortTransferSucceeded
+        @test port_lifecycle_state(submission_port) == PortDraining
+        closed_payloads = payload_lifecycle_state(submission_port)
+        @test closed_payloads.payload === nothing
+        @test closed_payloads.outcome_credit ==
+              PayloadPoolDraining
+        @test_throws PortError close_command_completion!(ports)
+        @test_throws PortError close_command_return_paths!(ports)
+
+        rejected_after_close = matching_command_submission(
+            submission_port,
+            StreamSequence(3),
+            PORT_TEST_PLANT.PlantCommandSequence(3),
+            receive_time_command_timing(
+                PORT_TEST_PLANT.PlantTimestamp(3)),
+            InlineCommandPayload(0.3))
+        @test try_submit!(
+            submission_port,
+            rejected_after_close,
+            Int64(3)).status == PortClosed
+
+        @test process_next_command!(
+            bridge, state, workspace, Int64(10)).status ==
+              PortTransferSucceeded
+        @test process_next_command!(
+            bridge, state, workspace, Int64(11)).status ==
+              PortTransferSucceeded
+        @test process_next_command!(
+            bridge, state, workspace, Int64(12)).status == PortClosed
+        @test port_lifecycle_state(submission_port) == PortDrained
+
+        @test close_command_completion!(ports).status ==
+              PortTransferSucceeded
+        @test port_lifecycle_state(completion_port) == PortDraining
+        @test_throws PortError close_command_return_paths!(ports)
+        output = Ref{CommandOutcome{InlineCommandPayload{Float64}}}()
+        observed = StreamSequence[]
+        for _ in 1:2
+            @test try_take!(output, completion_port).status ==
+                  PortTransferSucceeded
+            push!(observed, outcome_stream_sequence(output[]))
+            @test outcome_stage(output[]) == BoundaryCommandOutcome
+            @test release_outcome!(completion_port, output[]).status ==
+                  PortTransferSucceeded
+        end
+        @test observed == StreamSequence[StreamSequence(1), StreamSequence(2)]
+        @test try_take!(output, completion_port).status == PortClosed
+        @test port_lifecycle_state(completion_port) == PortDrained
+        @test lease_return_lifecycle_state(
+            completion_port).outcome_credit == PortAccepting
+
+        close_results = close_command_return_paths!(ports)
+        @test close_results.payload_status === nothing
+        @test close_results.credit_status == RingTransferSucceeded
+        @test lease_return_lifecycle_state(
+            completion_port).outcome_credit == PortDraining
+        @test reclaim_outcome_credit_returns!(submission_port) ==
+              RingBatchResult(RingTransferSucceeded, 2)
+        @test payload_lifecycle_state(
+            completion_port).outcome_credit == PayloadPoolDrained
+        @test lease_return_lifecycle_state(
+            completion_port).outcome_credit == PortDrained
+        @test outcome_credit_accounting(completion_port).free == 2
+        @test close_command_ingress!(ports).status == PortClosed
+        @test close_command_completion!(ports).status == PortClosed
+
+        leased_ports = prepare_command_ports(
+            port_test_endpoint(port_test_schema(); capacity=1),
+            [zeros(3)];
+            session=RunSessionID(74),
+            payload_pool_id=UInt64(135),
+            outcome_credit_pool_id=UInt64(136))
+        leased_submission_port = command_submission_port(leased_ports)
+        closed_submission = claim_command_submission(
+            leased_submission_port,
+            [0.1, 0.2, 0.3],
+            1,
+            1,
+            PORT_TEST_PLANT.PlantTimestamp(1))
+        @test close_command_ingress!(leased_ports).status ==
+              PortTransferSucceeded
+        @test payload_lifecycle_state(
+            leased_submission_port).payload == PayloadPoolDraining
+        @test try_submit!(
+            leased_submission_port,
+            closed_submission,
+            Int64(1)).status == PortClosed
+        @test producer_command_payload(
+            leased_submission_port,
+            closed_submission.payload.lease) == [0.1, 0.2, 0.3]
+        @test abort_command_payload!(
+            leased_submission_port,
+            closed_submission.payload.lease) ==
+              PayloadTransitionSucceeded
+        @test payload_lifecycle_state(
+            leased_submission_port).payload == PayloadPoolDrained
+
+        fault_endpoint = port_test_endpoint(
+            port_test_schema(Float64; dimensions=());
+            capacity=1)
+        fault_ports = prepare_command_ports(
+            fault_endpoint,
+            Float64;
+            session=RunSessionID(75),
+            submission_capacity=1,
+            completion_capacity=1,
+            outcome_credit_pool_id=UInt64(137))
+        fault_submission_port = command_submission_port(fault_ports)
+        fault_completion_port = command_completion_port(fault_ports)
+        fault_submission = matching_command_submission(
+            fault_submission_port,
+            StreamSequence(1),
+            PORT_TEST_PLANT.PlantCommandSequence(1),
+            receive_time_command_timing(
+                PORT_TEST_PLANT.PlantTimestamp(1)),
+            InlineCommandPayload(0.1))
+        fault_submission = replace_submission(
+            fault_submission;
+            descriptor_schema_version=PortSchemaVersion(2))
+        @test try_submit!(
+            fault_submission_port,
+            fault_submission,
+            Int64(1)).status == PortTransferSucceeded
+        @test close_ring!(fault_completion_port.ring) ==
+              RingTransferSucceeded
+        fault_bridge = prepare_command_bridge(
+            fault_ports, fault_endpoint)
+        publication_error = try
+            process_next_command!(
+                fault_bridge,
+                CommandBridgeState(fault_bridge),
+                CommandBridgeWorkspace(fault_bridge),
+                Int64(2))
+            nothing
+        catch error
+            error
+        end
+        @test publication_error isa PortError
+        @test publication_error.reason == :publication_after_close
+        capacity_error = try
+            Base.invokelatest(
+                AdaptiveOpticsHIL.Ports.
+                    _command_outcome_publication_error,
+                RingFull)
+            nothing
+        catch error
+            error
+        end
+        @test capacity_error isa PortError
+        @test capacity_error.reason == :credit_capacity_invariant
+    end
 end
 
 @testset "Complete acquisition ports" begin
@@ -1258,6 +1520,20 @@ end
         PORT_TEST_PLANT.AcquisitionProductContract
     @test descriptor_accounting(port).capacity == 1
     @test descriptor_accounting(port).occupancy == 0
+    @test port_lifecycle_state(port) == PortAccepting
+    completion_policy = port_resource_policy(port)
+    @test resource_capacity(completion_policy) == 1
+    @test maximum_outstanding(completion_policy) == 1
+    @test resource_full_policy(completion_policy) isa
+          RetainProducerOnFull
+    product_policy = payload_resource_policy(port)
+    @test resource_capacity(product_policy) == 2
+    @test payload_lifecycle_state(port) == PayloadPoolAccepting
+    return_policy = lease_return_policy(port)
+    @test resource_capacity(return_policy) == 2
+    @test maximum_outstanding(return_policy) == 2
+    @test resource_full_policy(return_policy) isa
+          ReservedFullIsInvariant
 
     leases = (
         Ref(PayloadLeaseRef(0, 0, 0, 0)),
@@ -1310,6 +1586,9 @@ end
         fill(Float32(2), 2, 2)
     @test release_product!(port, output[]).status ==
         PortTransferSucceeded
+    @test acquisition_product_accounting(port).return_queued == 2
+    @test reclaim_product_returns!(port) ==
+          RingBatchResult(RingTransferSucceeded, 2)
     @test acquisition_product_accounting(port).free == 2
 
     lease_ref = Ref(PayloadLeaseRef(0, 0, 0, 0))
@@ -1397,8 +1676,181 @@ end
     abort_ref = Ref(PayloadLeaseRef(0, 0, 0, 0))
     @test try_claim_product!(abort_ref, port) ==
         PayloadTransitionSucceeded
-    @test abort_product!(port, abort_ref[]) ==
+        @test abort_product!(port, abort_ref[]) ==
         PayloadTransitionSucceeded
+
+    @testset "Drop-newest policy and close/drain" begin
+        drop_products = [
+            PORT_TEST_PLANT.AcquisitionProducts(
+                zeros(Float32, 1); metadata=(kind=:pixels,)),
+            PORT_TEST_PLANT.AcquisitionProducts(
+                zeros(Float32, 1); metadata=(kind=:pixels,)),
+        ]
+        drop_port = prepare_acquisition_completion_port(
+            PORT_TEST_PLANT.AcquisitionID(:drop_pixels),
+            drop_products;
+            session=RunSessionID(82),
+            product_pool_id=UInt64(145),
+            ring_capacity=1,
+            delivery_contract=delivery,
+            full_policy=DropNewestOnFull())
+        @test resource_full_policy(
+            port_resource_policy(drop_port)) isa DropNewestOnFull
+        @test resource_full_policy(
+            payload_resource_policy(drop_port)) isa DropNewestOnFull
+
+        drop_leases = (
+            Ref{PayloadLeaseRef}(),
+            Ref{PayloadLeaseRef}())
+        for lease in drop_leases
+            @test try_claim_product!(lease, drop_port) ==
+                  PayloadTransitionSucceeded
+        end
+        @test_throws PortError close_acquisition_return_path!(
+            drop_port)
+        first_drop_completion = matching_acquisition_completion(
+            drop_port,
+            StreamSequence(1),
+            PORT_TEST_PLANT.PlantTimestamp(1),
+            AdapterReadinessSnapshot(
+                AdapterReady,
+                PORT_TEST_PLANT.PlantTimestamp(1)),
+            drop_leases[1][],
+            Int64(1))
+        dropped_completion = matching_acquisition_completion(
+            drop_port,
+            StreamSequence(2),
+            PORT_TEST_PLANT.PlantTimestamp(2),
+            AdapterReadinessSnapshot(
+                AdapterReady,
+                PORT_TEST_PLANT.PlantTimestamp(2)),
+            drop_leases[2][],
+            Int64(2))
+        @test try_publish!(drop_port, first_drop_completion).status ==
+              PortTransferSucceeded
+        @test try_publish!(drop_port, dropped_completion).status ==
+              PortFull
+        @test acquisition_product_accounting(drop_port).free == 1
+
+        drop_output = Ref{AcquisitionCompletion}()
+        @test try_take!(drop_output, drop_port).status ==
+              PortTransferSucceeded
+        @test acquisition_completion_sequence(drop_output[]) ==
+              StreamSequence(1)
+        @test release_product!(drop_port, drop_output[]).status ==
+              PortTransferSucceeded
+        @test reclaim_product_returns!(drop_port) ==
+              RingBatchResult(RingTransferSucceeded, 1)
+
+        third_lease = Ref{PayloadLeaseRef}()
+        @test try_claim_product!(third_lease, drop_port) ==
+              PayloadTransitionSucceeded
+        third_completion = matching_acquisition_completion(
+            drop_port,
+            StreamSequence(3),
+            PORT_TEST_PLANT.PlantTimestamp(3),
+            AdapterReadinessSnapshot(
+                AdapterReady,
+                PORT_TEST_PLANT.PlantTimestamp(3)),
+            third_lease[],
+            Int64(3))
+        @test try_publish!(drop_port, third_completion).status ==
+              PortTransferSucceeded
+
+        closed_lease = Ref{PayloadLeaseRef}()
+        @test try_claim_product!(closed_lease, drop_port) ==
+              PayloadTransitionSucceeded
+        @test close_acquisition_completion!(drop_port).status ==
+              PortTransferSucceeded
+        @test port_lifecycle_state(drop_port) == PortDraining
+        @test payload_lifecycle_state(drop_port) ==
+              PayloadPoolDraining
+        closed_completion = matching_acquisition_completion(
+            drop_port,
+            StreamSequence(4),
+            PORT_TEST_PLANT.PlantTimestamp(4),
+            AdapterReadinessSnapshot(
+                AdapterReady,
+                PORT_TEST_PLANT.PlantTimestamp(4)),
+            closed_lease[],
+            Int64(4))
+        @test try_publish!(drop_port, closed_completion).status ==
+              PortClosed
+        @test producer_product(drop_port, closed_lease[]) ===
+              drop_products[2]
+        @test abort_product!(drop_port, closed_lease[]) ==
+              PayloadTransitionSucceeded
+        @test_throws PortError close_acquisition_return_path!(
+            drop_port)
+        @test try_take!(drop_output, drop_port).status ==
+              PortTransferSucceeded
+        @test acquisition_completion_sequence(drop_output[]) ==
+              StreamSequence(3)
+        @test release_product!(drop_port, drop_output[]).status ==
+              PortTransferSucceeded
+        @test try_take!(drop_output, drop_port).status == PortClosed
+        @test port_lifecycle_state(drop_port) == PortDrained
+        @test close_acquisition_return_path!(drop_port) ==
+              RingTransferSucceeded
+        @test lease_return_lifecycle_state(drop_port) == PortDraining
+        @test reclaim_product_returns!(drop_port) ==
+              RingBatchResult(RingTransferSucceeded, 1)
+        @test lease_return_lifecycle_state(drop_port) == PortDrained
+        @test acquisition_product_accounting(drop_port).free == 2
+        @test payload_lifecycle_state(drop_port) ==
+              PayloadPoolDrained
+        @test payload_ownership_deficit(drop_port).deficit == 0
+        post_close_claim = Ref(PayloadLeaseRef(1, 1, 1, 1))
+        @test try_claim_product!(post_close_claim, drop_port) ==
+              PayloadPoolClosed
+        @test post_close_claim[] == PayloadLeaseRef(1, 1, 1, 1)
+    end
+
+    @testset "Lease-return invariant preserves consumer ownership" begin
+        invariant_products = [
+            PORT_TEST_PLANT.AcquisitionProducts(
+                zeros(Float32, 1); metadata=(kind=:pixels,)),
+        ]
+        invariant_port = prepare_acquisition_completion_port(
+            PORT_TEST_PLANT.AcquisitionID(:return_invariant),
+            invariant_products;
+            session=RunSessionID(83),
+            product_pool_id=UInt64(148),
+            delivery_contract=delivery)
+        invariant_lease = Ref{PayloadLeaseRef}()
+        @test try_claim_product!(invariant_lease, invariant_port) ==
+              PayloadTransitionSucceeded
+        invariant_completion = matching_acquisition_completion(
+            invariant_port,
+            StreamSequence(1),
+            PORT_TEST_PLANT.PlantTimestamp(1),
+            AdapterReadinessSnapshot(
+                AdapterReady,
+                PORT_TEST_PLANT.PlantTimestamp(1)),
+            invariant_lease[],
+            Int64(1))
+        @test try_publish!(
+            invariant_port, invariant_completion).status ==
+              PortTransferSucceeded
+        invariant_output = Ref{AcquisitionCompletion}()
+        @test try_take!(invariant_output, invariant_port).status ==
+              PortTransferSucceeded
+
+        @test try_submit!(
+            invariant_port.product_pool.return_ring,
+            invariant_lease[]) == RingTransferSucceeded
+        invariant_release =
+            release_product!(invariant_port, invariant_output[])
+        @test invariant_release.status == PortRejected
+        @test invariant_release.reason == LeaseReturnUnavailable
+        @test port_payload_status(invariant_release) ==
+              PayloadReturnCreditUnavailable
+        @test completed_product(
+            invariant_port,
+            invariant_output[]) === invariant_products[1]
+        @test payload_ownership_deficit(
+            invariant_port).consumer_leased == 1
+    end
 
     @testset "Product-storage alias dispatch" begin
         storage = zeros(Float32, 2, 2)
@@ -1495,6 +1947,31 @@ end
         session,
         product_pool_id=UInt64(143),
         delivery_contract=delivery)
+    @test_throws OwnershipError prepare_acquisition_completion_port(
+        PORT_TEST_PLANT.AcquisitionID(:undersized_returns),
+        products;
+        session,
+        product_pool_id=UInt64(146),
+        product_return_capacity=1,
+        delivery_contract=delivery)
+    @test_throws PortError prepare_acquisition_completion_port(
+        PORT_TEST_PLANT.AcquisitionID(:invalid_full_policy),
+        products;
+        session,
+        product_pool_id=UInt64(147),
+        delivery_contract=delivery,
+        full_policy=ReservedFullIsInvariant())
+    oversized_ring_port = prepare_acquisition_completion_port(
+        PORT_TEST_PLANT.AcquisitionID(:oversized_ring),
+        products;
+        session,
+        product_pool_id=UInt64(149),
+        ring_capacity=4,
+        delivery_contract=delivery)
+    oversized_ring_policy =
+        port_resource_policy(oversized_ring_port)
+    @test resource_capacity(oversized_ring_policy) == 4
+    @test maximum_outstanding(oversized_ring_policy) == 2
 
     # Sampled device feedback deliberately uses this same complete-product
     # contract; it is not a CommandOutcome or a separate instrument API.

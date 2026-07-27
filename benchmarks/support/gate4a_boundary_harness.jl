@@ -901,6 +901,7 @@ function execute_boundary_run!(driver::BoundaryDriver)
         _wait_for_deadline!(driver, result)
     end
     _observe_feedback_products!(driver)
+    reclaim_serial_returns!(driver.fixture.run)
     wall_end = time_ns()
     accounting = stop_serial_run!(
         driver.fixture.armed,
