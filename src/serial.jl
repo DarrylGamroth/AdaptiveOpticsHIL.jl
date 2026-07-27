@@ -3,7 +3,8 @@
 
 Deterministic, single-owner pacing of one prepared AdaptiveOpticsSim plant
 event loop through transport-neutral HIL ports. This namespace never sleeps,
-polls, invokes callbacks, creates workers, or chooses an RTC transport.
+invokes callbacks, creates a task per event, or chooses an RTC transport. An
+explicit execution policy may arm stable long-lived optical owners.
 """
 module Serial
 
@@ -11,6 +12,7 @@ import Clocks
 import ..Lifecycle
 
 using AdaptiveOpticsSim.Plant: AcquisitionID, AcquisitionProducts
+using AdaptiveOpticsSim.Plant: AbstractOpticalPathBatchExecutor
 using AdaptiveOpticsSim.Plant: PlantTimestamp
 using AdaptiveOpticsSim.Plant: PreparedPlantEventLoop
 using AdaptiveOpticsSim.Plant: acquisition_product_sequence
@@ -23,6 +25,15 @@ using AdaptiveOpticsSim.Plant: step_plant_events!
 using AdaptiveOpticsSim.Plant: validate_acquisition_product_contract
 
 import ..AdaptiveOpticsHIL: AdaptiveOpticsHILError
+using ..Execution: AbstractOpticalExecutionConfiguration
+using ..Execution: SerialOpticalExecution
+using ..Execution: _arm_optical_execution!
+using ..Execution: _execution_accounting
+using ..Execution: _execution_accounting_is_quiescent
+using ..Execution: _execution_is_armed, _execution_is_quiescent
+using ..Execution: _mark_optical_execution_failed!
+using ..Execution: _prepare_optical_execution
+using ..Execution: _start_optical_execution!, _stop_optical_execution!
 using ..Lifecycle: AdapterReadinessSnapshot
 using ..Lifecycle: RunFailureEvent
 using ..Lifecycle: RunLifecycleParameters, RunLifecycleState
@@ -72,6 +83,7 @@ export SerialDeadlinePending, SerialEventLoopComplete
 export SerialStepResult, serial_step_status, serial_step_timestamp
 export serial_step_time_until_ns, step_serial_run!
 export serial_products_published
+export serial_optical_execution_configuration, serial_optical_execution
 export SerialRunAccounting
 export reclaim_serial_returns!, serial_run_accounting
 export serial_run_is_quiescent
@@ -107,10 +119,12 @@ struct ConfiguredSerialRun{
     L<:PreparedPlantEventLoop,
     B<:PreparedCommandBridge,
     A<:Tuple,
+    E<:AbstractOpticalExecutionConfiguration,
 }
     event_loop::L
     command_bridge::B
     acquisition_ports::A
+    optical_execution::E
     lifecycle::RunLifecycleParameters
     nonstructural_controls::Tuple{}
 
@@ -118,16 +132,19 @@ struct ConfiguredSerialRun{
         event_loop::L,
         command_bridge::B,
         acquisition_ports::A,
+        optical_execution::E,
         lifecycle::RunLifecycleParameters,
         nonstructural_controls::Tuple{},
         ::_SerialConstructionToken) where {
         L<:PreparedPlantEventLoop,
         B<:PreparedCommandBridge,
         A<:Tuple,
-    } = new{L,B,A}(
+        E<:AbstractOpticalExecutionConfiguration,
+    } = new{L,B,A,E}(
         event_loop,
         command_bridge,
         acquisition_ports,
+        optical_execution,
         lifecycle,
         nonstructural_controls)
 end
@@ -184,23 +201,32 @@ struct PreparedSerialRun{
     P<:Tuple,
     S<:SerialRunState,
     W<:SerialRunWorkspace,
+    E<:AbstractOpticalPathBatchExecutor,
 }
     configuration::C
     publishers::P
     state::S
     workspace::W
+    execution::E
 
     PreparedSerialRun(
         configuration::C,
         publishers::P,
         state::S,
         workspace::W,
+        execution::E,
         ::_SerialConstructionToken) where {
         C<:ConfiguredSerialRun,
         P<:Tuple,
         S<:SerialRunState,
         W<:SerialRunWorkspace,
-    } = new{C,P,S,W}(configuration, publishers, state, workspace)
+        E<:AbstractOpticalPathBatchExecutor,
+    } = new{C,P,S,W,E}(
+        configuration,
+        publishers,
+        state,
+        workspace,
+        execution)
 end
 
 """One active, inclusive-deadline arm attempt."""
@@ -335,6 +361,22 @@ serial_products_published(run::Union{
     RunningSerialRun,
 }) = _prepared_serial_run(run).state.products_published
 
+serial_optical_execution_configuration(
+    run::ConfiguredSerialRun) = run.optical_execution
+serial_optical_execution_configuration(run::Union{
+    PreparedSerialRun,
+    ArmingSerialRun,
+    ArmedSerialRun,
+    RunningSerialRun,
+}) = _prepared_serial_run(run).configuration.optical_execution
+
+serial_optical_execution(run::Union{
+    PreparedSerialRun,
+    ArmingSerialRun,
+    ArmedSerialRun,
+    RunningSerialRun,
+}) = _prepared_serial_run(run).execution
+
 function _serial_publisher(
     event_loop::PreparedPlantEventLoop,
     port::AcquisitionCompletionPort)
@@ -405,9 +447,20 @@ function _validate_nonstructural_controls(::Any)
         "nonstructural control declarations must be a tuple"))
 end
 
+@inline _validate_optical_execution(
+    execution::AbstractOpticalExecutionConfiguration) = execution
+
+function _validate_optical_execution(::Any)
+    throw(SerialRunError(
+        :serial_run,
+        :invalid_optical_execution,
+        "optical execution must be an AbstractOpticalExecutionConfiguration"))
+end
+
 """
     configure_serial_run(command_bridge, acquisition_ports;
-        arm_timeout_ns, nonstructural_controls=())
+        arm_timeout_ns, optical_execution=SerialOpticalExecution(),
+        nonstructural_controls=())
 
 Validate and freeze the exact event-loop command route, acquisition-completion
 ports, and relative arm deadline for one serial HIL topology. Prepared
@@ -418,9 +471,11 @@ function configure_serial_run(
     command_bridge::PreparedCommandBridge,
     acquisition_ports::Tuple;
     arm_timeout_ns::Integer,
+    optical_execution=SerialOpticalExecution(),
     nonstructural_controls=())
     controls = _validate_nonstructural_controls(
         nonstructural_controls)
+    execution = _validate_optical_execution(optical_execution)
     event_loop = command_bridge_event_loop(command_bridge)
     event_loop === nothing && throw(SerialRunError(
         :serial_run, :command_target_without_event_loop,
@@ -435,6 +490,7 @@ function configure_serial_run(
         event_loop,
         command_bridge,
         acquisition_ports,
+        execution,
         lifecycle,
         controls,
         _SERIAL_CONSTRUCTION_TOKEN)
@@ -471,11 +527,19 @@ function prepare_serial_run(configuration::ConfiguredSerialRun)
         bridge_workspace,
         leases,
         _SERIAL_CONSTRUCTION_TOKEN)
+    execution = _prepare_optical_execution(
+        configuration.optical_execution,
+        configuration.event_loop,
+        plant_event_loop_state(state.bridge),
+        plant_event_loop_workspace(workspace.bridge),
+        configuration.lifecycle.session,
+    )
     return PreparedSerialRun(
         configuration,
         publishers,
         state,
         workspace,
+        execution,
         _SERIAL_CONSTRUCTION_TOKEN)
 end
 
@@ -484,7 +548,13 @@ struct AcquisitionPortAccounting
     products::PayloadPoolAccounting
 end
 
-struct SerialRunAccounting{C,A<:Tuple}
+"""
+Cold ownership snapshot for one serial run.
+
+`execution_owners` is `nothing` for the core serial oracle and a fixed
+`Memory{ExecutionOwnerAccounting}` snapshot for prepared HIL owners.
+"""
+struct SerialRunAccounting{C,A<:Tuple,E}
     command_submissions::RingAccounting
     command_completions::RingAccounting
     command_credits::PayloadPoolAccounting
@@ -492,6 +562,7 @@ struct SerialRunAccounting{C,A<:Tuple}
     command_dispositions::Int
     active_command_correlations::Int
     acquisitions::A
+    execution_owners::E
 end
 
 @inline _serial_command_payload_accounting(
@@ -529,7 +600,8 @@ function serial_run_accounting(run::PreparedSerialRun)
         command_disposition_count(
             command_disposition_workspace(workspace.bridge)),
         active_command_correlations(state.bridge),
-        _serial_acquisition_accounting(run.publishers))
+        _serial_acquisition_accounting(run.publishers),
+        _execution_accounting(run.execution))
 end
 
 # Julia emits no coverage counters for these exercised constant dispatch leaves.
@@ -553,7 +625,9 @@ function serial_run_is_quiescent(accounting::SerialRunAccounting)
         _pool_is_quiescent(accounting.command_payloads) &&
         iszero(accounting.command_dispositions) &&
         iszero(accounting.active_command_correlations) &&
-        _acquisitions_are_quiescent(accounting.acquisitions)
+        _acquisitions_are_quiescent(accounting.acquisitions) &&
+        _execution_accounting_is_quiescent(
+            accounting.execution_owners)
 end
 
 # Direct dispatch tests cover these inlined recursion leaves, but Julia's
@@ -616,6 +690,11 @@ function begin_serial_arm!(
         throw(SerialRunError(
             :serial_run, :ownership_not_quiescent,
             "every port and payload pool must be quiescent before arm"))
+    _execution_is_quiescent(run.execution) ||
+        throw(SerialRunError(
+            :serial_run,
+            :execution_ownership_not_quiescent,
+            "every execution-owner handoff must be quiescent before arm"))
     opened_execution_ns = _read_execution_clock(clock)
     window = _begin_arm!(
         state.lifecycle,
@@ -656,14 +735,32 @@ function arm_serial_run!(
         attempt.window,
         readiness,
         current_execution_ns)
-    return ArmedSerialRun(
+    armed = ArmedSerialRun(
         attempt.prepared,
         mapping,
         _SERIAL_CONSTRUCTION_TOKEN)
+    try
+        _arm_optical_execution!(attempt.prepared.execution)
+    catch error
+        _record_serial_failure!(armed, error)
+        rethrow()
+    end
+    return armed
 end
 
 function start_serial_run!(armed::ArmedSerialRun)
+    _execution_is_armed(armed.prepared.execution) ||
+        throw(SerialRunError(
+            :serial_run,
+            :execution_owners_not_armed,
+            "optical execution owners must be armed before the run starts"))
     _start_run!(armed.prepared.state.lifecycle)
+    try
+        _start_optical_execution!(armed.prepared.execution)
+    catch error
+        _record_serial_failure!(armed, error)
+        rethrow()
+    end
     return RunningSerialRun(armed, _SERIAL_CONSTRUCTION_TOKEN)
 end
 
@@ -680,8 +777,14 @@ end
     serial_run_is_quiescent(accounting) || throw(SerialRunError(
         :serial_run, :ownership_not_quiescent,
         "clean stop requires every descriptor, outcome, and payload lease to be accounted for"))
+    _execution_is_quiescent(armed.prepared.execution) ||
+        throw(SerialRunError(
+            :serial_run,
+            :execution_ownership_not_quiescent,
+            "clean stop requires every execution-owner handoff to be accounted for"))
+    _stop_optical_execution!(armed.prepared.execution)
     _record_stop!(armed.prepared.state.lifecycle, event)
-    return accounting
+    return serial_run_accounting(armed.prepared)
 end
 
 stop_serial_run!(
@@ -787,7 +890,8 @@ end
 function _step_serial_run!(
     armed::ArmedSerialRun,
     state::SerialRunState,
-    workspace::SerialRunWorkspace)
+    workspace::SerialRunWorkspace,
+    execution::AbstractOpticalPathBatchExecutor)
     run = armed.prepared
     configuration = run.configuration
     publication_execution_ns =
@@ -820,7 +924,10 @@ function _step_serial_run!(
         SerialDeadlinePending, timestamp, time_until_ns)
 
     processed = step_plant_events!(
-        configuration.event_loop, event_state, event_workspace)
+        configuration.event_loop,
+        event_state,
+        event_workspace,
+        execution)
     processed == timestamp || _serial_publication_error(
         :event_timestamp_mismatch,
         "the prepared event loop did not process its advertised timestamp")
@@ -844,8 +951,10 @@ function _step_serial_run!(
 end
 
 """
-Perform one nonblocking command, deadline, or plant-event decision. A pending
-deadline is returned to the caller; this function never sleeps or retries.
+Perform one command, deadline, or plant-event scheduling decision. A pending
+deadline is returned without sleeping. A due optical event completes the
+selected executor's prepared materialization and execution barriers before
+returning.
 """
 @inline _serial_failure_component(::Any) = :serial_run # COV_EXCL_LINE
 @inline _serial_failure_component(error::SerialRunError) =
@@ -856,22 +965,27 @@ deadline is returned to the caller; this function never sleeps or retries.
     error.reason
 
 @noinline function _record_serial_failure!(
-    running::RunningSerialRun,
+    armed::ArmedSerialRun,
     error)
-    armed = running.armed
     observed_execution_ns = try
         _read_execution_clock(execution_clock(armed.timing))
     catch
         nothing
     end
     event = RunFailureEvent(
-        run_session(running),
+        run_session(armed),
         execution_clock_identity(armed.timing),
         observed_execution_ns,
         _serial_failure_component(error),
         _serial_failure_reason(error))
+    _mark_optical_execution_failed!(armed.prepared.execution)
     return _fail_run!(armed.prepared.state.lifecycle, event)
 end
+
+_record_serial_failure!(
+    running::RunningSerialRun,
+    error,
+) = _record_serial_failure!(running.armed, error)
 
 function step_serial_run!(running::RunningSerialRun)
     run = running.armed.prepared
@@ -882,7 +996,8 @@ function step_serial_run!(running::RunningSerialRun)
         return _step_serial_run!(
             running.armed,
             state,
-            workspace)
+            workspace,
+            run.execution)
     catch error
         _record_serial_failure!(running, error)
         rethrow()
