@@ -201,10 +201,9 @@ const _SERIAL_CONSTRUCTION_TOKEN = _SerialConstructionToken()
 """
 Immutable configured topology for one deterministic serial runtime.
 
-The current core exposes no prepared nonstructural acquisition, trigger,
-shutter, calibration-source, or optic-mode control seam, so this configuration
-admits none. Such controls are added only with concrete preallocated core
-support, never as arbitrary callbacks.
+Model-supported runtime plant controls use the same prepared typed command
+endpoints as every other RTC command. The serial configuration does not own a
+second callback-like control surface.
 """
 struct ConfiguredSerialRun{
     L<:PreparedPlantEventLoop,
@@ -219,7 +218,6 @@ struct ConfiguredSerialRun{
     optical_execution::E
     lifecycle::RunLifecycleParameters
     ingress_liveness::I
-    nonstructural_controls::Tuple{}
 
     ConfiguredSerialRun(
         event_loop::L,
@@ -228,7 +226,6 @@ struct ConfiguredSerialRun{
         optical_execution::E,
         lifecycle::RunLifecycleParameters,
         ingress_liveness::I,
-        nonstructural_controls::Tuple{},
         ::_SerialConstructionToken) where {
         L<:PreparedPlantEventLoop,
         B<:PreparedCommandBridge,
@@ -241,8 +238,7 @@ struct ConfiguredSerialRun{
         acquisition_ports,
         optical_execution,
         lifecycle,
-        ingress_liveness,
-        nonstructural_controls)
+        ingress_liveness)
 end
 
 """
@@ -600,22 +596,6 @@ function _validate_serial_acquisition_ports(ports::Tuple)
     return session
 end
 
-@inline _validate_nonstructural_controls(::Tuple{}) = ()
-
-function _validate_nonstructural_controls(::Tuple)
-    throw(SerialRunError(
-        :serial_run,
-        :unsupported_nonstructural_control,
-        "the prepared serial core exposes no nonstructural control seam"))
-end
-
-function _validate_nonstructural_controls(::Any)
-    throw(SerialRunError(
-        :serial_run,
-        :invalid_nonstructural_controls,
-        "nonstructural control declarations must be a tuple"))
-end
-
 @inline _validate_rtc_ingress_liveness(
     ::PreparedCommandBridge,
     ::Nothing) = NoRTCIngressLiveness()
@@ -654,22 +634,19 @@ end
 """
     configure_serial_run(command_bridge, acquisition_ports;
         arm_timeout_ns, optical_execution=SerialOpticalExecution(),
-        ingress_liveness=nothing, nonstructural_controls=())
+        ingress_liveness=nothing)
 
 Validate and freeze the exact event-loop command route, acquisition-completion
-ports, and relative arm deadline for one serial HIL topology. Prepared
-nonstructural controls are currently unsupported by the core serial event loop,
-so only the empty tuple is accepted.
+ports, and relative arm deadline for one serial HIL topology. Runtime plant
+state changes supported by the prepared model use typed command endpoints;
+this lifecycle boundary does not add a parallel control queue or callback.
 """
 function configure_serial_run(
     command_bridge::PreparedCommandBridge,
     acquisition_ports::Tuple;
     arm_timeout_ns::Integer,
     optical_execution=SerialOpticalExecution(),
-    ingress_liveness=nothing,
-    nonstructural_controls=())
-    controls = _validate_nonstructural_controls(
-        nonstructural_controls)
+    ingress_liveness=nothing)
     execution = _validate_optical_execution(optical_execution)
     liveness = _validate_rtc_ingress_liveness(
         command_bridge, ingress_liveness)
@@ -690,7 +667,6 @@ function configure_serial_run(
         execution,
         lifecycle,
         liveness,
-        controls,
         _SERIAL_CONSTRUCTION_TOKEN)
 end
 

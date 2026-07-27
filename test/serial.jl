@@ -1639,26 +1639,6 @@ end
         @test command_session_error isa SerialRunError
         @test command_session_error.reason == :session_mismatch
 
-        control_error = captured_serial_error() do
-            configure_serial_run(
-                fixture.bridge,
-                (fixture.wfs_port, fixture.feedback_port);
-                arm_timeout_ns=10,
-                nonstructural_controls=(:shutter,))
-        end
-        @test control_error isa SerialRunError
-        @test control_error.reason ==
-            :unsupported_nonstructural_control
-        invalid_controls = captured_serial_error() do
-            configure_serial_run(
-                fixture.bridge,
-                (fixture.wfs_port, fixture.feedback_port);
-                arm_timeout_ns=10,
-                nonstructural_controls=[:shutter])
-        end
-        @test invalid_controls isa SerialRunError
-        @test invalid_controls.reason ==
-            :invalid_nonstructural_controls
         invalid_port = captured_serial_error() do
             configure_serial_run(
                 fixture.bridge,

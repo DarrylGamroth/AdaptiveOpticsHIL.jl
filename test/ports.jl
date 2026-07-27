@@ -917,6 +917,105 @@ end
             PortTransferSucceeded
     end
 
+    @testset "Future-effective calendar capacity is terminal" begin
+        schema = port_test_schema()
+        endpoint = port_test_endpoint(schema; capacity=1)
+        ports = prepare_command_ports(
+            endpoint,
+            [zeros(3), zeros(3)];
+            session=RunSessionID(58),
+            payload_pool_id=UInt64(118),
+            outcome_credit_pool_id=UInt64(119),
+            submission_capacity=2,
+            completion_capacity=2)
+        submission_port = command_submission_port(ports)
+        completion_port = command_completion_port(ports)
+        bridge = prepare_command_bridge(ports, endpoint)
+        state = CommandBridgeState(bridge)
+        bridge_workspace = CommandBridgeWorkspace(bridge)
+
+        first = claim_command_submission(
+            submission_port,
+            [0.1, 0.1, 0.1],
+            1,
+            1,
+            PORT_TEST_PLANT.PlantTimestamp(1))
+        first = replace_submission(
+            first;
+            timing=receive_time_command_timing(
+                PORT_TEST_PLANT.PlantTimestamp(1);
+                requested_effective_timestamp=
+                    PORT_TEST_PLANT.PlantTimestamp(100)))
+        @test try_submit!(
+            submission_port, first, Int64(1)).status ==
+            PortTransferSucceeded
+        first_processing = process_next_command!(
+            bridge, state, bridge_workspace, Int64(1))
+        @test command_processing_stage(first_processing) ==
+            CommandSemanticallyAdmitted
+
+        second = claim_command_submission(
+            submission_port,
+            [0.2, 0.2, 0.2],
+            2,
+            2,
+            PORT_TEST_PLANT.PlantTimestamp(2))
+        second = replace_submission(
+            second;
+            timing=receive_time_command_timing(
+                PORT_TEST_PLANT.PlantTimestamp(2);
+                requested_effective_timestamp=
+                    PORT_TEST_PLANT.PlantTimestamp(200)))
+        @test try_submit!(
+            submission_port, second, Int64(2)).status ==
+            PortTransferSucceeded
+        second_processing = process_next_command!(
+            bridge, state, bridge_workspace, Int64(2))
+        @test command_processing_stage(second_processing) ==
+            CommandTerminatedDuringAdmission
+        @test active_command_correlations(state) == 1
+        @test PORT_TEST_PLANT.pending_command_count(
+            command_endpoint_state(state)) == 1
+
+        rejected = take_command_outcome(completion_port)
+        @test outcome_stage(rejected) == CoreCommandOutcome
+        @test outcome_reason(rejected) == :calendar_capacity
+        @test outcome_terminal_kind(rejected) ==
+            PORT_TEST_PLANT.RejectedCommand
+        @test outcome_stream_sequence(rejected) == StreamSequence(2)
+        @test outcome_command_sequence(rejected) ==
+            PORT_TEST_PLANT.PlantCommandSequence(2)
+        @test outcome_payload(completion_port, rejected) ≈
+            [0.2, 0.2, 0.2]
+        @test release_outcome!(completion_port, rejected).status ==
+            PortTransferSucceeded
+        @test reclaim_command_payload_returns!(submission_port) ==
+            RingBatchResult(RingTransferSucceeded, 1)
+        @test reclaim_outcome_credit_returns!(submission_port) ==
+            RingBatchResult(RingTransferSucceeded, 1)
+
+        @test finish_ready_command!(
+            bridge,
+            state,
+            bridge_workspace,
+            PORT_TEST_PLANT.PlantTimestamp(100),
+            Int64(100)) == 1
+        applied = take_command_outcome(completion_port)
+        @test outcome_reason(applied) == :applied
+        @test outcome_stream_sequence(applied) == StreamSequence(1)
+        @test release_outcome!(completion_port, applied).status ==
+            PortTransferSucceeded
+        @test reclaim_command_payload_returns!(submission_port) ==
+            RingBatchResult(RingTransferSucceeded, 1)
+        @test reclaim_outcome_credit_returns!(submission_port) ==
+            RingBatchResult(RingTransferSucceeded, 1)
+        @test command_payload_accounting(submission_port).free == 2
+        @test outcome_credit_accounting(submission_port).free == 2
+        @test active_command_correlations(state) == 0
+        @test PORT_TEST_PLANT.pending_command_count(
+            command_endpoint_state(state)) == 0
+    end
+
     @testset "Preparation, lease, and full backpressure" begin
         schema = port_test_schema()
         endpoint = port_test_endpoint(schema)
