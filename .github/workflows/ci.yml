@@ -24,7 +24,7 @@ jobs:
         include:
           - os: ubuntu-latest
             julia-version: "1.12"
-          - os: macos-latest
+          - os: macos-15
             julia-version: "1.12"
           - os: windows-latest
             julia-version: "1.12"
@@ -44,6 +44,10 @@ jobs:
 
       - name: Cache Julia artifacts
         uses: julia-actions/cache@v3
+
+      - name: Verify Apple Silicon runner
+        if: matrix.os == 'macos-15'
+        run: julia --startup-file=no -e 'using InteractiveUtils; Sys.isapple() && Sys.ARCH === :aarch64 || error("SPSC layout validation requires the maintained Apple Silicon runner"); versioninfo()'
 
       - name: Instantiate
         run: julia --project=. --startup-file=no -e 'using Pkg; Pkg.instantiate()'

@@ -1,4 +1,11 @@
 using AdaptiveOpticsHIL.Ownership
+using AdaptiveOpticsHIL.Ownership:
+    MAX_SUPPORTED_CACHE_LINE_BYTES,
+    SPSCLayoutEvidence,
+    maximum_cache_line_bytes,
+    ring_layout_contract,
+    validate_ring_layout
+using InteractiveUtils
 
 const OWNERSHIP_TESTS_WITH_COVERAGE =
     Base.JLOptions().code_coverage != 0
@@ -24,9 +31,80 @@ function ring_allocation_bytes(
     output::Base.RefValue{UInt64})
     try_submit!(ring, UInt64(11))
     try_take!(output, ring)
-    submit_bytes = @allocated try_submit!(ring, UInt64(12))
+    batch_output = fill(UInt64(0), 2)
+    try_submit!(ring, UInt64(12))
+    try_submit!(ring, UInt64(13))
+    try_take_batch!(batch_output, ring)
+    ring_accounting(ring)
+    validate_ring_layout(ring)
+
+    submit_bytes = @allocated try_submit!(ring, UInt64(14))
     take_bytes = @allocated try_take!(output, ring)
-    return submit_bytes, take_bytes
+    try_submit!(ring, UInt64(15))
+    try_submit!(ring, UInt64(16))
+    batch_bytes = @allocated try_take_batch!(batch_output, ring)
+    accounting_bytes = @allocated ring_accounting(ring)
+    layout_validation_bytes = @allocated validate_ring_layout(ring)
+    return (;
+        submit_bytes,
+        take_bytes,
+        batch_bytes,
+        accounting_bytes,
+        layout_validation_bytes)
+end
+
+function replace_layout_evidence(
+    evidence::SPSCLayoutEvidence;
+    maximum_cache_line_bytes::Int=
+        evidence.maximum_cache_line_bytes,
+    cursor_storage_bytes::Int=evidence.cursor_storage_bytes,
+    object_base_modulo::Int=evidence.object_base_modulo,
+    producer_sequence_offset::Int=
+        evidence.producer_sequence_offset,
+    producer_cached_consumer_sequence_offset::Int=
+        evidence.producer_cached_consumer_sequence_offset,
+    producer_slot_offset::Int=
+        evidence.producer_slot_offset,
+    consumer_sequence_offset::Int=
+        evidence.consumer_sequence_offset,
+    consumer_cached_producer_sequence_offset::Int=
+        evidence.consumer_cached_producer_sequence_offset,
+    consumer_slot_offset::Int=
+        evidence.consumer_slot_offset,
+    closed_offset::Int=evidence.closed_offset)
+    return SPSCLayoutEvidence(
+        maximum_cache_line_bytes,
+        cursor_storage_bytes,
+        object_base_modulo,
+        producer_sequence_offset,
+        producer_cached_consumer_sequence_offset,
+        producer_slot_offset,
+        consumer_sequence_offset,
+        consumer_cached_producer_sequence_offset,
+        consumer_slot_offset,
+        closed_offset)
+end
+
+function ownership_error_reason(f::F) where {F}
+    try
+        f()
+    catch error
+        error isa OwnershipError || rethrow()
+        return error.reason
+    end
+    return nothing
+end
+
+function llvm_text(f, types)
+    output = IOBuffer()
+    code_llvm(
+        output,
+        f,
+        types;
+        optimize=true,
+        raw=true,
+        debuginfo=:none)
+    return String(take!(output))
 end
 
 function payload_allocation_bytes(
@@ -67,11 +145,112 @@ end
         @test_throws OwnershipError SPSCDescriptorRing{Vector{Int}}(2)
         @test_throws OwnershipError SPSCDescriptorRing{UInt64}(
             UInt128(typemax(Int)) + 1)
+        @test_throws OwnershipError SPSCLayoutContract(32)
+        @test_throws OwnershipError SPSCLayoutContract(96)
+        @test_throws OwnershipError SPSCLayoutContract(256)
 
         ring = SPSCDescriptorRing{UInt64}(3)
         @test ring_capacity(ring) == 3
-        @test ring_cursor_separation_bytes() >=
-              CONSERVATIVE_CACHE_LINE_BYTES
+        contract = ring_layout_contract(ring)
+        @test maximum_cache_line_bytes(contract) ==
+              MAX_SUPPORTED_CACHE_LINE_BYTES
+        evidence = @inferred validate_ring_layout(ring)
+        @test evidence.maximum_cache_line_bytes ==
+              MAX_SUPPORTED_CACHE_LINE_BYTES
+        @test evidence.cursor_storage_bytes >=
+              6 * MAX_SUPPORTED_CACHE_LINE_BYTES
+        @test evidence.consumer_sequence_offset -
+              evidence.producer_sequence_offset >=
+              2 * MAX_SUPPORTED_CACHE_LINE_BYTES
+        @test evidence.closed_offset -
+              evidence.consumer_sequence_offset >=
+              2 * MAX_SUPPORTED_CACHE_LINE_BYTES
+        @test 0 <= evidence.object_base_modulo <
+              MAX_SUPPORTED_CACHE_LINE_BYTES
+
+        line64_contract = SPSCLayoutContract(64)
+        line64_ring =
+            SPSCDescriptorRing{UInt64}(3, line64_contract)
+        @test ring_layout_contract(line64_ring) === line64_contract
+        line64_evidence = validate_ring_layout(line64_ring)
+        @test line64_evidence.maximum_cache_line_bytes == 64
+
+        mismatched_contract = replace_layout_evidence(
+            evidence;
+            maximum_cache_line_bytes=64)
+        mismatch_reason = ownership_error_reason() do
+            Ownership._validate_spsc_layout_evidence(
+                contract, mismatched_contract)
+        end
+        @test mismatch_reason == :layout_contract_mismatch
+
+        invalid_modulo = replace_layout_evidence(
+            evidence;
+            object_base_modulo=
+                evidence.maximum_cache_line_bytes)
+        modulo_reason = ownership_error_reason() do
+            Ownership._validate_spsc_layout_evidence(
+                contract, invalid_modulo)
+        end
+        @test modulo_reason == :invalid_object_address_modulo
+
+        insufficient_storage = replace_layout_evidence(
+            evidence;
+            cursor_storage_bytes=
+                6 * evidence.maximum_cache_line_bytes - 1)
+        storage_reason = ownership_error_reason() do
+            Ownership._validate_spsc_layout_evidence(
+                contract, insufficient_storage)
+        end
+        @test storage_reason == :insufficient_cursor_storage
+
+        outside_storage = replace_layout_evidence(
+            evidence;
+            closed_offset=evidence.cursor_storage_bytes)
+        outside_reason = ownership_error_reason() do
+            Ownership._validate_spsc_layout_evidence(
+                contract, outside_storage)
+        end
+        @test outside_reason == :atomic_field_outside_storage
+
+        misaligned = replace_layout_evidence(
+            evidence;
+            object_base_modulo=mod(
+                evidence.object_base_modulo + 1,
+                evidence.maximum_cache_line_bytes))
+        misaligned_reason = ownership_error_reason() do
+            Ownership._validate_spsc_layout_evidence(
+                contract, misaligned)
+        end
+        @test misaligned_reason == :misaligned_atomic_field
+
+        overlapping = replace_layout_evidence(
+            evidence;
+            consumer_sequence_offset=
+                evidence.producer_sequence_offset)
+        overlapping_reason = ownership_error_reason() do
+            Ownership._validate_spsc_layout_evidence(
+                contract, overlapping)
+        end
+        @test overlapping_reason == :overlapping_cursor_fields
+
+        insufficiently_separated = SPSCLayoutEvidence(
+            128, 776, 0, 128, 136, 144, 152, 160, 168, 176)
+        separation_reason = ownership_error_reason() do
+            Ownership._validate_spsc_layout_evidence(
+                contract, insufficiently_separated)
+        end
+        @test separation_reason ==
+              :insufficient_publication_separation
+
+        insufficiently_padded = SPSCLayoutEvidence(
+            128, 776, 0, 0, 8, 16, 256, 264, 272, 512)
+        padding_reason = ownership_error_reason() do
+            Ownership._validate_spsc_layout_evidence(
+                contract, insufficiently_padded)
+        end
+        @test padding_reason == :insufficient_boundary_padding
+
         @test !ring_is_closed(ring)
         accounting = ring_accounting(ring)
         @test accounting ==
@@ -127,6 +306,68 @@ end
             @test output[] == cycle
         end
         @test ring_accounting(ring).occupancy == 0
+    end
+
+    @testset "UInt64 sequence wrap" begin
+        ring = SPSCDescriptorRing{UInt64}(3)
+        output = Ref(UInt64(0))
+        initial_sequence = typemax(UInt64) - one(UInt64)
+        @atomic :release ring.cursors.producer_sequence =
+            initial_sequence
+        ring.cursors.producer_cached_consumer_sequence =
+            initial_sequence
+        @atomic :release ring.cursors.consumer_sequence =
+            initial_sequence
+        ring.cursors.consumer_cached_producer_sequence =
+            initial_sequence
+
+        @test try_submit!(ring, UInt64(41)) ==
+              RingTransferSucceeded
+        @test try_submit!(ring, UInt64(42)) ==
+              RingTransferSucceeded
+        @test try_submit!(ring, UInt64(43)) ==
+              RingTransferSucceeded
+        @test ring_accounting(ring).producer_sequence == 1
+        @test ring_accounting(ring).occupancy == 3
+        @test try_take!(output, ring) == RingTransferSucceeded
+        @test output[] == 41
+        @test try_take!(output, ring) == RingTransferSucceeded
+        @test output[] == 42
+        @test try_take!(output, ring) == RingTransferSucceeded
+        @test output[] == 43
+        accounting = ring_accounting(ring)
+        @test accounting.producer_sequence == 1
+        @test accounting.consumer_sequence == 1
+        @test accounting.occupancy == 0
+
+        @test try_submit!(ring, UInt64(44)) ==
+              RingTransferSucceeded
+        @test try_take!(output, ring) == RingTransferSucceeded
+        @test output[] == 44
+
+        batch_ring = SPSCDescriptorRing{UInt64}(5)
+        batch_initial_sequence =
+            typemax(UInt64) - UInt64(2)
+        @atomic :release batch_ring.cursors.producer_sequence =
+            batch_initial_sequence
+        batch_ring.cursors.producer_cached_consumer_sequence =
+            batch_initial_sequence
+        @atomic :release batch_ring.cursors.consumer_sequence =
+            batch_initial_sequence
+        batch_ring.cursors.consumer_cached_producer_sequence =
+            batch_initial_sequence
+        for value in UInt64(51):UInt64(55)
+            @test try_submit!(batch_ring, value) ==
+                  RingTransferSucceeded
+        end
+        batch_output = fill(UInt64(0), 5)
+        @test try_take_batch!(batch_output, batch_ring) ==
+              RingBatchResult(RingTransferSucceeded, 5)
+        @test batch_output == collect(UInt64(51):UInt64(55))
+        batch_accounting = ring_accounting(batch_ring)
+        @test batch_accounting.producer_sequence == 2
+        @test batch_accounting.consumer_sequence == 2
+        @test batch_accounting.occupancy == 0
     end
 
     @testset "Natural batches" begin
@@ -195,8 +436,58 @@ end
         if OWNERSHIP_TESTS_WITH_COVERAGE
             @test_skip "allocation assertions are disabled under coverage"
         else
-            @test ring_allocation_bytes(ring, output) == (0, 0)
+            @test ring_allocation_bytes(ring, output) == (
+                submit_bytes=0,
+                take_bytes=0,
+                batch_bytes=0,
+                accounting_bytes=0,
+                layout_validation_bytes=0)
         end
+    end
+
+    @testset "Generated atomic ordering" begin
+        submit_llvm = llvm_text(
+            try_submit!,
+            Tuple{SPSCDescriptorRing{UInt64},UInt64})
+        take_llvm = llvm_text(
+            try_take!,
+            Tuple{
+                Base.RefValue{UInt64},
+                SPSCDescriptorRing{UInt64}})
+        close_llvm = llvm_text(
+            close_ring!,
+            Tuple{SPSCDescriptorRing{UInt64}})
+
+        @test occursin(
+            r"load atomic i64, ptr .* acquire",
+            submit_llvm)
+        @test occursin(
+            r"store atomic i64 .* release",
+            submit_llvm)
+        @test occursin(
+            r"load atomic i64, ptr .* acquire",
+            take_llvm)
+        @test occursin(
+            r"store atomic i64 .* release",
+            take_llvm)
+        @test occursin(
+            r"store atomic i64 .* release",
+            close_llvm)
+        for generated_code in (
+            submit_llvm,
+            take_llvm,
+            close_llvm)
+            @test !occursin("jl_apply_generic", generated_code)
+            @test !occursin("jl_gc_alloc", generated_code)
+            @test !occursin(" urem ", generated_code)
+        end
+
+        @info(
+            "SPSC atomic-ordering inspection target",
+            julia_version=VERSION,
+            llvm_version=Base.libllvm_version,
+            machine=Sys.MACHINE,
+            kernel=Sys.KERNEL)
     end
 end
 

@@ -45,8 +45,13 @@ foundation for command and acquisition ports:
 - a fixed-capacity SPSC ring for compact, concrete, immutable descriptors
 - explicit success, full, empty, and closed results with close-and-drain
   behavior
-- release/acquire sequence publication with independently written cursors
-  separated by a conservative 128-byte distance
+- release/acquire sequence publication with producer, consumer, and closure
+  state isolated under a prepared 64- or 128-byte cache-line upper-bound
+  contract
+- cold layout evidence derived from both Julia field offsets and the actual
+  cursor-object address before a ring is admitted
+- owner-local slot cursors that preserve arbitrary-capacity indexing across
+  `UInt64` publication-sequence wrap without division in descriptor transfer
 - a fixed payload pool with immutable pool, session, slot, and generation
   references
 - explicit producer-owned, queued, consumer-leased, and free transitions
