@@ -48,6 +48,14 @@ using ..Ownership: RingAccounting, RingClosed, RingEmpty, RingFull
 using ..Ownership: RingTransferSucceeded, SPSCDescriptorRing
 using ..Ownership: close_ring!, ring_accounting
 using ..Ownership: try_submit!, try_take!
+using ..Ports: AbstractResourceCriticality
+using ..Ports: OptionalResource, RequiredResource
+import ..Ports: maximum_resource_lateness_ns
+import ..Ports: overload_recovery_occupancy, resource_criticality
+import ..Ports: resource_is_required
+using ..Timing: ExecutionClockMapping
+using ..Timing: _read_execution_clock, execution_clock
+using ..Timing: execution_lateness_ns
 
 export ExecutionOwnerError
 export AbstractOpticalExecutionConfiguration, SerialOpticalExecution
@@ -65,10 +73,19 @@ export execution_owner_count, execution_owner
 export execution_owner_id, execution_owner_kind
 export execution_owner_backend, execution_owner_compute_device
 export execution_owner_group_count, execution_owner_group_ordinal
+export AbstractExecutionOwnerOverloadAction
+export FailRunOnOwnerOverload, ExecutionOwnerOverloadPolicy
+export ExecutionOwnerPolicyOverride
+export execution_owner_overload_policy, execution_owner_overload_action
+export resource_criticality, maximum_resource_lateness_ns
+export overload_recovery_occupancy, resource_is_required
 export execution_owner_mode, execution_owner_idle_policy
 export execution_cpu_budget, execution_cpu_environment
 export execution_owner_ring_capacity, execution_owners_phase
 export execution_batches_completed
+export ExecutionOwnerOverloadDecision
+export ExecutionOwnerNoOverloadDecision
+export ExecutionOwnerFailedForCapacity, ExecutionOwnerFailedForDeadline
 export ExecutionOwnerAccounting, execution_owner_accounting
 export execution_owners_are_quiescent
 
@@ -211,6 +228,122 @@ function _validate_execution_owner_mode(
     )
 end
 
+"""Prepared action when an execution-owner capacity or deadline proof fails."""
+abstract type AbstractExecutionOwnerOverloadAction end
+
+"""
+Fail the run when an owner cannot preserve its prepared capacity or deadline.
+
+This action is valid for required and optional owners. Work is never silently
+revoked after dispatch.
+"""
+struct FailRunOnOwnerOverload <:
+    AbstractExecutionOwnerOverloadAction end
+
+@inline _checked_execution_owner_maximum_lateness(::Nothing) = nothing
+
+@inline function _checked_execution_owner_maximum_lateness(
+    value::Integer,
+)
+    0 <= value <= typemax(Int64) || _execution_owner_error(
+        :invalid_maximum_lateness,
+        "maximum execution-owner lateness must be a nonnegative Int64-compatible nanosecond count",
+    )
+    return Int64(value)
+end
+
+@inline _checked_execution_owner_maximum_lateness(
+    ::Bool,
+) = _execution_owner_error(
+    :invalid_maximum_lateness,
+    "maximum execution-owner lateness must be an integer nanosecond count, not Bool",
+)
+
+@inline function _checked_execution_owner_recovery_occupancy(
+    value::Integer,
+)
+    0 <= value <= typemax(Int) || _execution_owner_error(
+        :invalid_recovery_occupancy,
+        "execution-owner recovery occupancy must be a nonnegative addressable count",
+    )
+    return Int(value)
+end
+
+@inline _checked_execution_owner_recovery_occupancy(
+    ::Bool,
+) = _execution_owner_error(
+    :invalid_recovery_occupancy,
+    "execution-owner recovery occupancy must be an integer count, not Bool",
+)
+
+"""
+Immutable capacity/deadline contract applied to one or more prepared owners.
+
+`maximum_lateness_ns === nothing` selects no execution-clock owner deadline.
+`recovery_occupancy` applies independently to the equally sized due and
+completion descriptor paths and is validated when the topology is prepared.
+"""
+struct ExecutionOwnerOverloadPolicy{
+    C<:AbstractResourceCriticality,
+    A<:AbstractExecutionOwnerOverloadAction,
+}
+    criticality::C
+    action::A
+    maximum_lateness_ns::Union{Nothing,Int64}
+    recovery_occupancy::Int
+
+    function ExecutionOwnerOverloadPolicy(
+        criticality::C,
+        action::A;
+        maximum_lateness_ns::Union{Nothing,Integer},
+        recovery_occupancy::Integer,
+    ) where {
+        C<:AbstractResourceCriticality,
+        A<:AbstractExecutionOwnerOverloadAction,
+    }
+        return new{C,A}(
+            criticality,
+            action,
+            _checked_execution_owner_maximum_lateness(
+                maximum_lateness_ns),
+            _checked_execution_owner_recovery_occupancy(
+                recovery_occupancy),
+        )
+    end
+end
+
+resource_criticality(policy::ExecutionOwnerOverloadPolicy) =
+    policy.criticality
+execution_owner_overload_action(
+    policy::ExecutionOwnerOverloadPolicy) = policy.action
+maximum_resource_lateness_ns(
+    policy::ExecutionOwnerOverloadPolicy) =
+    policy.maximum_lateness_ns
+overload_recovery_occupancy(
+    policy::ExecutionOwnerOverloadPolicy) =
+    policy.recovery_occupancy
+@inline resource_is_required(
+    policy::ExecutionOwnerOverloadPolicy) =
+    resource_is_required(resource_criticality(policy))
+
+_validate_execution_owner_overload_action(
+    ::FailRunOnOwnerOverload,
+) = nothing
+
+function _validate_execution_owner_overload_action(
+    ::AbstractExecutionOwnerOverloadAction,
+)
+    return _execution_owner_error(
+        :unsupported_overload_action,
+        "execution-owner overload action is not supported",
+    )
+end
+
+struct _ExecutionOwnerPolicyOverrideRecord
+    owner::UInt32
+    policy::ExecutionOwnerOverloadPolicy
+end
+
 struct _ExecutionOwnerConfigurationToken end
 const _EXECUTION_OWNER_CONFIGURATION_TOKEN =
     _ExecutionOwnerConfigurationToken()
@@ -221,32 +354,44 @@ Immutable owner-execution admission contract.
 The CPU budget and observed environment come from AdaptiveOpticsSim's
 HIL-neutral admission surface. Construction validates them without changing
 Julia, FFT-provider, or BLAS thread settings. `ring_capacity` bounds each
-owner's one-producer/one-consumer due and completion path.
+owner's one-producer/one-consumer due and completion path. `owner_policy` is a
+mandatory declaration for every prepared owner; exact stable owner IDs may
+replace it through `owner_policy_overrides`.
 """
 struct ExecutionOwnerConfiguration{
     M<:AbstractExecutionOwnerMode,
     B<:CPUExecutionBudget,
+    P<:ExecutionOwnerOverloadPolicy,
 } <: AbstractOpticalExecutionConfiguration
     mode::M
     cpu_budget::B
     cpu_environment::CPUExecutionEnvironment
     ring_capacity::Int
+    owner_policy::P
+    owner_policy_overrides::Memory{
+        _ExecutionOwnerPolicyOverrideRecord}
 
     function ExecutionOwnerConfiguration(
         mode::M,
         cpu_budget::B,
         cpu_environment::CPUExecutionEnvironment,
         ring_capacity::Int,
+        owner_policy::P,
+        owner_policy_overrides::Memory{
+            _ExecutionOwnerPolicyOverrideRecord},
         ::_ExecutionOwnerConfigurationToken,
     ) where {
         M<:AbstractExecutionOwnerMode,
         B<:CPUExecutionBudget,
+        P<:ExecutionOwnerOverloadPolicy,
     }
-        return new{M,B}(
+        return new{M,B,P}(
             mode,
             cpu_budget,
             cpu_environment,
             ring_capacity,
+            owner_policy,
+            owner_policy_overrides,
         )
     end
 end
@@ -273,17 +418,24 @@ function ExecutionOwnerConfiguration(
     cpu_budget::B,
     cpu_environment::CPUExecutionEnvironment;
     ring_capacity::Integer=1,
+    owner_policy::ExecutionOwnerOverloadPolicy,
+    owner_policy_overrides::Tuple=(),
 ) where {
     M<:AbstractExecutionOwnerMode,
     B<:CPUExecutionBudget,
 }
     _validate_execution_owner_mode(mode)
+    _validate_execution_owner_overload_action(owner_policy.action)
+    overrides = _checked_execution_owner_policy_overrides(
+        owner_policy_overrides)
     validate_cpu_execution_budget(cpu_budget, cpu_environment)
     return ExecutionOwnerConfiguration(
         mode,
         cpu_budget,
         cpu_environment,
         _checked_execution_ring_capacity(ring_capacity),
+        owner_policy,
+        overrides,
         _EXECUTION_OWNER_CONFIGURATION_TOKEN,
     )
 end
@@ -327,6 +479,105 @@ function Base.show(io::IO, value::ExecutionOwnerID)
 end
 
 execution_owner_id_value(value::ExecutionOwnerID) = value.value
+
+"""Replace the configured owner policy for one stable prepared owner ID."""
+struct ExecutionOwnerPolicyOverride{
+    P<:ExecutionOwnerOverloadPolicy,
+}
+    owner::ExecutionOwnerID
+    policy::P
+
+    function ExecutionOwnerPolicyOverride(
+        owner::ExecutionOwnerID,
+        policy::P,
+    ) where {P<:ExecutionOwnerOverloadPolicy}
+        _validate_execution_owner_overload_action(policy.action)
+        return new{P}(owner, policy)
+    end
+end
+
+@inline function _store_execution_owner_policy_override!(
+    destination::Memory{_ExecutionOwnerPolicyOverrideRecord},
+    index::Int,
+    override::ExecutionOwnerPolicyOverride,
+)
+    destination[index] = _ExecutionOwnerPolicyOverrideRecord(
+        execution_owner_id_value(override.owner),
+        override.policy,
+    )
+    return nothing
+end
+
+function _store_execution_owner_policy_override!(
+    ::Memory{_ExecutionOwnerPolicyOverrideRecord},
+    ::Int,
+    ::Any,
+)
+    return _execution_owner_error(
+        :invalid_owner_policy_override,
+        "execution-owner policy overrides must be ExecutionOwnerPolicyOverride values",
+    )
+end
+
+function _checked_execution_owner_policy_overrides(
+    values::Tuple,
+)
+    Base.@nospecialize values
+    overrides = Memory{_ExecutionOwnerPolicyOverrideRecord}(
+        undef, length(values))
+    @inbounds for index in eachindex(values)
+        _store_execution_owner_policy_override!(
+            overrides, index, values[index])
+    end
+    @inbounds for right in 2:length(overrides)
+        owner = overrides[right].owner
+        for left in 1:(right - 1)
+            overrides[left].owner == owner &&
+                _execution_owner_error(
+                    :duplicate_owner_policy,
+                    "an execution owner cannot have more than one overload-policy override",
+                )
+        end
+    end
+    return overrides
+end
+
+@inline function _resolve_execution_owner_policy(
+    default::ExecutionOwnerOverloadPolicy,
+    owner::ExecutionOwnerID,
+    overrides::Memory{_ExecutionOwnerPolicyOverrideRecord},
+)
+    owner_value = execution_owner_id_value(owner)
+    @inbounds for override in overrides
+        override.owner == owner_value && return override.policy
+    end
+    return default
+end
+
+@inline function _execution_owner_policy(
+    configuration::ExecutionOwnerConfiguration,
+    owner::ExecutionOwnerID,
+)
+    return _resolve_execution_owner_policy(
+        configuration.owner_policy,
+        owner,
+        configuration.owner_policy_overrides,
+    )
+end
+
+function _validate_prepared_owner_policy_overrides(
+    overrides::Memory{_ExecutionOwnerPolicyOverrideRecord},
+    owner_count::Int,
+)
+    @inbounds for override in overrides
+        Int(override.owner) <= owner_count ||
+            _execution_owner_error(
+                :unknown_owner_policy,
+                "an execution-owner policy override refers to an owner absent from the prepared topology",
+            )
+    end
+    return nothing
+end
 
 """Fixed core target owned by one HIL execution owner."""
 @enum ExecutionOwnerKind::UInt8 begin
@@ -376,6 +627,7 @@ struct PreparedExecutionOwner
     group_ordinals::Memory{UInt32}
     backend::AbstractArrayBackend
     compute_device::AbstractComputeDevice
+    overload_policy::ExecutionOwnerOverloadPolicy
     due::SPSCDescriptorRing{_ExecutionOwnerWorkDescriptor}
     completion::SPSCDescriptorRing{_ExecutionOwnerCompletion}
 end
@@ -385,6 +637,18 @@ execution_owner_kind(owner::PreparedExecutionOwner) = owner.kind
 execution_owner_backend(owner::PreparedExecutionOwner) = owner.backend
 execution_owner_compute_device(owner::PreparedExecutionOwner) =
     owner.compute_device
+execution_owner_overload_policy(owner::PreparedExecutionOwner) =
+    owner.overload_policy
+execution_owner_overload_action(owner::PreparedExecutionOwner) =
+    execution_owner_overload_action(owner.overload_policy)
+resource_criticality(owner::PreparedExecutionOwner) =
+    resource_criticality(owner.overload_policy)
+maximum_resource_lateness_ns(owner::PreparedExecutionOwner) =
+    maximum_resource_lateness_ns(owner.overload_policy)
+overload_recovery_occupancy(owner::PreparedExecutionOwner) =
+    overload_recovery_occupancy(owner.overload_policy)
+@inline resource_is_required(owner::PreparedExecutionOwner) =
+    resource_is_required(owner.overload_policy)
 execution_owner_group_count(owner::PreparedExecutionOwner) =
     length(owner.group_ordinals)
 
@@ -401,6 +665,28 @@ end
     _ExecutionOwnerWorking = 0x02
     _ExecutionOwnerStoppedActivity = 0x03
     _ExecutionOwnerFailedActivity = 0x04
+end
+
+"""Last bounded overload decision for one execution owner."""
+@enum ExecutionOwnerOverloadDecision::UInt8 begin
+    ExecutionOwnerNoOverloadDecision = 0x01
+    ExecutionOwnerFailedForCapacity = 0x02
+    ExecutionOwnerFailedForDeadline = 0x03
+end
+
+"""Coordinator-owned mutable overload evidence for one owner."""
+mutable struct _ExecutionOwnerOverloadState
+    overload_episodes::UInt64
+    recovery_count::UInt64
+    current_due_occupancy::Int
+    maximum_due_occupancy::Int
+    current_completion_occupancy::Int
+    maximum_completion_occupancy::Int
+    latest_lateness_ns::Int64
+    maximum_lateness_ns::Int64
+    overloaded::Bool
+    recovered_to_threshold::Bool
+    decision::ExecutionOwnerOverloadDecision
 end
 
 mutable struct _ExecutionOwnerState
@@ -464,6 +750,7 @@ struct PreparedExecutionOwnerExecutor{
     owners::Memory{PreparedExecutionOwner}
     group_owner_ordinals::Memory{UInt32}
     owner_states::Memory{_ExecutionOwnerState}
+    owner_overload_states::Memory{_ExecutionOwnerOverloadState}
     owner_workspaces::Memory{_ExecutionOwnerWorkspace}
     coordinator::_ExecutionCoordinatorState
     coordinator_workspace::_ExecutionCoordinatorWorkspace
@@ -473,6 +760,31 @@ struct PreparedExecutionOwnerExecutor{
     cpu_environment::CPUExecutionEnvironment
     ring_capacity::Int
 end
+
+"""
+Run-local execution-clock binding used only by the armed serial hot path.
+
+The prepared executor continues to own all mutable state and descriptor
+rings; this immutable wrapper supplies the exact run timing map for owner
+deadline observations.
+"""
+struct _ExecutionClockBoundOwnerExecutor{
+    E<:PreparedExecutionOwnerExecutor,
+    M<:ExecutionClockMapping,
+} <: AbstractOpticalPathBatchExecutor
+    executor::E
+    timing::M
+end
+
+@inline _bind_optical_execution_timing(
+    executor::PreparedExecutionOwnerExecutor,
+    timing::ExecutionClockMapping,
+) = _ExecutionClockBoundOwnerExecutor(executor, timing)
+
+@inline _bind_optical_execution_timing(
+    executor::AbstractOpticalPathBatchExecutor,
+    ::ExecutionClockMapping,
+) = executor
 
 execution_owner_count(executor::PreparedExecutionOwnerExecutor) =
     length(executor.owners)
@@ -543,6 +855,7 @@ function _prepared_owner(
         _copy_uint32_memory(group_ordinals),
         backend,
         compute_device,
+        _execution_owner_policy(configuration, id),
         SPSCDescriptorRing{_ExecutionOwnerWorkDescriptor}(
             configuration.ring_capacity),
         SPSCDescriptorRing{_ExecutionOwnerCompletion}(
@@ -618,6 +931,18 @@ function _prepare_execution_owner_topology(
         :unassigned_path_group,
         "every prepared path execution group must have one HIL owner",
     )
+    _validate_prepared_owner_policy_overrides(
+        configuration.owner_policy_overrides,
+        length(owners),
+    )
+    for owner in owners
+        policy = owner.overload_policy
+        policy.recovery_occupancy < configuration.ring_capacity ||
+            _execution_owner_error(
+                :invalid_recovery_occupancy,
+                "execution-owner recovery occupancy must be lower than each prepared descriptor-path capacity",
+            )
+    end
     return _copy_owner_memory(owners), group_owner_ordinals
 end
 
@@ -664,6 +989,26 @@ function _owner_states(count::Int)
             UInt(0),
             0,
             nothing,
+        )
+    end
+    return values
+end
+
+function _owner_overload_states(count::Int)
+    values = Memory{_ExecutionOwnerOverloadState}(undef, count)
+    @inbounds for index in eachindex(values)
+        values[index] = _ExecutionOwnerOverloadState(
+            UInt64(0),
+            UInt64(0),
+            0,
+            0,
+            0,
+            0,
+            Int64(0),
+            Int64(0),
+            false,
+            false,
+            ExecutionOwnerNoOverloadDecision,
         )
     end
     return values
@@ -751,6 +1096,7 @@ function _prepare_optical_execution(
         owners,
         group_owner_ordinals,
         _owner_states(owner_count),
+        _owner_overload_states(owner_count),
         _owner_workspaces(owner_count),
         _ExecutionCoordinatorState(
             ExecutionOwnersPrepared,
@@ -1301,6 +1647,7 @@ end
 """Cold, externally synchronized accounting for one execution owner."""
 struct ExecutionOwnerAccounting
     id::ExecutionOwnerID
+    overload_policy::ExecutionOwnerOverloadPolicy
     due::RingAccounting
     completion::RingAccounting
     work_submitted::UInt64
@@ -1312,6 +1659,17 @@ struct ExecutionOwnerAccounting
     task_id::UInt
     last_thread_id::Int
     failed::Bool
+    overload_episodes::UInt64
+    recovery_count::UInt64
+    current_due_occupancy::Int
+    maximum_due_occupancy::Int
+    current_completion_occupancy::Int
+    maximum_completion_occupancy::Int
+    latest_lateness_ns::Int64
+    maximum_lateness_ns::Int64
+    overloaded::Bool
+    recovered_to_threshold::Bool
+    overload_decision::ExecutionOwnerOverloadDecision
 end
 
 function execution_owner_accounting(
@@ -1322,11 +1680,15 @@ function execution_owner_accounting(
     index = Int(ordinal)
     owner = @inbounds executor.owners[index]
     state = @inbounds executor.owner_states[index]
+    overload = @inbounds executor.owner_overload_states[index]
     coordinator = executor.coordinator
+    due = ring_accounting(owner.due)
+    completion = ring_accounting(owner.completion)
     return ExecutionOwnerAccounting(
         owner.id,
-        ring_accounting(owner.due),
-        ring_accounting(owner.completion),
+        owner.overload_policy,
+        due,
+        completion,
         @inbounds(coordinator.submitted[index]),
         state.work_taken,
         state.work_completed,
@@ -1336,6 +1698,17 @@ function execution_owner_accounting(
         state.task_id,
         state.last_thread_id,
         state.activity == _ExecutionOwnerFailedActivity,
+        overload.overload_episodes,
+        overload.recovery_count,
+        due.occupancy,
+        overload.maximum_due_occupancy,
+        completion.occupancy,
+        overload.maximum_completion_occupancy,
+        overload.latest_lateness_ns,
+        overload.maximum_lateness_ns,
+        overload.overloaded,
+        overload.recovered_to_threshold,
+        overload.decision,
     )
 end
 
@@ -1461,6 +1834,112 @@ function _collect_due_execution_owners!(
     return owner_count
 end
 
+@inline function _record_owner_due_submission!(
+    overload::_ExecutionOwnerOverloadState,
+)
+    overload.current_due_occupancy += 1
+    overload.maximum_due_occupancy = max(
+        overload.maximum_due_occupancy,
+        overload.current_due_occupancy,
+    )
+    return nothing
+end
+
+@inline function _record_owner_completion_consumption!(
+    overload::_ExecutionOwnerOverloadState,
+    owner::PreparedExecutionOwner,
+)
+    overload.maximum_completion_occupancy = max(
+        overload.maximum_completion_occupancy,
+        overload.current_completion_occupancy + 1,
+    )
+    overload.current_due_occupancy =
+        ring_accounting(owner.due).occupancy
+    overload.current_completion_occupancy =
+        ring_accounting(owner.completion).occupancy
+    return nothing
+end
+
+@inline function _mark_execution_owner_overload!(
+    overload::_ExecutionOwnerOverloadState,
+    decision::ExecutionOwnerOverloadDecision,
+)
+    if !overload.overloaded
+        overload.overload_episodes += UInt64(1)
+    end
+    overload.overloaded = true
+    overload.recovered_to_threshold = false
+    overload.decision = decision
+    return nothing
+end
+
+@noinline function _fail_execution_owner_overload!(
+    ::FailRunOnOwnerOverload,
+    owner::PreparedExecutionOwner,
+    reason::Symbol,
+    message::AbstractString,
+)
+    _execution_owner_error(
+        reason,
+        "execution owner $(execution_owner_id_value(owner.id)) $message",
+    )
+end
+
+@inline function _record_execution_owner_lateness!(
+    overload::_ExecutionOwnerOverloadState,
+    lateness_ns::Int64,
+)
+    nonnegative = max(Int64(0), lateness_ns)
+    overload.latest_lateness_ns = nonnegative
+    overload.maximum_lateness_ns = max(
+        overload.maximum_lateness_ns, nonnegative)
+    return nonnegative
+end
+
+@inline function _observe_execution_owner_deadline!(
+    executor::PreparedExecutionOwnerExecutor,
+    owner_ordinal::Int,
+    timing::ExecutionClockMapping,
+    timestamp::PlantTimestamp,
+)
+    owner = @inbounds executor.owners[owner_ordinal]
+    maximum_lateness_ns = owner.overload_policy.maximum_lateness_ns
+    maximum_lateness_ns === nothing && return false
+    observed_execution_ns =
+        _read_execution_clock(execution_clock(timing))
+    overload =
+        @inbounds executor.owner_overload_states[owner_ordinal]
+    lateness_ns = _record_execution_owner_lateness!(
+        overload,
+        execution_lateness_ns(
+            timing, timestamp, observed_execution_ns),
+    )
+    lateness_ns <= maximum_lateness_ns && return false
+    _mark_execution_owner_overload!(
+        overload, ExecutionOwnerFailedForDeadline)
+    return true
+end
+
+@inline _observe_execution_owner_deadline!(
+    ::PreparedExecutionOwnerExecutor,
+    ::Int,
+    ::Nothing,
+    ::PlantTimestamp,
+) = false
+
+@noinline function _fail_execution_owner_deadline!(
+    executor::PreparedExecutionOwnerExecutor,
+    owner_ordinal::Int,
+)
+    owner = @inbounds executor.owners[owner_ordinal]
+    return _fail_execution_owner_overload!(
+        owner.overload_policy.action,
+        owner,
+        :owner_deadline_exceeded,
+        "exceeded its prepared execution-clock deadline",
+    )
+end
+
 function _submit_owner_phase!(
     executor::PreparedExecutionOwnerExecutor,
     claim::OpticalPathBatchClaim,
@@ -1480,11 +1959,27 @@ function _submit_owner_phase!(
             phase,
             claim,
         )
-        try_submit!(owner.due, descriptor) ==
-            RingTransferSucceeded || _execution_owner_error(
-                :due_work_publication,
-                "bounded due-work path rejected an owner descriptor",
+        status = try_submit!(owner.due, descriptor)
+        if status != RingTransferSucceeded
+            overload =
+                executor.owner_overload_states[owner_ordinal]
+            accounting = ring_accounting(owner.due)
+            overload.current_due_occupancy = accounting.occupancy
+            overload.maximum_due_occupancy = max(
+                overload.maximum_due_occupancy,
+                accounting.occupancy,
             )
+            _mark_execution_owner_overload!(
+                overload, ExecutionOwnerFailedForCapacity)
+            _fail_execution_owner_overload!(
+                owner.overload_policy.action,
+                owner,
+                :due_work_publication,
+                "could not publish into its bounded due-work path",
+            )
+        end
+        _record_owner_due_submission!(
+            executor.owner_overload_states[owner_ordinal])
         executor.coordinator.submitted[owner_ordinal] += UInt64(1)
     end
     return nothing
@@ -1541,6 +2036,8 @@ function _collect_owner_phase!(
     batch_sequence::UInt64,
     owner_count::Int,
     phase::_ExecutionOwnerWorkPhase,
+    timing,
+    timestamp::PlantTimestamp,
 )
     workspace = executor.coordinator_workspace
     fill!(workspace.completion_seen, false)
@@ -1549,6 +2046,7 @@ function _collect_owner_phase!(
     remaining = owner_count
     failure_seen = false
     first_failure = nothing
+    deadline_failure_owner = 0
     poll_count = zero(UInt32)
     while remaining > 0
         made_progress = false
@@ -1588,16 +2086,36 @@ function _collect_owner_phase!(
                 )
             workspace.completion_seen[owner_ordinal] = true
             executor.coordinator.completions[owner_ordinal] += UInt64(1)
+            _record_owner_completion_consumption!(
+                executor.owner_overload_states[owner_ordinal],
+                owner,
+            )
             remaining -= 1
             made_progress = true
-            if completion.status == _ExecutionOwnerWorkFailed &&
-                !failure_seen
-                first_failure =
-                    executor.owner_states[owner_ordinal].failure
-                failure_seen = true
+            if completion.status == _ExecutionOwnerWorkFailed
+                if !failure_seen
+                    first_failure =
+                        executor.owner_states[owner_ordinal].failure
+                    failure_seen = true
+                end
+            else
+                if _observe_execution_owner_deadline!(
+                    executor, owner_ordinal, timing, timestamp)
+                    iszero(deadline_failure_owner) &&
+                        (deadline_failure_owner = owner_ordinal)
+                end
             end
         end
         made_progress && (poll_count = zero(UInt32); continue)
+        @inbounds for due_index in 1:owner_count
+            owner_ordinal =
+                Int(workspace.due_owner_ordinals[due_index])
+            workspace.completion_seen[owner_ordinal] && continue
+            _observe_execution_owner_deadline!(
+                executor, owner_ordinal, timing, timestamp) &&
+                _fail_execution_owner_deadline!(
+                    executor, owner_ordinal)
+        end
         poll_count = _wait_for_owner_progress(
             executor.mode,
             poll_count,
@@ -1606,15 +2124,19 @@ function _collect_owner_phase!(
         )
     end
     failure_seen && throw(first_failure)
+    iszero(deadline_failure_owner) ||
+        _fail_execution_owner_deadline!(
+            executor, deadline_failure_owner)
     return nothing
 end
 
-function Plant.execute_optical_path_batch!(
+function _execute_owned_optical_path_batch!(
     executor::PreparedExecutionOwnerExecutor,
     prepared::PreparedPlantEventLoop,
     state::PlantEventLoopState,
     workspace::PlantEventLoopWorkspace,
     timestamp::PlantTimestamp,
+    timing,
 )
     _require_executor_binding(executor, prepared, state, workspace)
     claim = begin_optical_path_batch!(
@@ -1633,6 +2155,8 @@ function Plant.execute_optical_path_batch!(
         batch_sequence,
         owner_count,
         _ExecutionOwnerMaterialization,
+        timing,
+        timestamp,
     )
     seal_optical_path_batch_materialization!(
         prepared, state, workspace, claim)
@@ -1648,11 +2172,47 @@ function Plant.execute_optical_path_batch!(
         batch_sequence,
         owner_count,
         _ExecutionOwnerExecution,
+        timing,
+        timestamp,
     )
     completed = complete_optical_path_batch!(
         prepared, state, workspace, claim)
     executor.coordinator.batch_count += UInt64(1)
     return completed
+end
+
+function Plant.execute_optical_path_batch!(
+    executor::PreparedExecutionOwnerExecutor,
+    prepared::PreparedPlantEventLoop,
+    state::PlantEventLoopState,
+    workspace::PlantEventLoopWorkspace,
+    timestamp::PlantTimestamp,
+)
+    return _execute_owned_optical_path_batch!(
+        executor,
+        prepared,
+        state,
+        workspace,
+        timestamp,
+        nothing,
+    )
+end
+
+function Plant.execute_optical_path_batch!(
+    runtime::_ExecutionClockBoundOwnerExecutor,
+    prepared::PreparedPlantEventLoop,
+    state::PlantEventLoopState,
+    workspace::PlantEventLoopWorkspace,
+    timestamp::PlantTimestamp,
+)
+    return _execute_owned_optical_path_batch!(
+        runtime.executor,
+        prepared,
+        state,
+        workspace,
+        timestamp,
+        runtime.timing,
+    )
 end
 
 end

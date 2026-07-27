@@ -397,11 +397,17 @@ end
 
         advance!(clock, 7)
         @test execution_lateness_ns(mapping, target) == 7
+        @test @inferred(execution_lateness_ns(
+            mapping, target, Int64(1_257))) == 7
         @test execution_time_until_ns(mapping, target) == -7
         if TIMING_TESTS_WITH_COVERAGE
             @test_skip "allocation assertions are disabled under coverage"
         else
             @test timing_allocation_bytes(mapping, target) == (0, 0)
+            execution_lateness_ns(
+                mapping, target, Int64(1_257))
+            @test @allocated(execution_lateness_ns(
+                mapping, target, Int64(1_257))) == 0
         end
     end
 

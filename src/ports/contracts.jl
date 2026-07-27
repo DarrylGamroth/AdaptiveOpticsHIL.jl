@@ -25,6 +25,97 @@ struct DropNewestOnFull <: AbstractPortFullPolicy end
 """Treat `full` as a violated capacity proof rather than ordinary pressure."""
 struct ReservedFullIsInvariant <: AbstractPortFullPolicy end
 
+"""Prepared operational importance of one bounded runtime resource."""
+abstract type AbstractResourceCriticality end
+
+"""Capacity or deadline loss on this resource fails the run."""
+struct RequiredResource <: AbstractResourceCriticality end
+
+"""This resource may shed only when its prepared full policy permits loss."""
+struct OptionalResource <: AbstractResourceCriticality end
+
+@inline _checked_maximum_resource_lateness(::Nothing) = nothing
+
+@inline function _checked_maximum_resource_lateness(
+    value::Integer)
+    0 <= value <= typemax(Int64) ||
+        throw(PortError(
+            :acquisition_overload_policy,
+            :invalid_maximum_lateness,
+            "maximum acquisition lateness must be a nonnegative Int64-compatible nanosecond count"))
+    return Int64(value)
+end
+
+@inline _checked_maximum_resource_lateness(::Bool) =
+    throw(PortError(
+        :acquisition_overload_policy,
+        :invalid_maximum_lateness,
+        "maximum acquisition lateness must be an integer nanosecond count, not Bool"))
+
+@inline function _checked_overload_recovery_occupancy(
+    value::Integer)
+    0 <= value <= typemax(Int) ||
+        throw(PortError(
+            :acquisition_overload_policy,
+            :invalid_recovery_occupancy,
+            "overload recovery occupancy must be a nonnegative addressable count"))
+    return Int(value)
+end
+
+@inline _checked_overload_recovery_occupancy(::Bool) =
+    throw(PortError(
+        :acquisition_overload_policy,
+        :invalid_recovery_occupancy,
+        "overload recovery occupancy must be an integer count, not Bool"))
+
+"""
+Immutable overload contract for one acquisition completion path.
+
+`maximum_lateness_ns === nothing` declares that no execution-clock publication
+deadline applies. The recovery occupancy is validated against the prepared
+port and product capacities.
+"""
+struct AcquisitionOverloadPolicy{
+    C<:AbstractResourceCriticality,
+    F<:AbstractPortFullPolicy,
+}
+    criticality::C
+    full_policy::F
+    maximum_lateness_ns::Union{Nothing,Int64}
+    recovery_occupancy::Int
+
+    function AcquisitionOverloadPolicy(
+        criticality::C,
+        full_policy::F;
+        maximum_lateness_ns::Union{Nothing,Integer},
+        recovery_occupancy::Integer) where {
+        C<:AbstractResourceCriticality,
+        F<:AbstractPortFullPolicy,
+    }
+        return new{C,F}(
+            criticality,
+            full_policy,
+            _checked_maximum_resource_lateness(
+                maximum_lateness_ns),
+            _checked_overload_recovery_occupancy(
+                recovery_occupancy))
+    end
+end
+
+resource_criticality(policy::AcquisitionOverloadPolicy) =
+    policy.criticality
+resource_full_policy(policy::AcquisitionOverloadPolicy) =
+    policy.full_policy
+maximum_resource_lateness_ns(policy::AcquisitionOverloadPolicy) =
+    policy.maximum_lateness_ns
+overload_recovery_occupancy(policy::AcquisitionOverloadPolicy) =
+    policy.recovery_occupancy
+
+@inline resource_is_required(::RequiredResource) = true
+@inline resource_is_required(::OptionalResource) = false
+@inline resource_is_required(policy::AcquisitionOverloadPolicy) =
+    resource_is_required(resource_criticality(policy))
+
 # Public constructor tests cover both dispatch leaves, but coverage
 # instrumentation cannot retain counters for these compile-time-inlined traits.
 @inline _resource_capacity_is_bool(::Bool) = true # COV_EXCL_LINE

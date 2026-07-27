@@ -8,7 +8,7 @@ using AdaptiveOpticsHIL.Lifecycle: failure_event_component
 using AdaptiveOpticsHIL.Lifecycle: failure_event_execution_ns
 using AdaptiveOpticsHIL.Lifecycle: failure_event_reason
 using AdaptiveOpticsHIL.Timing: ExecutionClockID
-using AdaptiveOpticsSim.Plant: PlantTimestamp
+using AdaptiveOpticsSim.Plant: CommandEndpointID, PlantTimestamp
 using Clocks
 
 const HIL_LIFECYCLE = AdaptiveOpticsHIL.Lifecycle
@@ -16,6 +16,8 @@ const LIFECYCLE_TEST_CLOCK =
     ExecutionClockID(:lifecycle_test_clock)
 const LIFECYCLE_OTHER_CLOCK =
     ExecutionClockID(:lifecycle_other_clock)
+const LIFECYCLE_TESTS_WITH_COVERAGE =
+    Base.JLOptions().code_coverage != 0
 
 function captured_lifecycle_error(f)
     try
@@ -33,6 +35,15 @@ function lifecycle_state(
         RunSessionID(session_value);
         arm_timeout_ns)
     return parameters, RunLifecycleState(parameters)
+end
+
+@inline function liveness_reset_allocations!(
+    state,
+    endpoint,
+    clock,
+    observed_execution_ns)
+    return @allocated HIL_LIFECYCLE._admit_rtc_ingress_liveness!(
+        state, endpoint, clock, observed_execution_ns)
 end
 
 @testset "Operational run lifecycle" begin
@@ -685,5 +696,148 @@ end
         end
         @test duplicate_failure isa RunLifecycleError
         @test duplicate_failure.reason == :invalid_phase
+    end
+
+    @testset "RTC-ingress-liveness inclusive deadline" begin
+        endpoint = CommandEndpointID(:lifecycle_dm)
+        policy = RTCIngressLivenessPolicy(
+            endpoint,
+            LIFECYCLE_TEST_CLOCK;
+            timeout_ns=10)
+        @test rtc_ingress_liveness_endpoint(policy) == endpoint
+        @test rtc_ingress_liveness_clock(policy) ==
+            LIFECYCLE_TEST_CLOCK
+        @test rtc_ingress_liveness_timeout_ns(policy) == 10
+        @test_throws RunLifecycleError RTCIngressLivenessPolicy(
+            endpoint,
+            LIFECYCLE_TEST_CLOCK;
+            timeout_ns=false)
+        @test_throws RunLifecycleError RTCIngressLivenessPolicy(
+            endpoint,
+            LIFECYCLE_TEST_CLOCK;
+            timeout_ns=0)
+        @test_throws RunLifecycleError RTCIngressLivenessPolicy(
+            endpoint,
+            LIFECYCLE_TEST_CLOCK;
+            timeout_ns=big(typemax(Int64)) + 1)
+
+        clock = CachedNanoClock(100)
+        state = HIL_LIFECYCLE.RTCIngressLivenessState(policy)
+        @test rtc_ingress_liveness_status(state) ==
+            RTCIngressLivenessDisarmed
+        @test HIL_LIFECYCLE._start_rtc_ingress_liveness!(
+            state,
+            LIFECYCLE_TEST_CLOCK,
+            Clocks.time_nanos(clock)) == RTCIngressLivenessActive
+        @test rtc_ingress_liveness_origin_ns(state) == 100
+        @test rtc_ingress_liveness_deadline_ns(state) == 110
+
+        Clocks.advance!(clock, 10)
+        @test @inferred(
+            HIL_LIFECYCLE._observe_rtc_ingress_liveness!(
+                state,
+                LIFECYCLE_TEST_CLOCK,
+                Clocks.time_nanos(clock))) ==
+            RTCIngressLivenessActive
+        @test HIL_LIFECYCLE._admit_rtc_ingress_liveness!(
+            state,
+            endpoint,
+            LIFECYCLE_TEST_CLOCK,
+            Clocks.time_nanos(clock)) == RTCIngressLivenessActive
+        @test rtc_ingress_liveness_origin_ns(state) == 110
+        @test rtc_ingress_liveness_deadline_ns(state) == 120
+        @test rtc_ingress_liveness_reset_count(state) == 1
+        @test rtc_ingress_liveness_last_admission_ns(state) == 110
+
+        Clocks.advance!(clock, 10)
+        @test HIL_LIFECYCLE._observe_rtc_ingress_liveness!(
+            state,
+            LIFECYCLE_TEST_CLOCK,
+            Clocks.time_nanos(clock)) == RTCIngressLivenessActive
+        Clocks.advance!(clock, 1)
+        @test HIL_LIFECYCLE._observe_rtc_ingress_liveness!(
+            state,
+            LIFECYCLE_TEST_CLOCK,
+            Clocks.time_nanos(clock)) == RTCIngressLivenessExpired
+        @test rtc_ingress_liveness_observation_ns(state) == 121
+        @test rtc_ingress_liveness_expiry_count(state) == 1
+        Clocks.advance!(clock, 1)
+        @test HIL_LIFECYCLE._observe_rtc_ingress_liveness!(
+            state,
+            LIFECYCLE_TEST_CLOCK,
+            Clocks.time_nanos(clock)) == RTCIngressLivenessExpired
+        @test rtc_ingress_liveness_observation_ns(state) == 121
+        @test rtc_ingress_liveness_expiry_count(state) == 1
+
+        accounting = rtc_ingress_liveness_accounting(state)
+        @test accounting.status == RTCIngressLivenessExpired
+        @test accounting.endpoint == endpoint
+        @test accounting.execution_clock == LIFECYCLE_TEST_CLOCK
+        @test accounting.timeout_ns == 10
+        @test accounting.origin_execution_ns == 110
+        @test accounting.deadline_execution_ns == 120
+
+        late = HIL_LIFECYCLE.RTCIngressLivenessState(policy)
+        HIL_LIFECYCLE._start_rtc_ingress_liveness!(
+            late, LIFECYCLE_TEST_CLOCK, Int64(0))
+        @test HIL_LIFECYCLE._admit_rtc_ingress_liveness!(
+            late, endpoint, LIFECYCLE_TEST_CLOCK, Int64(11)) ==
+            RTCIngressLivenessExpired
+        @test rtc_ingress_liveness_reset_count(late) == 0
+        @test rtc_ingress_liveness_last_admission_ns(late) == 11
+
+        mismatch = HIL_LIFECYCLE.RTCIngressLivenessState(policy)
+        @test_throws RunLifecycleError begin
+            HIL_LIFECYCLE._start_rtc_ingress_liveness!(
+                mismatch, LIFECYCLE_OTHER_CLOCK, Int64(0))
+        end
+        HIL_LIFECYCLE._start_rtc_ingress_liveness!(
+            mismatch, LIFECYCLE_TEST_CLOCK, Int64(0))
+        @test_throws RunLifecycleError begin
+            HIL_LIFECYCLE._admit_rtc_ingress_liveness!(
+                mismatch,
+                CommandEndpointID(:other_dm),
+                LIFECYCLE_TEST_CLOCK,
+                Int64(1))
+        end
+
+        wrapping = HIL_LIFECYCLE.RTCIngressLivenessState(policy)
+        wrapping_origin = typemax(Int64) - Int64(5)
+        HIL_LIFECYCLE._start_rtc_ingress_liveness!(
+            wrapping, LIFECYCLE_TEST_CLOCK, wrapping_origin)
+        exact_wrapped = reinterpret(
+            Int64,
+            reinterpret(UInt64, wrapping_origin) + UInt64(10))
+        @test HIL_LIFECYCLE._observe_rtc_ingress_liveness!(
+            wrapping, LIFECYCLE_TEST_CLOCK, exact_wrapped) ==
+            RTCIngressLivenessActive
+
+        allocation_state =
+            HIL_LIFECYCLE.RTCIngressLivenessState(policy)
+        HIL_LIFECYCLE._start_rtc_ingress_liveness!(
+            allocation_state, LIFECYCLE_TEST_CLOCK, Int64(0))
+        HIL_LIFECYCLE._admit_rtc_ingress_liveness!(
+            allocation_state,
+            endpoint,
+            LIFECYCLE_TEST_CLOCK,
+            Int64(1))
+        if LIFECYCLE_TESTS_WITH_COVERAGE
+            @test_skip "allocation assertions are disabled under coverage"
+        else
+            @test liveness_reset_allocations!(
+                allocation_state,
+                endpoint,
+                LIFECYCLE_TEST_CLOCK,
+                Int64(2)) == 0
+        end
+
+        disabled = HIL_LIFECYCLE.RTCIngressLivenessState(
+            HIL_LIFECYCLE.NoRTCIngressLiveness())
+        @test HIL_LIFECYCLE._start_rtc_ingress_liveness!(
+            disabled,
+            LIFECYCLE_TEST_CLOCK,
+            Int64(0)) == RTCIngressLivenessDisabled
+        @test rtc_ingress_liveness_accounting(disabled).endpoint ===
+            nothing
     end
 end

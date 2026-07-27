@@ -431,6 +431,11 @@ function prepare_gate4a_fixture(
     delivery = AdapterDeliveryContract(
         PlantDuration(config.complete_product_lead_time_ns),
         PlantDuration(config.maximum_lease_hold_time_ns))
+    required_acquisition_policy = AcquisitionOverloadPolicy(
+        RequiredResource(),
+        RetainProducerOnFull();
+        maximum_lateness_ns=nothing,
+        recovery_occupancy=0)
     wfs_port = prepare_acquisition_completion_port(
         AcquisitionID(:hil_wfs),
         _product_buffers(
@@ -440,7 +445,8 @@ function prepare_gate4a_fixture(
         session,
         product_pool_id=UInt64(0x7c20),
         ring_capacity=config.primary_product_capacity,
-        delivery_contract=delivery)
+        delivery_contract=delivery,
+        overload_policy=required_acquisition_policy)
     feedback_port = prepare_acquisition_completion_port(
         AcquisitionID(:hil_dm_feedback),
         _product_buffers(
@@ -450,7 +456,8 @@ function prepare_gate4a_fixture(
         session,
         product_pool_id=UInt64(0x7c21),
         ring_capacity=config.feedback_product_capacity,
-        delivery_contract=delivery)
+        delivery_contract=delivery,
+        overload_policy=required_acquisition_policy)
     configuration = configure_serial_run(
         bridge,
         (wfs_port, feedback_port);

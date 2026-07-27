@@ -139,6 +139,9 @@ function take_command_outcome(port::CommandCompletionPort{P}) where {P}
     return output[]
 end
 
+command_processing_status(result::CommandProcessingResult) =
+    port_status(command_processing_port_result(result))
+
 function finish_ready_command!(
     bridge,
     state,
@@ -193,7 +196,7 @@ function inline_command_cycle!(
         command_completion_port(ports), outcome_ref[])
     return (
         submit_result.status,
-        process_result.status,
+        command_processing_status(process_result),
         disposition_count,
         take_result.status,
         payload_value,
@@ -239,7 +242,7 @@ function leased_command_cycle!(
     return (
         claim_status,
         submit_result.status,
-        process_result.status,
+        command_processing_status(process_result),
         disposition_count,
         take_result.status,
         release_result.status)
@@ -456,11 +459,17 @@ end
         @test maximum_outstanding(submission_policy) == 4
         @test resource_full_policy(submission_policy) isa
               RetainProducerOnFull
+        @test resource_criticality(submission_port) isa
+            RequiredResource
+        @test resource_is_required(submission_port)
         completion_policy = port_resource_policy(completion_port)
         @test resource_capacity(completion_policy) == 8
         @test maximum_outstanding(completion_policy) == 8
         @test resource_full_policy(completion_policy) isa
               ReservedFullIsInvariant
+        @test resource_criticality(completion_port) isa
+            RequiredResource
+        @test resource_is_required(completion_port)
         payload_policy = payload_resource_policy(submission_port)
         @test resource_capacity(payload_policy.payload) == 8
         @test resource_capacity(payload_policy.outcome_credit) == 8
@@ -501,9 +510,15 @@ end
             submission_port, submission, Int64(1_000)).status ==
             PortTransferSucceeded
         @test outcome_credit_accounting(submission_port).queued == 1
-        @test process_next_command!(
-            bridge, state, bridge_workspace, Int64(1_100)).status ==
+        processing = process_next_command!(
+            bridge, state, bridge_workspace, Int64(1_100))
+        @test command_processing_status(processing) ==
             PortTransferSucceeded
+        @test command_processing_stage(processing) ==
+            CommandSemanticallyAdmitted
+        @test command_processing_endpoint(processing) ==
+            PORT_TEST_PLANT.CommandEndpointID(:hil_dm)
+        @test command_processing_presentation(processing) !== nothing
         descriptor = bridge_workspace.descriptor_scratch[]
         @test submission_session(descriptor) == submission_session(submission)
         @test submission_stream_sequence(descriptor) ==
@@ -662,10 +677,13 @@ end
             @test try_submit!(
                 submission_port, submission, Int64(timestamp_ns)).status ==
                 PortTransferSucceeded
-            @test process_next_command!(
+            processing = process_next_command!(
                 bridge, state, bridge_workspace,
-                Int64(timestamp_ns)).status ==
+                Int64(timestamp_ns))
+            @test command_processing_status(processing) ==
                 PortTransferSucceeded
+            @test command_processing_stage(processing) ==
+                CommandBoundaryRejected
             outcome = take_command_outcome(completion_port)
             @test outcome_stage(outcome) == BoundaryCommandOutcome
             @test outcome.boundary_reason == expected_reason
@@ -796,8 +814,12 @@ end
             accepted_sequence,
             PORT_TEST_PLANT.PlantTimestamp(timestamp_ns))
         try_submit!(submission_port, duplicate, Int64(timestamp_ns))
-        process_next_command!(
+        duplicate_processing = process_next_command!(
             bridge, state, bridge_workspace, Int64(timestamp_ns))
+        @test command_processing_stage(duplicate_processing) ==
+            CommandTerminatedDuringAdmission
+        @test command_processing_presentation(
+            duplicate_processing) !== nothing
         duplicate_outcome = take_command_outcome(completion_port)
         @test outcome_stage(duplicate_outcome) == CoreCommandOutcome
         @test outcome_reason(duplicate_outcome) == :duplicate_sequence
@@ -852,9 +874,10 @@ end
             @test try_submit!(
                 submission_port, submission, Int64(receive_ns)).status ==
                 PortTransferSucceeded
-            @test process_next_command!(
+            processing = process_next_command!(
                 bridge, state, bridge_workspace,
-                Int64(receive_ns)).status ==
+                Int64(receive_ns))
+            @test command_processing_status(processing) ==
                 PortTransferSucceeded
         end
 
@@ -1156,9 +1179,11 @@ end
             receive_time_command_timing(second_time),
             InlineCommandPayload(0.2))
         try_submit!(submission_port, second, Int64(2))
-        @test process_next_command!(
+        processing = process_next_command!(
             bridge, state, bridge_workspace,
-            Int64(2)).status == PortTransferSucceeded
+            Int64(2))
+        @test command_processing_status(processing) ==
+            PortTransferSucceeded
         first_outcome = take_command_outcome(completion_port)
         @test outcome_command_sequence(first_outcome) ==
             PORT_TEST_PLANT.PlantCommandSequence(1)
@@ -1500,14 +1525,19 @@ end
             rejected_after_close,
             Int64(3)).status == PortClosed
 
-        @test process_next_command!(
-            bridge, state, workspace, Int64(10)).status ==
+        first_processing = process_next_command!(
+            bridge, state, workspace, Int64(10))
+        @test command_processing_status(first_processing) ==
               PortTransferSucceeded
-        @test process_next_command!(
-            bridge, state, workspace, Int64(11)).status ==
+        second_processing = process_next_command!(
+            bridge, state, workspace, Int64(11))
+        @test command_processing_status(second_processing) ==
               PortTransferSucceeded
-        @test process_next_command!(
-            bridge, state, workspace, Int64(12)).status == PortClosed
+        closed_processing = process_next_command!(
+            bridge, state, workspace, Int64(12))
+        @test command_processing_status(closed_processing) == PortClosed
+        @test command_processing_stage(closed_processing) ==
+            CommandNotProcessed
         @test port_lifecycle_state(submission_port) == PortDrained
 
         @test close_command_completion!(ports).status ==
@@ -1646,16 +1676,50 @@ end
     delivery = AdapterDeliveryContract(
         PORT_TEST_PLANT.PlantDuration(50),
         PORT_TEST_PLANT.PlantDuration(10_000))
+    required_overload = AcquisitionOverloadPolicy(
+        RequiredResource(),
+        RetainProducerOnFull();
+        maximum_lateness_ns=nothing,
+        recovery_occupancy=0)
+    @test_throws PortError AcquisitionOverloadPolicy(
+        RequiredResource(),
+        RetainProducerOnFull();
+        maximum_lateness_ns=false,
+        recovery_occupancy=0)
+    @test_throws PortError AcquisitionOverloadPolicy(
+        RequiredResource(),
+        RetainProducerOnFull();
+        maximum_lateness_ns=-1,
+        recovery_occupancy=0)
+    @test_throws PortError AcquisitionOverloadPolicy(
+        RequiredResource(),
+        RetainProducerOnFull();
+        maximum_lateness_ns=nothing,
+        recovery_occupancy=false)
+    @test_throws PortError AcquisitionOverloadPolicy(
+        RequiredResource(),
+        RetainProducerOnFull();
+        maximum_lateness_ns=nothing,
+        recovery_occupancy=-1)
     port = prepare_acquisition_completion_port(
         PORT_TEST_PLANT.AcquisitionID(:wfs_pixels),
         products;
         session,
         product_pool_id=UInt64(140),
         ring_capacity=1,
-        delivery_contract=delivery)
+        delivery_contract=delivery,
+        overload_policy=required_overload)
     @test acquisition_delivery_contract(port) == delivery
     @test acquisition_product_contract(port) isa
         PORT_TEST_PLANT.AcquisitionProductContract
+    @test acquisition_overload_policy(port) === required_overload
+    @test resource_is_required(required_overload)
+    @test resource_criticality(required_overload) isa RequiredResource
+    @test maximum_resource_lateness_ns(required_overload) === nothing
+    @test overload_recovery_occupancy(required_overload) == 0
+    @test resource_is_required(port)
+    @test maximum_resource_lateness_ns(port) === nothing
+    @test overload_recovery_occupancy(port) == 0
     @test descriptor_accounting(port).capacity == 1
     @test descriptor_accounting(port).occupancy == 0
     @test port_lifecycle_state(port) == PortAccepting
@@ -1821,7 +1885,14 @@ end
             product_pool_id=UInt64(145),
             ring_capacity=1,
             delivery_contract=delivery,
-            full_policy=DropNewestOnFull())
+            overload_policy=AcquisitionOverloadPolicy(
+                OptionalResource(),
+                DropNewestOnFull();
+                maximum_lateness_ns=10,
+                recovery_occupancy=0))
+        @test !resource_is_required(
+            acquisition_overload_policy(drop_port))
+        @test resource_criticality(drop_port) isa OptionalResource
         @test resource_full_policy(
             port_resource_policy(drop_port)) isa DropNewestOnFull
         @test resource_full_policy(
@@ -1932,7 +2003,8 @@ end
             invariant_products;
             session=RunSessionID(83),
             product_pool_id=UInt64(148),
-            delivery_contract=delivery)
+            delivery_contract=delivery,
+            overload_policy=required_overload)
         invariant_lease = Ref{PayloadLeaseRef}()
         @test try_claim_product!(invariant_lease, invariant_port) ==
               PayloadTransitionSucceeded
@@ -2020,7 +2092,8 @@ end
             wrapped_aliases;
             session,
             product_pool_id=UInt64(144),
-            delivery_contract=delivery)
+            delivery_contract=delivery,
+            overload_policy=required_overload)
     end
 
     bad_products = [
@@ -2035,7 +2108,8 @@ end
             bad_products;
             session,
             product_pool_id=UInt64(141),
-            delivery_contract=delivery)
+            delivery_contract=delivery,
+            overload_policy=required_overload)
     end
     abstract_products = PORT_TEST_PLANT.AcquisitionProducts[
         PORT_TEST_PLANT.AcquisitionProducts(
@@ -2046,7 +2120,8 @@ end
         abstract_products;
         session,
         product_pool_id=UInt64(142),
-        delivery_contract=delivery)
+        delivery_contract=delivery,
+        overload_policy=required_overload)
     shared_observation = zeros(Float32, 2, 2)
     aliased_products = [
         PORT_TEST_PLANT.AcquisitionProducts(
@@ -2059,28 +2134,59 @@ end
         aliased_products;
         session,
         product_pool_id=UInt64(143),
-        delivery_contract=delivery)
+        delivery_contract=delivery,
+        overload_policy=required_overload)
     @test_throws OwnershipError prepare_acquisition_completion_port(
         PORT_TEST_PLANT.AcquisitionID(:undersized_returns),
         products;
         session,
         product_pool_id=UInt64(146),
         product_return_capacity=1,
-        delivery_contract=delivery)
+        delivery_contract=delivery,
+        overload_policy=required_overload)
     @test_throws PortError prepare_acquisition_completion_port(
         PORT_TEST_PLANT.AcquisitionID(:invalid_full_policy),
         products;
         session,
         product_pool_id=UInt64(147),
         delivery_contract=delivery,
-        full_policy=ReservedFullIsInvariant())
+        overload_policy=AcquisitionOverloadPolicy(
+            OptionalResource(),
+            ReservedFullIsInvariant();
+            maximum_lateness_ns=nothing,
+            recovery_occupancy=0))
+    @test_throws PortError prepare_acquisition_completion_port(
+        PORT_TEST_PLANT.AcquisitionID(:required_drop),
+        products;
+        session,
+        product_pool_id=UInt64(150),
+        ring_capacity=1,
+        delivery_contract=delivery,
+        overload_policy=AcquisitionOverloadPolicy(
+            RequiredResource(),
+            DropNewestOnFull();
+            maximum_lateness_ns=nothing,
+            recovery_occupancy=0))
+    @test_throws PortError prepare_acquisition_completion_port(
+        PORT_TEST_PLANT.AcquisitionID(:invalid_recovery_threshold),
+        products;
+        session,
+        product_pool_id=UInt64(151),
+        ring_capacity=1,
+        delivery_contract=delivery,
+        overload_policy=AcquisitionOverloadPolicy(
+            OptionalResource(),
+            DropNewestOnFull();
+            maximum_lateness_ns=nothing,
+            recovery_occupancy=1))
     oversized_ring_port = prepare_acquisition_completion_port(
         PORT_TEST_PLANT.AcquisitionID(:oversized_ring),
         products;
         session,
         product_pool_id=UInt64(149),
         ring_capacity=4,
-        delivery_contract=delivery)
+        delivery_contract=delivery,
+        overload_policy=required_overload)
     oversized_ring_policy =
         port_resource_policy(oversized_ring_port)
     @test resource_capacity(oversized_ring_policy) == 4

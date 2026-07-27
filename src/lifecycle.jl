@@ -8,7 +8,7 @@ poll, or choose an RTC transport.
 """
 module Lifecycle
 
-using AdaptiveOpticsSim.Plant: PlantTimestamp
+using AdaptiveOpticsSim.Plant: CommandEndpointID, PlantTimestamp
 
 import ..AdaptiveOpticsHIL: AdaptiveOpticsHILError
 using ..Timing: ExecutionClockID
@@ -35,6 +35,19 @@ export RuntimeRunFailure
 export RunTermination, run_termination_kind
 export run_termination_execution_ns, run_termination_plant_timestamp
 export run_termination_component, run_termination_reason
+export RTCIngressLivenessPolicy
+export RTCIngressLivenessStatus, RTCIngressLivenessDisabled
+export RTCIngressLivenessDisarmed, RTCIngressLivenessActive
+export RTCIngressLivenessExpired
+export rtc_ingress_liveness_endpoint, rtc_ingress_liveness_clock
+export rtc_ingress_liveness_timeout_ns
+export rtc_ingress_liveness_status, rtc_ingress_liveness_origin_ns
+export rtc_ingress_liveness_deadline_ns
+export rtc_ingress_liveness_observation_ns
+export rtc_ingress_liveness_last_admission_ns
+export rtc_ingress_liveness_reset_count
+export rtc_ingress_liveness_expiry_count
+export RTCIngressLivenessAccounting, rtc_ingress_liveness_accounting
 
 """Invalid run identity, readiness, phase transition, or terminal event."""
 struct RunLifecycleError <: AdaptiveOpticsHILError
@@ -600,6 +613,8 @@ end
     return elapsed_ns
 end
 
+include("lifecycle/ingress_liveness.jl")
+
 function _begin_arm!(
     state::RunLifecycleState,
     parameters::RunLifecycleParameters,
@@ -863,5 +878,7 @@ public run_transition_is_valid
 public RunFailureEvent
 public failure_event_execution_ns, failure_event_component
 public failure_event_reason
+public AbstractRTCIngressLivenessPolicy, NoRTCIngressLiveness
+public RTCIngressLivenessState
 
 end

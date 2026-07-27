@@ -103,6 +103,15 @@ plant. Preparation validates a declared core `CPUExecutionBudget` against an
 observed `CPUExecutionEnvironment` without changing Julia, FFT, or BLAS thread
 settings.
 
+Every `ExecutionOwnerConfiguration` also requires one immutable
+`ExecutionOwnerOverloadPolicy`. A base policy classifies all owners as
+required or optional and binds a concrete overload action, optional
+execution-clock lateness limit, and recovery occupancy; stable
+`ExecutionOwnerID` overrides may replace it for selected owners. The current
+owner action is `FailRunOnOwnerOverload()` for both criticalities. Optional
+work is never revoked after dispatch or mislabeled as shed without a core skip
+disposition and an ownership-safe retained-product contract.
+
 The HIL coordinator remains the sole plant-timeline and atmosphere writer. For
 each due timestamp it performs the core
 begin → materialize → seal → execute → complete contract, so independently
@@ -130,6 +139,17 @@ in-process boundaries:
   `AdaptiveOpticsSim.Plant.AcquisitionProducts` values through an exact
   prepared product contract. Sampled controllable-optic/device feedback uses
   this same acquisition contract rather than command outcomes.
+
+Command submission and its reserved terminal-outcome path are required
+resources: pre-transfer `full` retains producer ownership, while every
+transferred command must receive one outcome. Each acquisition port instead
+requires an `AcquisitionOverloadPolicy` that declares required/optional
+criticality, concrete full behavior, optional publication-lateness limit, and
+recovery occupancy. Required acquisition loss fails the run. An optional
+`DropNewestOnFull()` path may shed only the newly completed product, preserving
+its assigned stream-sequence gap and reclaiming only producer-owned storage.
+Raw frames are not implicitly coalesced and no runtime overload path changes
+the prepared provider or fidelity.
 
 Command timing records either canonical plant receive time or an already
 mapped, versioned external timestamp. Mapping estimation remains the
@@ -165,12 +185,26 @@ clock reading records an arm-timeout failure. Arm and active-run interval
 checks use the same bounded modular arithmetic as execution-clock pacing,
 including `Int64` representation wrap.
 
+An optional `RTCIngressLivenessPolicy` binds the run's command endpoint, exact
+execution-clock identity, and an inclusive timeout shorter than `2^63`
+nanoseconds. Its origin is the transition to running. Only successful semantic
+core admission resets it; enqueue, mapping, malformed/duplicate/rejected
+traffic, application, and transport-health messages do not. The first
+observation later than the deadline fails the operational run, terminally
+accounts pending admitted commands, and leaves the held effective command and
+physical optic unchanged. This is deliberately separate from replayable
+plant-time command-silence behavior.
+
 The serial path exposes the complete breaking lifecycle directly:
 
 ```julia
 configuration = configure_serial_run(
     command_bridge, acquisition_ports;
-    arm_timeout_ns=1_000_000_000)
+    arm_timeout_ns=1_000_000_000,
+    ingress_liveness=RTCIngressLivenessPolicy(
+        command_endpoint,
+        execution_clock_identity(clock);
+        timeout_ns=100_000_000))
 run = prepare_serial_run(configuration)
 attempt = begin_serial_arm!(run, clock)
 readiness = AdapterReadinessSnapshot(
@@ -225,6 +259,15 @@ materialization and execution barriers while the coordinator and already-armed
 tasks poll only their bounded owner rings according to the selected idle
 policy. A caller may advance a `CachedNanoClock` exactly in deterministic tests
 or apply its own pacing policy around a `SystemNanoClock` in production.
+
+Acquisition publication observes descriptor and product-pool occupancy
+separately, records exact execution-clock lateness and overload episodes, and
+continues publishing independent required streams when an optional
+drop-newest stream is full. A selected owner deadline is checked against the
+same armed execution-clock mapping. Deadline/capacity policy failure records
+bounded owner evidence and fails the run; coordinated acknowledgement,
+completion drain, and ownership-deficit finalization remain the next Gate 8
+delivery and are not represented as clean recovery here.
 
 Sampled actuator/device feedback is simply another independently scheduled
 acquisition-completion stream. It does not share command cadence and never

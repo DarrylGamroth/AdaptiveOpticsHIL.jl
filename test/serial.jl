@@ -100,6 +100,12 @@ end
 function serial_test_execution_owner_configuration(
     mode::AbstractExecutionOwnerMode;
     outer_owner_count::Integer=1,
+    owner_policy=ExecutionOwnerOverloadPolicy(
+        RequiredResource(),
+        FailRunOnOwnerOverload();
+        maximum_lateness_ns=nothing,
+        recovery_occupancy=0),
+    owner_policy_overrides=(),
 )
     julia_threads = Threads.nthreads()
     blas_threads = BLAS.get_num_threads()
@@ -123,7 +129,13 @@ function serial_test_execution_owner_configuration(
         fft_thread_count=fft_threads,
         blas_thread_count=blas_threads,
     )
-    return ExecutionOwnerConfiguration(mode, budget, environment)
+    return ExecutionOwnerConfiguration(
+        mode,
+        budget,
+        environment;
+        owner_policy,
+        owner_policy_overrides,
+    )
 end
 
 mutable struct MutableIdentityNanoClock <: Clocks.AbstractNanoClock
@@ -425,6 +437,18 @@ function serial_test_fixture(;
     session=RunSessionID(0x7c00),
     arm_timeout_ns=10_000_000,
     optical_execution=SerialOpticalExecution(),
+    wfs_overload_policy=AcquisitionOverloadPolicy(
+        RequiredResource(),
+        RetainProducerOnFull();
+        maximum_lateness_ns=nothing,
+        recovery_occupancy=0),
+    feedback_overload_policy=AcquisitionOverloadPolicy(
+        RequiredResource(),
+        RetainProducerOnFull();
+        maximum_lateness_ns=nothing,
+        recovery_occupancy=0),
+    ingress_liveness=nothing,
+    reverse_acquisition_ports=false,
     arm=true,
     start=true)
     core = serial_test_plant()
@@ -448,7 +472,8 @@ function serial_test_fixture(;
         session,
         product_pool_id=UInt64(0x7c20),
         ring_capacity=product_ring_capacity,
-        delivery_contract=delivery)
+        delivery_contract=delivery,
+        overload_policy=wfs_overload_policy)
     feedback_port = prepare_acquisition_completion_port(
         AcquisitionID(:hil_dm_feedback),
         serial_product_buffers(
@@ -456,11 +481,16 @@ function serial_test_fixture(;
         session,
         product_pool_id=UInt64(0x7c21),
         ring_capacity=product_ring_capacity,
-        delivery_contract=delivery)
+        delivery_contract=delivery,
+        overload_policy=feedback_overload_policy)
+    acquisition_ports = reverse_acquisition_ports ?
+        (feedback_port, wfs_port) :
+        (wfs_port, feedback_port)
     configuration = configure_serial_run(
         bridge,
-        (wfs_port, feedback_port);
+        acquisition_ports;
         optical_execution,
+        ingress_liveness,
         arm_timeout_ns)
     run = prepare_serial_run(configuration)
     clock = CachedNanoClock(0)
@@ -725,24 +755,30 @@ end
     return @allocated step_serial_run!(fixture.running)
 end
 
-function queue_serial_test_command!(fixture)
+function queue_serial_test_command!(
+    fixture;
+    stream_sequence=1,
+    command_sequence=1,
+    receive_ns=1,
+    effective_ns=2_000_000,
+    advance_ns=1)
     submission_port = command_submission_port(fixture.command_ports)
     lease_ref = Ref(PayloadLeaseRef(0, 0, 0, 0))
     @assert try_claim_command_payload!(lease_ref, submission_port) ==
         PayloadTransitionSucceeded
     fill!(
         producer_command_payload(submission_port, lease_ref[]), 0.0)
-    receive = PlantTimestamp(1)
+    receive = PlantTimestamp(receive_ns)
     timing = receive_time_command_timing(
         receive;
-        requested_effective_timestamp=PlantTimestamp(2_000_000))
+        requested_effective_timestamp=PlantTimestamp(effective_ns))
     submission = matching_command_submission(
         submission_port,
-        StreamSequence(1),
-        PlantCommandSequence(1),
+        StreamSequence(stream_sequence),
+        PlantCommandSequence(command_sequence),
         timing,
         LeasedCommandPayload(lease_ref[]))
-    Clocks.advance!(fixture.clock, 1)
+    Clocks.advance!(fixture.clock, advance_ns)
     @assert port_status(try_submit!(
         submission_port, submission, Clocks.time_nanos(fixture.clock))) ==
         PortTransferSucceeded
@@ -751,6 +787,29 @@ end
 
 @inline function serial_command_step_allocations(fixture)
     return @allocated step_serial_run!(fixture.running)
+end
+
+@inline function serial_optional_shed_allocations!(
+    policy,
+    publication)
+    return @allocated AdaptiveOpticsHIL.Serial.
+        _handle_serial_capacity_overload!(policy, publication)
+end
+
+function take_serial_acquisition_sequences!(port, sequences)
+    output = Ref{AcquisitionCompletion}()
+    while true
+        result = try_take!(output, port)
+        port_status(result) == PortEmpty && return sequences
+        @assert port_status(result) == PortTransferSucceeded
+        completion = output[]
+        push!(
+            sequences,
+            stream_sequence_value(
+                acquisition_completion_sequence(completion)))
+        @assert port_status(release_product!(port, completion)) ==
+            PortTransferSucceeded
+    end
 end
 
 serial_test_mean(values) = sum(values) / length(values)
@@ -787,7 +846,9 @@ end
     @test isconst(
         AdaptiveOpticsHIL.Serial.SerialRunState, :bridge)
     @test isconst(
-        AdaptiveOpticsHIL.Serial.SerialRunState, :published_sequences)
+        AdaptiveOpticsHIL.Serial.SerialRunState, :publications)
+    @test isconst(
+        AdaptiveOpticsHIL.Serial.SerialRunState, :ingress_liveness)
     @test isconst(
         AdaptiveOpticsHIL.Serial.SerialRunState, :lifecycle)
     @test Base.ispublic(AdaptiveOpticsHIL.Ports,
@@ -982,6 +1043,264 @@ end
         @test run_phase(origin_fixture.run) == RunPrepared
     end
 
+    @testset "RTC-ingress-liveness serial integration" begin
+        endpoint = CommandEndpointID(:hil_dm)
+        policy = RTCIngressLivenessPolicy(
+            endpoint,
+            ExecutionClockID(:execution_clock);
+            timeout_ns=10)
+        fixture = serial_test_fixture(; ingress_liveness=policy)
+        @test serial_rtc_ingress_liveness_policy(
+            fixture.configuration) === policy
+        initial_liveness =
+            serial_rtc_ingress_liveness_accounting(fixture.run)
+        @test initial_liveness.status == RTCIngressLivenessActive
+        @test initial_liveness.origin_execution_ns == 0
+        @test initial_liveness.endpoint == endpoint
+
+        @test serial_step_status(
+            step_serial_run!(fixture.running)) ==
+            SerialPlantEventProcessed
+        queue_serial_test_command!(fixture)
+        enqueued_liveness =
+            serial_rtc_ingress_liveness_accounting(fixture.run)
+        @test enqueued_liveness.reset_count == 0
+        @test enqueued_liveness.origin_execution_ns == 0
+        admitted = step_serial_run!(fixture.running)
+        @test serial_step_status(admitted) ==
+            SerialCommandProcessed
+        admitted_liveness =
+            serial_rtc_ingress_liveness_accounting(fixture.run)
+        @test admitted_liveness.reset_count == 1
+        @test admitted_liveness.origin_execution_ns == 1
+        @test SERIAL_TEST_PLANT.effective_command(
+            fixture.event_loop,
+            plant_event_loop_state(fixture.run.state.bridge),
+            endpoint) == zeros(Float64, 2)
+
+        queue_serial_test_command!(
+            fixture;
+            stream_sequence=2,
+            command_sequence=1,
+            receive_ns=2,
+            advance_ns=1)
+        terminated = step_serial_run!(fixture.running)
+        @test serial_step_status(terminated) ==
+            SerialCommandProcessed
+        @test serial_rtc_ingress_liveness_accounting(
+            fixture.run).reset_count == 1
+
+        outcome_ref =
+            Ref{CommandOutcome{LeasedCommandPayload}}()
+        @test port_status(try_take!(
+            outcome_ref,
+            command_completion_port(fixture.command_ports))) ==
+            PortTransferSucceeded
+        @test outcome_stage(outcome_ref[]) == CoreCommandOutcome
+        @test outcome_reason(outcome_ref[]) == :duplicate_sequence
+        @test port_status(release_outcome!(
+            command_completion_port(fixture.command_ports),
+            outcome_ref[])) == PortTransferSucceeded
+
+        queue_serial_test_command!(
+            fixture;
+            stream_sequence=2,
+            command_sequence=2,
+            receive_ns=3,
+            advance_ns=1)
+        rejected = step_serial_run!(fixture.running)
+        @test serial_step_status(rejected) ==
+            SerialCommandProcessed
+        @test serial_rtc_ingress_liveness_accounting(
+            fixture.run).reset_count == 1
+        @test port_status(try_take!(
+            outcome_ref,
+            command_completion_port(fixture.command_ports))) ==
+            PortTransferSucceeded
+        @test outcome_stage(outcome_ref[]) ==
+            BoundaryCommandOutcome
+        @test outcome_boundary_reason(outcome_ref[]) ==
+            CommandStreamSequenceNotIncreasing
+        @test port_status(release_outcome!(
+            command_completion_port(fixture.command_ports),
+            outcome_ref[])) == PortTransferSucceeded
+        reclaim_serial_returns!(fixture.run)
+
+        Clocks.advance!(fixture.clock, 8)
+        exact = step_serial_run!(fixture.running)
+        @test serial_step_status(exact) ==
+            SerialDeadlinePending
+        @test serial_rtc_ingress_liveness_accounting(
+            fixture.run).status == RTCIngressLivenessActive
+
+        Clocks.advance!(fixture.clock, 1)
+        expiry = captured_serial_error() do
+            step_serial_run!(fixture.running)
+        end
+        @test expiry isa SerialRunError
+        @test expiry.component == :rtc_ingress_liveness
+        @test expiry.reason == :deadline_expired
+        @test run_phase(fixture.run) == RunFailed
+        termination = run_termination(fixture.run)
+        @test run_termination_component(termination) ==
+            :rtc_ingress_liveness
+        @test run_termination_reason(termination) ==
+            :deadline_expired
+        expired_liveness =
+            serial_rtc_ingress_liveness_accounting(fixture.run)
+        @test expired_liveness.status ==
+            RTCIngressLivenessExpired
+        @test expired_liveness.observation_execution_ns == 12
+        @test expired_liveness.deadline_execution_ns == 11
+        @test expired_liveness.expiry_count == 1
+        @test active_command_correlations(
+            fixture.run.state.bridge) == 0
+        @test SERIAL_TEST_PLANT.effective_command(
+            fixture.event_loop,
+            plant_event_loop_state(fixture.run.state.bridge),
+            endpoint) == zeros(Float64, 2)
+
+        @test port_status(try_take!(
+            outcome_ref,
+            command_completion_port(fixture.command_ports))) ==
+            PortTransferSucceeded
+        @test outcome_terminal_kind(outcome_ref[]) ==
+            SERIAL_TEST_PLANT.FailedCommand
+        @test outcome_reason(outcome_ref[]) ==
+            :hil_ingress_liveness_expired
+        @test port_status(release_outcome!(
+            command_completion_port(fixture.command_ports),
+            outcome_ref[])) == PortTransferSucceeded
+    end
+
+    @testset "Prepared acquisition overload decisions" begin
+        optional_policy = AcquisitionOverloadPolicy(
+            OptionalResource(),
+            DropNewestOnFull();
+            maximum_lateness_ns=10_000_000,
+            recovery_occupancy=0)
+        fixture = serial_test_fixture(
+            product_capacity=2,
+            product_ring_capacity=1,
+            feedback_overload_policy=optional_policy,
+            reverse_acquisition_ports=true)
+        feedback_source = first(fixture.run.publishers).source
+        @test acquisition_overload_policy(
+            fixture.feedback_port) === optional_policy
+        wfs_sequences = UInt64[]
+        for _ in 1:256
+            result = step_serial_run!(fixture.running)
+            serial_step_status(result) == SerialDeadlinePending &&
+                Clocks.advance!(
+                    fixture.clock,
+                    serial_step_time_until_ns(result))
+            take_serial_acquisition_sequences!(
+                fixture.wfs_port, wfs_sequences)
+            reclaim_serial_returns!(fixture.run)
+            feedback = serial_acquisition_overload_accounting(
+                fixture.run, AcquisitionID(:hil_dm_feedback))
+            feedback.products_shed >= 1 && break
+        end
+        overloaded = serial_acquisition_overload_accounting(
+            fixture.run, AcquisitionID(:hil_dm_feedback))
+        @test overloaded.products_shed == 1
+        @test overloaded.products_failed == 0
+        @test overloaded.last_sequence == 2
+        @test overloaded.decision ==
+            AcquisitionShedForCapacity
+        @test overloaded.overloaded
+        @test overloaded.maximum_descriptor_occupancy >= 1
+        @test overloaded.maximum_product_occupancy >= 1
+
+        feedback_sequences = UInt64[]
+        take_serial_acquisition_sequences!(
+            fixture.feedback_port, feedback_sequences)
+        @test feedback_sequences == UInt64[1]
+        reclaim_serial_returns!(fixture.run)
+        for _ in 1:256
+            result = step_serial_run!(fixture.running)
+            serial_step_status(result) == SerialDeadlinePending &&
+                Clocks.advance!(
+                    fixture.clock,
+                    serial_step_time_until_ns(result))
+            take_serial_acquisition_sequences!(
+                fixture.wfs_port, wfs_sequences)
+            reclaim_serial_returns!(fixture.run)
+            feedback = serial_acquisition_overload_accounting(
+                fixture.run, AcquisitionID(:hil_dm_feedback))
+            feedback.last_sequence >= 3 &&
+                ring_accounting(
+                    fixture.feedback_port.ring).occupancy > 0 &&
+                break
+        end
+        take_serial_acquisition_sequences!(
+            fixture.feedback_port, feedback_sequences)
+        @test feedback_sequences == UInt64[1, 3]
+        recovered = serial_acquisition_overload_accounting(
+            fixture.run, AcquisitionID(:hil_dm_feedback))
+        @test recovered.recovery_count == 1
+        @test recovered.recovered_to_threshold
+        @test !recovered.overloaded
+        @test recovered.products_published == 2
+        @test acquisition_overload_policy(
+            fixture.feedback_port) === optional_policy
+        @test first(fixture.run.publishers).source ===
+            feedback_source
+        @test ring_accounting(
+            fixture.feedback_port.ring).capacity == 1
+        @test acquisition_product_accounting(
+            fixture.feedback_port).capacity == 2
+        @test wfs_sequences ==
+            UInt64.(1:length(wfs_sequences))
+        required_wfs = serial_acquisition_overload_accounting(
+            fixture.run, AcquisitionID(:hil_wfs))
+        @test required_wfs.products_shed == 0
+        @test required_wfs.products_failed == 0
+
+        if SERIAL_TESTS_WITH_COVERAGE
+            @test_skip "allocation assertions are disabled under coverage"
+        else
+            allocation_state =
+                AdaptiveOpticsHIL.Serial.AcquisitionPublicationState()
+            AdaptiveOpticsHIL.Serial.
+                _handle_serial_capacity_overload!(
+                    optional_policy, allocation_state)
+            @test serial_optional_shed_allocations!(
+                optional_policy, allocation_state) == 0
+        end
+
+        deadline_policy = AcquisitionOverloadPolicy(
+            RequiredResource(),
+            RetainProducerOnFull();
+            maximum_lateness_ns=0,
+            recovery_occupancy=0)
+        deadline = serial_test_fixture(
+            wfs_overload_policy=deadline_policy)
+        deadline_error = nothing
+        for _ in 1:256
+            result = try
+                step_serial_run!(deadline.running)
+            catch error
+                deadline_error = error
+                break
+            end
+            serial_step_status(result) == SerialDeadlinePending &&
+                Clocks.advance!(
+                    deadline.clock,
+                    serial_step_time_until_ns(result) + 1)
+        end
+        @test deadline_error isa SerialRunError
+        @test deadline_error.reason ==
+            :acquisition_publication_deadline
+        @test run_phase(deadline.run) == RunFailed
+        deadline_accounting =
+            serial_acquisition_overload_accounting(
+                deadline.run, AcquisitionID(:hil_wfs))
+        @test deadline_accounting.products_failed == 1
+        @test deadline_accounting.decision ==
+            AcquisitionFailedForDeadline
+    end
+
     @testset "Prepared execution-owner policy" begin
         @test Base.isexported(AdaptiveOpticsHIL, :Execution)
         @test !Base.isexported(
@@ -1022,6 +1341,17 @@ end
             AdaptiveOpticsSim.HostComputeDevice()
         @test execution_owner_group_count(owner) == 1
         @test execution_owner_group_ordinal(owner, 1) == 1
+        @test execution_owner_overload_policy(owner) ===
+            owner_configuration.owner_policy
+        @test resource_criticality(
+            execution_owner_overload_policy(owner)) isa
+            RequiredResource
+        @test execution_owner_overload_action(owner) isa
+            FailRunOnOwnerOverload
+        @test maximum_resource_lateness_ns(
+            execution_owner_overload_policy(owner)) === nothing
+        @test overload_recovery_occupancy(
+            execution_owner_overload_policy(owner)) == 0
         @test_throws BoundsError execution_owner(executor, 0)
         @test_throws BoundsError execution_owner_group_ordinal(owner, 2)
 
@@ -1074,6 +1404,41 @@ end
             first(stopped_run_accounting.execution_owners)
         @test stopped_run_owner.stop_acknowledged
         @test stopped_run_owner.due.closed
+
+        optional_deadline_policy = ExecutionOwnerOverloadPolicy(
+            OptionalResource(),
+            FailRunOnOwnerOverload();
+            maximum_lateness_ns=0,
+            recovery_occupancy=0,
+        )
+        deadline_configuration =
+            serial_test_execution_owner_configuration(
+                DeterministicExecutionOwners();
+                owner_policy=optional_deadline_policy,
+            )
+        owner_deadline = serial_test_fixture(
+            session=RunSessionID(0x7c2f),
+            optical_execution=deadline_configuration,
+        )
+        Clocks.advance!(owner_deadline.clock, 1)
+        owner_deadline_error = captured_serial_error() do
+            step_serial_run!(owner_deadline.running)
+        end
+        @test owner_deadline_error isa ExecutionOwnerError
+        @test owner_deadline_error.reason ==
+            :owner_deadline_exceeded
+        @test run_phase(owner_deadline.run) == RunFailed
+        @test execution_owners_phase(
+            serial_optical_execution(owner_deadline.run)) ==
+            ExecutionOwnersFailed
+        owner_deadline_accounting = execution_owner_accounting(
+            serial_optical_execution(owner_deadline.run), 1)
+        @test owner_deadline_accounting.overload_policy ===
+            optional_deadline_policy
+        @test owner_deadline_accounting.overload_episodes == 1
+        @test owner_deadline_accounting.maximum_lateness_ns == 1
+        @test owner_deadline_accounting.overload_decision ==
+            ExecutionOwnerFailedForDeadline
 
         invalid_execution = captured_serial_error() do
             serial_test_fixture(
@@ -1242,7 +1607,12 @@ end
                     fixture.plant, :hil_dm_feedback, 1);
                 session=other_session,
                 product_pool_id=UInt64(0x7c30),
-                delivery_contract=delivery)
+                delivery_contract=delivery,
+                overload_policy=AcquisitionOverloadPolicy(
+                    RequiredResource(),
+                    RetainProducerOnFull();
+                    maximum_lateness_ns=nothing,
+                    recovery_occupancy=0))
         session_error = captured_serial_error() do
             configure_serial_run(
                 fixture.bridge,
@@ -1297,6 +1667,40 @@ end
         end
         @test invalid_port isa SerialRunError
         @test invalid_port.reason == :invalid_acquisition_port
+
+        liveness_endpoint_error = captured_serial_error() do
+            serial_test_fixture(
+                ingress_liveness=RTCIngressLivenessPolicy(
+                    CommandEndpointID(:other_dm),
+                    ExecutionClockID(:execution_clock);
+                    timeout_ns=10),
+                arm=false,
+                start=false)
+        end
+        @test liveness_endpoint_error isa SerialRunError
+        @test liveness_endpoint_error.reason == :endpoint_mismatch
+        invalid_liveness = captured_serial_error() do
+            serial_test_fixture(
+                ingress_liveness=:not_a_watchdog,
+                arm=false,
+                start=false)
+        end
+        @test invalid_liveness isa SerialRunError
+        @test invalid_liveness.reason == :invalid_policy
+
+        wrong_liveness_clock = serial_test_fixture(
+            ingress_liveness=RTCIngressLivenessPolicy(
+                CommandEndpointID(:hil_dm),
+                ExecutionClockID(:other_execution_clock);
+                timeout_ns=10),
+            start=false)
+        liveness_clock_error = captured_serial_error() do
+            start_serial_run!(wrong_liveness_clock.armed)
+        end
+        @test liveness_clock_error isa RunLifecycleError
+        @test liveness_clock_error.reason ==
+            :clock_identity_mismatch
+        @test run_phase(wrong_liveness_clock.run) == RunFailed
 
         start_error = captured_serial_error() do
             start_serial_run!(fixture.armed)
@@ -1445,7 +1849,7 @@ end
         full_error = drive_until_serial_failure!(full)
         @test full_error isa SerialRunError
         @test full_error.reason ==
-            :acquisition_completion_full
+            :acquisition_product_capacity
         @test run_phase(full.run) == RunFailed
 
         closed = serial_test_fixture()

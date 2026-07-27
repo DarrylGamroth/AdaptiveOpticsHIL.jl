@@ -182,6 +182,19 @@ end
 command_submission_port(ports::PreparedCommandPorts) = ports.submission
 command_completion_port(ports::PreparedCommandPorts) = ports.completion
 
+"""
+Command ingress and its reserved completion path are required resources.
+
+Before transfer, `full` preserves producer ownership; after transfer, every
+command owns terminal-outcome credit and cannot be shed.
+"""
+resource_criticality(
+    ::Union{CommandSubmissionPort,CommandCompletionPort},
+) = RequiredResource()
+@inline resource_is_required(
+    ::Union{CommandSubmissionPort,CommandCompletionPort},
+) = true
+
 @inline _command_payload_capacity(::Nothing) = typemax(Int) # COV_EXCL_LINE
 @inline _command_payload_capacity(pool::PayloadPool) =
     payload_pool_capacity(pool)
@@ -1244,6 +1257,51 @@ function _try_insert_failed_admission_correlation!(
     return false
 end
 
+"""Semantic stage reached by one bounded command-bridge operation."""
+@enum CommandProcessingStage::UInt8 begin
+    CommandNotProcessed = 0x01
+    CommandBoundaryRejected = 0x02
+    CommandTerminatedDuringAdmission = 0x03
+    CommandSemanticallyAdmitted = 0x04
+end
+
+"""
+Explicit result of one command-bridge operation.
+
+The port result reports descriptor transfer. `stage` distinguishes boundary
+rejection and admission-time termination from the two semantic-admission
+statuses that may reset RTC-ingress liveness.
+"""
+struct CommandProcessingResult
+    port_result::PortResult
+    stage::CommandProcessingStage
+    endpoint::CommandEndpointID
+    presentation::Union{Nothing,CommandPresentationID}
+end
+
+command_processing_port_result(result::CommandProcessingResult) =
+    result.port_result
+command_processing_stage(result::CommandProcessingResult) =
+    result.stage
+command_processing_endpoint(result::CommandProcessingResult) =
+    result.endpoint
+command_processing_presentation(result::CommandProcessingResult) =
+    result.presentation
+
+@inline function _command_processing_stage(
+    admission::PlantCommandAdmission)
+    status = command_admission_status(admission)
+    status == CommandTerminatedOnAdmission &&
+        return CommandTerminatedDuringAdmission
+    status == CommandAdmittedPending ||
+        status == CommandAdmittedReady ||
+        throw(PortError(
+            :command_bridge,
+            :invalid_admission_status,
+            "core returned an unknown command-admission status"))
+    return CommandSemanticallyAdmitted
+end
+
 """
 Consume at most one submitted command. Boundary incompatibility produces a
 terminal boundary outcome. A compatible command is mapped to `PlantCommand`
@@ -1261,7 +1319,11 @@ function process_next_command!(
     end
     result = try_take!(
         workspace.descriptor_scratch, bridge.submission)
-    result.status == PortTransferSucceeded || return result
+    result.status == PortTransferSucceeded || return CommandProcessingResult(
+        result,
+        CommandNotProcessed,
+        bridge.submission.endpoint,
+        nothing)
     descriptor = workspace.descriptor_scratch[]
 
     boundary_reason =
@@ -1273,7 +1335,11 @@ function process_next_command!(
             boundary_reason,
             publication_execution_ns)
         _publish_command_outcome!(bridge.completion, outcome)
-        return PortResult(PortTransferSucceeded)
+        return CommandProcessingResult(
+            PortResult(PortTransferSucceeded),
+            CommandBoundaryRejected,
+            bridge.submission.endpoint,
+            nothing)
     end
 
     submission = descriptor.submission
@@ -1318,5 +1384,36 @@ function process_next_command!(
         state, command_presentation_id(admission), descriptor)
     publish_command_dispositions!(
         bridge, state, workspace, publication_execution_ns)
-    return PortResult(PortTransferSucceeded)
+    return CommandProcessingResult(
+        PortResult(PortTransferSucceeded),
+        _command_processing_stage(admission),
+        bridge.submission.endpoint,
+        command_presentation_id(admission))
+end
+
+"""
+Boundedly terminal-fail every pending command already admitted through one
+event-loop bridge and publish its correlated HIL outcome. Effective command
+and physical optic state are not changed.
+"""
+function fail_pending_bridge_commands!(
+    bridge::PreparedCommandBridge{
+        <:Any,<:Any,<:Any,<:_PlantEventLoopCommandBridgeRoute},
+    state::CommandBridgeState,
+    workspace::CommandBridgeWorkspace,
+    publication_execution_ns::Int64;
+    reason=CommandDispositionReason(:hil_ingress_liveness_expired))
+    if command_disposition_count(workspace.disposition_workspace) != 0
+        publish_command_dispositions!(
+            bridge, state, workspace, publication_execution_ns)
+    end
+    count = fail_pending_plant_commands!(
+        bridge.route.event_loop,
+        state.target_state,
+        workspace.disposition_workspace,
+        bridge.submission.endpoint;
+        reason)
+    publish_command_dispositions!(
+        bridge, state, workspace, publication_execution_ns)
+    return count
 end
