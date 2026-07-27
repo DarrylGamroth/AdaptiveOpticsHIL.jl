@@ -5,6 +5,83 @@ struct PortError <: AdaptiveOpticsHILError
     msg::String
 end
 
+"""
+Dispatch policy for an exhausted bounded resource.
+
+The policy is prepared, concrete, and resource-specific. It never introduces
+an implicit retry queue.
+"""
+abstract type AbstractPortFullPolicy end
+
+"""Return `full` without transferring or reclaiming producer ownership."""
+struct RetainProducerOnFull <: AbstractPortFullPolicy end
+
+"""
+Drop the newest acquisition on `full`, reclaiming its producer lease when one
+has already been claimed.
+"""
+struct DropNewestOnFull <: AbstractPortFullPolicy end
+
+"""Treat `full` as a violated capacity proof rather than ordinary pressure."""
+struct ReservedFullIsInvariant <: AbstractPortFullPolicy end
+
+@inline _resource_capacity_is_bool(::Bool) = true
+@inline _resource_capacity_is_bool(::Integer) = false
+
+"""Prepared capacity and full-policy proof for one bounded port resource."""
+struct PortResourcePolicy{F<:AbstractPortFullPolicy}
+    capacity::Int
+    maximum_outstanding::Int
+    full_policy::F
+
+    function PortResourcePolicy(
+        capacity::Integer,
+        maximum_outstanding::Integer,
+        full_policy::F) where {F<:AbstractPortFullPolicy}
+        (
+            _resource_capacity_is_bool(capacity) ||
+            _resource_capacity_is_bool(maximum_outstanding)
+        ) &&
+            throw(PortError(
+                :port_resource_policy,
+                :invalid_capacity,
+                "bounded resource capacities must be integer counts, not Bool"))
+        capacity > 0 || throw(PortError(
+            :port_resource_policy,
+            :invalid_capacity,
+            "bounded resource capacity must be positive"))
+        capacity <= typemax(Int) || throw(PortError(
+            :port_resource_policy,
+            :capacity_exceeds_address_space,
+            "bounded resource capacity exceeds the addressable range"))
+        0 <= maximum_outstanding <= capacity || throw(PortError(
+            :port_resource_policy,
+            :invalid_outstanding_bound,
+            "maximum outstanding ownership must fit the bounded resource"))
+        return new{F}(
+            Int(capacity),
+            Int(maximum_outstanding),
+            full_policy)
+    end
+end
+
+resource_capacity(policy::PortResourcePolicy) = policy.capacity
+maximum_outstanding(policy::PortResourcePolicy) =
+    policy.maximum_outstanding
+resource_full_policy(policy::PortResourcePolicy) = policy.full_policy
+
+"""
+Cold lifecycle derived from a port's close flag and descriptor occupancy.
+
+`PortDraining` and `PortDrained` are both closed to new producer transfer;
+already published descriptors remain consumable in the draining state.
+"""
+@enum PortLifecycleState::UInt8 begin
+    PortAccepting = 0x01
+    PortDraining = 0x02
+    PortDrained = 0x03
+end
+
 struct _PositiveCounterToken end
 const _POSITIVE_COUNTER_TOKEN = _PositiveCounterToken()
 
@@ -181,6 +258,7 @@ end
     AcquisitionMismatch = 0x09
     CoreAdmissionUnavailable = 0x0a
     CommandEndpointMismatch = 0x0b
+    LeaseReturnUnavailable = 0x0c
 end
 
 """

@@ -54,7 +54,10 @@ foundation for command and acquisition ports:
   `UInt64` publication-sequence wrap without division in descriptor transfer
 - a fixed payload pool with immutable pool, session, slot, and generation
   references
-- explicit producer-owned, queued, consumer-leased, and free transitions
+- explicit producer-owned, queued, consumer-leased, return-queued, and free
+  transitions
+- one reserved SPSC return descriptor for every legally consumer-held lease;
+  release publishes ownership back and the single pool owner reclaims storage
 
 The warmed transfer operations do not block, yield, retry, invoke callbacks, or
 allocate. Caller code owns its idle/backoff policy. Mutable frame and command
@@ -64,6 +67,15 @@ Pool identities are caller-declared and must be unique within one run/session;
 ports reject the most immediate payload/credit collision during preparation.
 Prepared port pools also require one concrete storage type and reject aliased
 command buffers or acquisition-product storage.
+
+Ports and payload claims expose typed full policies and cold
+accepting/draining/drained lifecycle state. Command ingress closes before
+terminal-outcome drain; completion and lease-return paths remain consumable
+until their owners close and drain them. A pool must close new claims before
+its return path can close. A valid first release cannot see ordinary full
+backpressure because return capacity covers the pool's complete legal lease
+set. Return-path full is an invariant result that preserves consumer ownership
+and remains visible in bounded deficit accounting.
 
 These are intentionally low-level foundations, not RTC transport APIs.
 

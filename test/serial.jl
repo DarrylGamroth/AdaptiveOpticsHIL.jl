@@ -574,6 +574,7 @@ function run_fake_rtc(;
             break
         end
     end
+    reclaim_serial_returns!(fixture.run)
     accounting = stop_serial_run!(
         fixture.armed, fixture.state, fixture.workspace)
     return (; fixture, trace, accounting)
@@ -1005,6 +1006,7 @@ end
         @test port_status(release_product!(
             busy.wfs_port, completion_ref[])) ==
             PortTransferSucceeded
+        @test reclaim_serial_returns!(busy.run) == 1
         @test serial_run_is_quiescent(
             stop_serial_run!(
                 busy.armed, busy.state, busy.workspace))

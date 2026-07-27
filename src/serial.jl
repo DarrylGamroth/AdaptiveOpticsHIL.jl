@@ -41,6 +41,8 @@ using ..Ports: outcome_credit_accounting, plant_event_loop_state
 using ..Ports: plant_event_loop_workspace
 using ..Ports: port_status, process_next_command!
 using ..Ports: producer_product, publish_command_dispositions!
+using ..Ports: reclaim_command_payload_returns!
+using ..Ports: reclaim_outcome_credit_returns!, reclaim_product_returns!
 using ..Ports: try_claim_product!, try_publish!
 using ..Timing: ExecutionClockMapping, arm_execution_clock
 using ..Timing: execution_clock, execution_time_until_ns
@@ -56,7 +58,8 @@ export SerialStepResult, serial_step_status, serial_step_timestamp
 export serial_step_time_until_ns, step_serial_run!
 export serial_run_lifecycle, serial_products_published
 export SerialRunAccounting, AcquisitionPortAccounting
-export serial_run_accounting, serial_run_is_quiescent
+export reclaim_serial_returns!, serial_run_accounting
+export serial_run_is_quiescent
 
 """Invalid serial-run preparation, lifecycle, pacing, or accounting."""
 struct SerialRunError <: AdaptiveOpticsHILError
@@ -334,6 +337,36 @@ function serial_run_is_quiescent(accounting::SerialRunAccounting)
         iszero(accounting.command_dispositions) &&
         iszero(accounting.active_command_correlations) &&
         _acquisitions_are_quiescent(accounting.acquisitions)
+end
+
+@inline _reclaim_serial_command_payload_returns!(
+    ::CommandSubmissionPort{<:InlineCommandPayload}) = 0
+
+@inline function _reclaim_serial_command_payload_returns!(
+    port::CommandSubmissionPort{LeasedCommandPayload})
+    return reclaim_command_payload_returns!(port).count
+end
+
+@inline _reclaim_serial_acquisition_returns!(::Tuple{}) = 0
+
+@inline function _reclaim_serial_acquisition_returns!(publishers::Tuple)
+    return reclaim_product_returns!(first(publishers).port).count +
+        _reclaim_serial_acquisition_returns!(Base.tail(publishers))
+end
+
+"""
+    reclaim_serial_returns!(run)
+
+Boundedly reclaim every already released command payload, outcome credit, and
+acquisition product in a deterministic single-owner serial run. Callers must
+not invoke this while another logical owner is operating a corresponding pool.
+The returned count is the exact number of slots reclaimed by this call.
+"""
+function reclaim_serial_returns!(run::PreparedSerialRun)
+    submission = command_submission_port(run.command_bridge)
+    return _reclaim_serial_command_payload_returns!(submission) +
+        reclaim_outcome_credit_returns!(submission).count +
+        _reclaim_serial_acquisition_returns!(run.publishers)
 end
 
 """

@@ -123,6 +123,15 @@ function run_two_owner_stress(
             end
         end
         valid &= close_ring!(ring) == RingTransferSucceeded
+        while valid
+            reclaim_payload_returns!(pool)
+            payload_pool_accounting(pool).free == capacity && break
+            yield()
+        end
+        valid &= close_payload_pool!(pool) ==
+                 PayloadPoolCloseSucceeded
+        valid &= close_payload_returns!(pool) ==
+                 RingTransferSucceeded
         return valid, full_observed
     end
 
