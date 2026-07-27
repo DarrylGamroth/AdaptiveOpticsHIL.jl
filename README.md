@@ -151,6 +151,14 @@ its assigned stream-sequence gap and reclaiming only producer-owned storage.
 Raw frames are not implicitly coalesced and no runtime overload path changes
 the prepared provider or fidelity.
 
+The core future-effective command calendar is also bounded. When it cannot
+admit another pending command, the HIL boundary publishes one correlated core
+`RejectedCommand` outcome with reason `:calendar_capacity`; it never backdates
+or silently discards the command. The initial single-host Gate 8 profile
+selects no command-observation or telemetry taps. Independent bounded observer
+taps remain Gate 10A work and therefore neither gate the canonical RTC
+consumer nor participate in its buffer-reclamation path.
+
 Command timing records either canonical plant receive time or an already
 mapped, versioned external timestamp. Mapping estimation remains the
 integration owner's responsibility. Complete-product lead time and maximum
@@ -232,10 +240,13 @@ Coordinated port closure, preallocated first-failure publication,
 deadline-bounded failure drain, and ownership-deficit finalization remain later
 Gate 8 work and are not claimed by this phase.
 
-The current core serial event loop exposes no prepared nonstructural
-acquisition, trigger, shutter, calibration-source, or optic-mode control seam,
-so serial configuration rejects such declarations instead of accepting
-callbacks or mutable structural changes.
+Runtime plant controls use the canonical typed command boundary. A prepared
+core model may expose acquisition enablement, trigger start/stop,
+shutter/calibration-source state, autonomous-optic enablement, or safe/hold
+behavior through command endpoints with explicit schema, effective-time,
+capacity, and state semantics. The companion does not add a second control
+queue, accept callbacks, or mutate optical state itself. A change unsupported
+by the prepared model requires another configure/prepare/arm cycle.
 
 ## Deterministic serial runtime
 
