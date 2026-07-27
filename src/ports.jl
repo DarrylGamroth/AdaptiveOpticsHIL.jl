@@ -23,6 +23,8 @@ using AdaptiveOpticsSim.Plant: PlantEventLoopState
 using AdaptiveOpticsSim.Plant: PlantEventLoopWorkspace
 using AdaptiveOpticsSim.Plant: PlantCommand, PlantCommandAdmission
 using AdaptiveOpticsSim.Plant: PlantCommandDisposition
+using AdaptiveOpticsSim.Plant: CommandAdmittedPending, CommandAdmittedReady
+using AdaptiveOpticsSim.Plant: CommandTerminatedOnAdmission
 using AdaptiveOpticsSim.Plant: PlantCommandSchemaID
 using AdaptiveOpticsSim.Plant: PlantCommandSchemaVersion
 using AdaptiveOpticsSim.Plant: PlantCommandSequence
@@ -32,6 +34,7 @@ using AdaptiveOpticsSim.Plant: PreparedPlantEventLoop
 using AdaptiveOpticsSim.Plant: admit_plant_command!
 using AdaptiveOpticsSim.Plant: clear_command_dispositions!
 using AdaptiveOpticsSim.Plant: command_basis, command_basis_revision
+using AdaptiveOpticsSim.Plant: command_admission_status
 using AdaptiveOpticsSim.Plant: command_dimensions
 using AdaptiveOpticsSim.Plant: command_disposition
 using AdaptiveOpticsSim.Plant: command_disposition_count
@@ -47,6 +50,7 @@ using AdaptiveOpticsSim.Plant: command_sequence
 using AdaptiveOpticsSim.Plant: command_terminal_kind
 using AdaptiveOpticsSim.Plant: command_terminal_timestamp
 using AdaptiveOpticsSim.Plant: effective_command
+using AdaptiveOpticsSim.Plant: fail_pending_plant_commands!
 using AdaptiveOpticsSim.Plant: plant_nanoseconds
 using AdaptiveOpticsSim.Plant: superseding_command_presentation_id
 using AdaptiveOpticsSim.Plant: validate_acquisition_product_contract
@@ -181,7 +185,7 @@ function payload_resource_policy(port::AcquisitionCompletionPort)
     return PortResourcePolicy(
         capacity,
         capacity,
-        port.full_policy)
+        port.overload_policy.full_policy)
 end
 
 """Return the cold claim lifecycle for each payload pool owned by `port`."""
@@ -267,6 +271,10 @@ export PortResult, port_status, port_rejection_reason, port_payload_status
 export AbstractPortFullPolicy, RetainProducerOnFull, DropNewestOnFull
 export ReservedFullIsInvariant, PortResourcePolicy
 export resource_capacity, maximum_outstanding, resource_full_policy
+export AbstractResourceCriticality, RequiredResource, OptionalResource
+export AcquisitionOverloadPolicy, resource_criticality
+export maximum_resource_lateness_ns, overload_recovery_occupancy
+export resource_is_required
 export PortLifecycleState, PortAccepting, PortDraining, PortDrained
 export port_lifecycle_state, port_resource_policy
 export payload_resource_policy, lease_return_policy
@@ -314,8 +322,14 @@ export outcome_superseding_presentation_id, outcome_payload
 export release_outcome!, outcome_credit_accounting
 export PreparedCommandBridge, CommandBridgeState, CommandBridgeWorkspace
 export prepare_command_bridge, command_endpoint_state
+export CommandProcessingStage, CommandNotProcessed, CommandBoundaryRejected
+export CommandTerminatedDuringAdmission, CommandSemanticallyAdmitted
+export CommandProcessingResult, command_processing_port_result
+export command_processing_stage, command_processing_endpoint
+export command_processing_presentation
 export command_disposition_workspace, process_next_command!
 export publish_command_dispositions!, active_command_correlations
+export fail_pending_bridge_commands!
 export plant_event_loop_state, plant_event_loop_workspace
 export command_submission_port, command_completion_port
 export descriptor_accounting
@@ -331,6 +345,7 @@ export try_claim_product!, producer_product, abort_product!, completed_product
 export try_publish!, release_product!, acquisition_product_accounting
 export reclaim_product_returns!
 export acquisition_delivery_contract, acquisition_product_contract
+export acquisition_overload_policy
 
 public CommandSubmissionDescriptor
 public command_bridge_event_loop

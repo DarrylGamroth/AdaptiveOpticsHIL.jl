@@ -4,12 +4,15 @@ using AdaptiveOpticsHIL.Execution
 using AdaptiveOpticsHIL.Lifecycle
 using AdaptiveOpticsHIL.Ownership: RingTransferSucceeded
 using AdaptiveOpticsHIL.Ownership: try_submit!, try_take!
+using AdaptiveOpticsHIL.Ports: OptionalResource, RequiredResource
+using AdaptiveOpticsHIL.Timing
 using AdaptiveOpticsSim
 using AdaptiveOpticsSim.Plant
 using AdaptiveOpticsSim.Plant: ColdPlantModelDefinition
 using AdaptiveOpticsSim.Plant: PreparedPathExecutor
 using AdaptiveOpticsSim.Plant: prepare_pupil_opd_materialization
 using LinearAlgebra: BLAS
+using Clocks
 using Test
 
 const EXECUTION_TEST_PLANT = AdaptiveOpticsSim.Plant
@@ -19,6 +22,8 @@ const EXECUTION_TEST_BATCH_ALLOCATION_BUDGET = 2_048
 
 struct ExecutionTestUnsupportedMode <: AbstractExecutionOwnerMode end
 struct ExecutionTestUnsupportedIdle <: AbstractExecutionOwnerIdlePolicy end
+struct ExecutionTestUnsupportedOverloadAction <:
+    AbstractExecutionOwnerOverloadAction end
 struct ExecutionTestUnsupportedConfiguration <:
     AbstractOpticalExecutionConfiguration
 end
@@ -26,6 +31,12 @@ end
 function execution_test_owner_configuration(
     mode::AbstractExecutionOwnerMode;
     outer_owner_count::Integer=1,
+    owner_policy=ExecutionOwnerOverloadPolicy(
+        RequiredResource(),
+        FailRunOnOwnerOverload();
+        maximum_lateness_ns=nothing,
+        recovery_occupancy=0),
+    owner_policy_overrides=(),
 )
     julia_threads = Threads.nthreads()
     blas_threads = BLAS.get_num_threads()
@@ -49,7 +60,13 @@ function execution_test_owner_configuration(
         fft_thread_count=fft_threads,
         blas_thread_count=blas_threads,
     )
-    return ExecutionOwnerConfiguration(mode, budget, environment)
+    return ExecutionOwnerConfiguration(
+        mode,
+        budget,
+        environment;
+        owner_policy,
+        owner_policy_overrides,
+    )
 end
 
 mutable struct ExecutionConcurrencyProbe
@@ -122,6 +139,11 @@ struct ExecutionOptionalScienceStall
     state::ExecutionIndependenceState
 end
 
+struct ExecutionOptionalScienceDeadlineStall{C}
+    state::ExecutionIndependenceState
+    clock::C
+end
+
 struct ExecutionRequiredWFSCompletion
     state::ExecutionIndependenceState
 end
@@ -157,6 +179,21 @@ function execution_probe_before!(
         state.timeout_ns,
         "required WFS did not complete while optional science was stalled",
     )
+    state.science_released[] = true
+    return nothing
+end
+
+function execution_probe_before!(
+    probe::ExecutionOptionalScienceDeadlineStall,
+)
+    state = probe.state
+    state.science_started[] = true
+    wait_for_execution_test_flag(
+        state.required_wfs_completed,
+        state.timeout_ns,
+        "required WFS did not complete while optional science was stalled",
+    )
+    Clocks.advance!(probe.clock, 1)
     state.science_released[] = true
     return nothing
 end
@@ -465,10 +502,18 @@ function prepare_execution_test_executor(
     mode::AbstractExecutionOwnerMode;
     outer_owner_count::Integer,
     session::RunSessionID=RunSessionID(0x8a00),
+    owner_policy=ExecutionOwnerOverloadPolicy(
+        RequiredResource(),
+        FailRunOnOwnerOverload();
+        maximum_lateness_ns=nothing,
+        recovery_occupancy=0),
+    owner_policy_overrides=(),
 )
     configuration = execution_test_owner_configuration(
         mode;
         outer_owner_count,
+        owner_policy,
+        owner_policy_overrides,
     )
     executor = AdaptiveOpticsHIL.Execution._prepare_optical_execution(
         configuration,
@@ -555,6 +600,46 @@ function stop_execution_test_executor!(executor)
     return executor
 end
 
+function settle_execution_test_owner_completions!(executor)
+    deadline_ns = time_ns() + UInt64(5_000_000_000)
+    while true
+        settled = all(
+            ordinal -> begin
+                accounting =
+                    execution_owner_accounting(executor, ordinal)
+                !accounting.failed &&
+                    accounting.work_taken ==
+                        accounting.work_completed
+            end,
+            1:execution_owner_count(executor),
+        )
+        settled && break
+        time_ns() <= deadline_ns || error(
+            "execution owners did not settle after policy failure")
+        yield()
+    end
+
+    completion_type =
+        AdaptiveOpticsHIL.Execution._ExecutionOwnerCompletion
+    scratch = Ref{completion_type}()
+    for ordinal in 1:execution_owner_count(executor)
+        owner = execution_owner(executor, ordinal)
+        while true
+            status = try_take!(scratch, owner.completion)
+            status == AdaptiveOpticsHIL.Ownership.RingEmpty && break
+            status == RingTransferSucceeded || error(
+                "failed owner completion path did not remain drainable")
+            AdaptiveOpticsHIL.Execution.
+                _record_owner_completion_consumption!(
+                    executor.owner_overload_states[ordinal],
+                    owner,
+                )
+            executor.coordinator.completions[ordinal] += UInt64(1)
+        end
+    end
+    return executor
+end
+
 function captured_execution_test_error(f)
     try
         f()
@@ -579,6 +664,19 @@ end
     executor,
 )
     return @allocated execute_execution_test_batch!(fixture, executor)
+end
+
+@inline function execution_owner_deadline_allocations!(
+    executor,
+    mapping,
+)
+    return @allocated AdaptiveOpticsHIL.Execution.
+        _observe_execution_owner_deadline!(
+            executor,
+            1,
+            mapping,
+            PlantTimestamp(0),
+        )
 end
 
 @testset "Long-lived optical execution owners" begin
@@ -610,6 +708,68 @@ end
     capacity_configuration =
         execution_test_owner_configuration(
             DeterministicExecutionOwners())
+    optional_owner_policy = ExecutionOwnerOverloadPolicy(
+        OptionalResource(),
+        FailRunOnOwnerOverload();
+        maximum_lateness_ns=0,
+        recovery_occupancy=0,
+    )
+    @test optional_owner_policy.criticality isa OptionalResource
+    @test optional_owner_policy.action isa FailRunOnOwnerOverload
+    @test optional_owner_policy.maximum_lateness_ns == 0
+    @test optional_owner_policy.recovery_occupancy == 0
+    @test !resource_is_required(optional_owner_policy)
+    @test resource_is_required(capacity_configuration.owner_policy)
+    @test_throws ExecutionOwnerError ExecutionOwnerOverloadPolicy(
+        RequiredResource(),
+        FailRunOnOwnerOverload();
+        maximum_lateness_ns=true,
+        recovery_occupancy=0,
+    )
+    @test_throws ExecutionOwnerError ExecutionOwnerOverloadPolicy(
+        RequiredResource(),
+        FailRunOnOwnerOverload();
+        maximum_lateness_ns=nothing,
+        recovery_occupancy=true,
+    )
+    unsupported_owner_policy = ExecutionOwnerOverloadPolicy(
+        RequiredResource(),
+        ExecutionTestUnsupportedOverloadAction();
+        maximum_lateness_ns=nothing,
+        recovery_occupancy=0,
+    )
+    @test_throws ExecutionOwnerError ExecutionOwnerConfiguration(
+        capacity_configuration.mode,
+        capacity_configuration.cpu_budget,
+        capacity_configuration.cpu_environment;
+        owner_policy=unsupported_owner_policy,
+    )
+    duplicate_override = ExecutionOwnerPolicyOverride(
+        ExecutionOwnerID(1), optional_owner_policy)
+    one_override_configuration = ExecutionOwnerConfiguration(
+        capacity_configuration.mode,
+        capacity_configuration.cpu_budget,
+        capacity_configuration.cpu_environment;
+        owner_policy=capacity_configuration.owner_policy,
+        owner_policy_overrides=(ExecutionOwnerPolicyOverride(
+            ExecutionOwnerID(1),
+            capacity_configuration.owner_policy,
+        ),),
+    )
+    @test typeof(one_override_configuration) ===
+        typeof(capacity_configuration)
+    @test length(
+        one_override_configuration.owner_policy_overrides) == 1
+    @test_throws ExecutionOwnerError ExecutionOwnerConfiguration(
+        capacity_configuration.mode,
+        capacity_configuration.cpu_budget,
+        capacity_configuration.cpu_environment;
+        owner_policy=capacity_configuration.owner_policy,
+        owner_policy_overrides=(
+            duplicate_override,
+            duplicate_override,
+        ),
+    )
     @test !applicable(
         ExecutionOwnerConfiguration,
         capacity_configuration.mode,
@@ -622,28 +782,33 @@ end
         capacity_configuration.cpu_budget,
         capacity_configuration.cpu_environment;
         ring_capacity=2,
+        owner_policy=capacity_configuration.owner_policy,
     ).ring_capacity == 2
     @test_throws ExecutionOwnerError ExecutionOwnerConfiguration(
         capacity_configuration.mode,
         capacity_configuration.cpu_budget,
         capacity_configuration.cpu_environment;
         ring_capacity=0,
+        owner_policy=capacity_configuration.owner_policy,
     )
     @test_throws ExecutionOwnerError ExecutionOwnerConfiguration(
         capacity_configuration.mode,
         capacity_configuration.cpu_budget,
         capacity_configuration.cpu_environment;
         ring_capacity=true,
+        owner_policy=capacity_configuration.owner_policy,
     )
     @test_throws ExecutionOwnerError ExecutionOwnerConfiguration(
         ExecutionTestUnsupportedMode(),
         capacity_configuration.cpu_budget,
         capacity_configuration.cpu_environment,
+        owner_policy=capacity_configuration.owner_policy,
     )
     @test_throws ExecutionOwnerError ExecutionOwnerConfiguration(
         ThreadedExecutionOwners(ExecutionTestUnsupportedIdle()),
         capacity_configuration.cpu_budget,
         capacity_configuration.cpu_environment,
+        owner_policy=capacity_configuration.owner_policy,
     )
     unsupported = execution_test_fixture()
     unsupported_error = captured_execution_test_error() do
@@ -658,6 +823,88 @@ end
     @test unsupported_error isa ExecutionOwnerError
     @test unsupported_error.reason ==
         :unsupported_execution_configuration
+    unknown_policy_configuration =
+        execution_test_owner_configuration(
+            DeterministicExecutionOwners();
+            owner_policy_overrides=(
+                ExecutionOwnerPolicyOverride(
+                    ExecutionOwnerID(4),
+                    optional_owner_policy,
+                ),
+            ),
+        )
+    unknown_policy_error = captured_execution_test_error() do
+        AdaptiveOpticsHIL.Execution._prepare_optical_execution(
+            unknown_policy_configuration,
+            unsupported.prepared,
+            unsupported.state,
+            unsupported.workspace,
+            RunSessionID(0x89df),
+        )
+    end
+    @test unknown_policy_error isa ExecutionOwnerError
+    @test unknown_policy_error.reason == :unknown_owner_policy
+    invalid_recovery_policy = ExecutionOwnerOverloadPolicy(
+        RequiredResource(),
+        FailRunOnOwnerOverload();
+        maximum_lateness_ns=nothing,
+        recovery_occupancy=1,
+    )
+    invalid_recovery_configuration =
+        execution_test_owner_configuration(
+            DeterministicExecutionOwners();
+            owner_policy=invalid_recovery_policy,
+        )
+    invalid_recovery_error = captured_execution_test_error() do
+        AdaptiveOpticsHIL.Execution._prepare_optical_execution(
+            invalid_recovery_configuration,
+            unsupported.prepared,
+            unsupported.state,
+            unsupported.workspace,
+            RunSessionID(0x89df),
+        )
+    end
+    @test invalid_recovery_error isa ExecutionOwnerError
+    @test invalid_recovery_error.reason ==
+        :invalid_recovery_occupancy
+    deadline_probe_fixture = execution_test_fixture()
+    deadline_probe_executor = prepare_execution_test_executor(
+        deadline_probe_fixture,
+        DeterministicExecutionOwners();
+        outer_owner_count=1,
+        session=RunSessionID(0x89e0),
+        owner_policy=optional_owner_policy,
+    )
+    deadline_probe_owner = execution_owner(
+        deadline_probe_executor, 1)
+    @test resource_criticality(deadline_probe_owner) isa OptionalResource
+    @test !resource_is_required(deadline_probe_owner)
+    @test maximum_resource_lateness_ns(deadline_probe_owner) == 0
+    @test overload_recovery_occupancy(deadline_probe_owner) == 0
+    deadline_probe_clock = CachedNanoClock(0)
+    deadline_probe_mapping = arm_execution_clock(
+        deadline_probe_clock, PlantTimestamp(0))
+    @test @inferred(
+        AdaptiveOpticsHIL.Execution.
+            _observe_execution_owner_deadline!(
+                deadline_probe_executor,
+                1,
+                deadline_probe_mapping,
+                PlantTimestamp(0),
+            )) == false
+    if EXECUTION_TESTS_WITH_COVERAGE
+        @test_skip "owner deadline allocation gate disabled under coverage instrumentation"
+    else
+        execution_owner_deadline_allocations!(
+            deadline_probe_executor,
+            deadline_probe_mapping,
+        )
+        @test execution_owner_deadline_allocations!(
+            deadline_probe_executor,
+            deadline_probe_mapping,
+        ) == 0
+    end
+    stop_execution_test_executor!(deadline_probe_executor)
     undersized = execution_test_fixture()
     undersized_configuration =
         execution_test_owner_configuration(
@@ -670,7 +917,7 @@ end
             undersized.prepared,
             undersized.state,
             undersized.workspace,
-            RunSessionID(0x89e0),
+            RunSessionID(0x89e1),
         )
     end
     @test undersized_error isa ExecutionOwnerError
@@ -684,7 +931,7 @@ end
             missing.prepared,
             missing.state,
             missing.workspace,
-            RunSessionID(0x89e1),
+            RunSessionID(0x89e2),
         )
     missing_error = captured_execution_test_error() do
         AdaptiveOpticsHIL.Execution._take_expected_completion!(
@@ -698,6 +945,70 @@ end
     @test missing_error.reason ==
         :missing_deterministic_completion
 
+    capacity = execution_test_fixture()
+    capacity_executor = prepare_execution_test_executor(
+        capacity,
+        DeterministicExecutionOwners();
+        outer_owner_count=1,
+        session=RunSessionID(0x89e2),
+    )
+    capacity_claim = EXECUTION_TEST_PLANT.begin_optical_path_batch!(
+        capacity.prepared,
+        capacity.state,
+        capacity.workspace,
+        PlantTimestamp(0),
+    )
+    capacity_owner_count =
+        AdaptiveOpticsHIL.Execution.
+            _collect_due_execution_owners!(
+                capacity_executor, capacity_claim)
+    capacity_owner_ordinal = Int(
+        capacity_executor.coordinator_workspace.
+            due_owner_ordinals[1])
+    capacity_owner =
+        execution_owner(
+            capacity_executor, capacity_owner_ordinal)
+    work_type =
+        AdaptiveOpticsHIL.Execution.
+            _ExecutionOwnerWorkDescriptor
+    occupied_work = work_type(
+        capacity_executor.session,
+        execution_owner_id(capacity_owner),
+        UInt64(1),
+        AdaptiveOpticsHIL.Execution.
+            _ExecutionOwnerMaterialization,
+        capacity_claim,
+    )
+    @test try_submit!(
+        capacity_owner.due, occupied_work) ==
+        RingTransferSucceeded
+    capacity_error = captured_execution_test_error() do
+        AdaptiveOpticsHIL.Execution._submit_owner_phase!(
+            capacity_executor,
+            capacity_claim,
+            UInt64(1),
+            capacity_owner_count,
+            AdaptiveOpticsHIL.Execution.
+                _ExecutionOwnerMaterialization,
+        )
+    end
+    @test capacity_error isa ExecutionOwnerError
+    @test capacity_error.reason == :due_work_publication
+    capacity_accounting = execution_owner_accounting(
+        capacity_executor, capacity_owner_ordinal)
+    @test capacity_accounting.overload_policy.criticality isa
+        RequiredResource
+    @test capacity_accounting.overload_episodes == 1
+    @test capacity_accounting.maximum_due_occupancy == 1
+    @test capacity_accounting.overload_decision ==
+        ExecutionOwnerFailedForCapacity
+    occupied_scratch = Ref{work_type}()
+    @test try_take!(
+        occupied_scratch, capacity_owner.due) ==
+        RingTransferSucceeded
+    @test execution_owners_are_quiescent(capacity_executor)
+    stop_execution_test_executor!(capacity_executor)
+
     owner_failure = ArgumentError("test execution-owner model failure")
     failing = execution_test_fixture(
         path_probes=(
@@ -710,7 +1021,7 @@ end
         failing,
         DeterministicExecutionOwners();
         outer_owner_count=1,
-        session=RunSessionID(0x89e2),
+        session=RunSessionID(0x89e3),
     )
     observed_failure = captured_execution_test_error() do
         execute_execution_test_batch!(failing, failing_executor)
@@ -1006,5 +1317,73 @@ end
         @test independence_state.required_wfs_completed[]
         @test independence_state.science_released[]
         stop_execution_test_executor!(independent_executor)
+
+        deadline_clock = CachedNanoClock(0)
+        deadline_state = ExecutionIndependenceState()
+        deadline_fixture = execution_test_fixture(
+            path_probes=(
+                ExecutionOptionalScienceDeadlineStall(
+                    deadline_state, deadline_clock),
+                ExecutionRequiredWFSCompletion(deadline_state),
+                nothing,
+            ),
+        )
+        optional_deadline_policy = ExecutionOwnerOverloadPolicy(
+            OptionalResource(),
+            FailRunOnOwnerOverload();
+            maximum_lateness_ns=0,
+            recovery_occupancy=0,
+        )
+        deadline_executor = prepare_execution_test_executor(
+            deadline_fixture,
+            ThreadedExecutionOwners();
+            outer_owner_count=3,
+            session=RunSessionID(0x8a04),
+            owner_policy_overrides=(
+                ExecutionOwnerPolicyOverride(
+                    ExecutionOwnerID(3),
+                    optional_deadline_policy,
+                ),
+            ),
+        )
+        deadline_mapping = arm_execution_clock(
+            deadline_clock, PlantTimestamp(0))
+        deadline_runtime =
+            AdaptiveOpticsHIL.Execution.
+                _bind_optical_execution_timing(
+                    deadline_executor, deadline_mapping)
+        deadline_error = captured_execution_test_error() do
+            execute_execution_test_batch!(
+                deadline_fixture, deadline_runtime)
+        end
+        @test deadline_error isa ExecutionOwnerError
+        @test deadline_error.reason == :owner_deadline_exceeded
+        @test deadline_state.science_started[]
+        @test deadline_state.required_wfs_completed[]
+        @test deadline_state.science_released[]
+        settle_execution_test_owner_completions!(
+            deadline_executor)
+        optional_accounting =
+            execution_owner_accounting(deadline_executor, 3)
+        @test optional_accounting.overload_policy ===
+            optional_deadline_policy
+        @test optional_accounting.overload_episodes == 1
+        @test optional_accounting.recovery_count == 0
+        @test optional_accounting.latest_lateness_ns == 1
+        @test optional_accounting.maximum_lateness_ns == 1
+        @test optional_accounting.overloaded
+        @test !optional_accounting.recovered_to_threshold
+        @test optional_accounting.overload_decision ==
+            ExecutionOwnerFailedForDeadline
+        @test optional_accounting.current_due_occupancy == 0
+        @test optional_accounting.current_completion_occupancy == 0
+        @test optional_accounting.maximum_due_occupancy == 1
+        @test optional_accounting.maximum_completion_occupancy == 1
+        required_accounting =
+            execution_owner_accounting(deadline_executor, 2)
+        @test required_accounting.work_completed == 2
+        @test !required_accounting.overloaded
+        @test execution_owners_are_quiescent(deadline_executor)
+        stop_execution_test_executor!(deadline_executor)
     end
 end

@@ -28,6 +28,7 @@ import ..AdaptiveOpticsHIL: AdaptiveOpticsHILError
 using ..Execution: AbstractOpticalExecutionConfiguration
 using ..Execution: SerialOpticalExecution
 using ..Execution: _arm_optical_execution!
+using ..Execution: _bind_optical_execution_timing
 using ..Execution: _execution_accounting
 using ..Execution: _execution_accounting_is_quiescent
 using ..Execution: _execution_is_armed, _execution_is_quiescent
@@ -35,34 +36,48 @@ using ..Execution: _mark_optical_execution_failed!
 using ..Execution: _prepare_optical_execution
 using ..Execution: _start_optical_execution!, _stop_optical_execution!
 using ..Lifecycle: AdapterReadinessSnapshot
+using ..Lifecycle: NoRTCIngressLiveness
+using ..Lifecycle: RTCIngressLivenessExpired
+using ..Lifecycle: RTCIngressLivenessPolicy
+using ..Lifecycle: RTCIngressLivenessState
 using ..Lifecycle: RunFailureEvent
 using ..Lifecycle: RunLifecycleParameters, RunLifecycleState
 using ..Lifecycle: RunPrepared, RunRunning
 using ..Lifecycle: RunStopRequest, RunTerminalEvent
 using ..Lifecycle: _begin_arm!, _complete_arm!, _fail_run!
+using ..Lifecycle: _admit_rtc_ingress_liveness!
+using ..Lifecycle: _observe_rtc_ingress_liveness!
 using ..Lifecycle: _record_stop!, _require_phase
+using ..Lifecycle: _start_rtc_ingress_liveness!
 using ..Lifecycle: _start_run!
 using ..Lifecycle: _validate_stop_event
 import ..Lifecycle: run_arm_window, run_execution_clock_identity
 import ..Lifecycle: run_adapter_readiness
 import ..Lifecycle: run_phase, run_session, run_termination
 using ..Ownership: PayloadLeaseRef, PayloadPoolAccounting, RingAccounting
+using ..Ownership: PayloadPoolClosed, PayloadPoolExhausted
 using ..Ownership: PayloadTransitionSucceeded
 using ..Ownership: ring_accounting
 using ..Ports: AcquisitionCompletionPort
+using ..Ports: AcquisitionOverloadPolicy
+using ..Ports: DropNewestOnFull, OptionalResource
 using ..Ports: CommandBridgeState, CommandBridgeWorkspace
 using ..Ports: CommandSubmissionPort
 using ..Ports: InlineCommandPayload, LeasedCommandPayload
 using ..Ports: PortClosed, PortEmpty, PortFull, PortTransferSucceeded
+using ..Ports: CommandSemanticallyAdmitted
 using ..Ports: PreparedCommandBridge, StreamSequence
 using ..Ports: abort_product!, acquisition_product_accounting
 using ..Ports: acquisition_product_contract, active_command_correlations
 using ..Ports: command_bridge_event_loop, command_completion_port
+using ..Ports: command_processing_endpoint
+using ..Ports: command_processing_port_result, command_processing_stage
 using ..Ports: command_disposition_workspace, command_payload_accounting
 using ..Ports: command_submission_port, matching_acquisition_completion
 using ..Ports: outcome_credit_accounting, plant_event_loop_state
 using ..Ports: plant_event_loop_workspace
 using ..Ports: port_status, process_next_command!
+using ..Ports: fail_pending_bridge_commands!
 using ..Ports: producer_product, publish_command_dispositions!
 using ..Ports: reclaim_command_payload_returns!
 using ..Ports: reclaim_outcome_credit_returns!, reclaim_product_returns!
@@ -70,6 +85,7 @@ using ..Ports: try_claim_product!, try_publish!
 using ..Timing: ExecutionClockMapping, arm_execution_clock
 using ..Timing: execution_clock, execution_clock_identity
 using ..Timing: execution_clock_origin_ns
+using ..Timing: execution_lateness_ns
 using ..Timing: execution_time_until_ns
 using ..Timing: _read_execution_clock
 
@@ -87,6 +103,14 @@ export serial_optical_execution_configuration, serial_optical_execution
 export SerialRunAccounting
 export reclaim_serial_returns!, serial_run_accounting
 export serial_run_is_quiescent
+export AcquisitionOverloadDecision, AcquisitionNoOverloadDecision
+export AcquisitionProductPublished, AcquisitionShedForCapacity
+export AcquisitionShedForDeadline, AcquisitionFailedForCapacity
+export AcquisitionFailedForDeadline, AcquisitionOverloadRecovered
+export AcquisitionOverloadAccounting
+export serial_acquisition_overload_accounting
+export serial_rtc_ingress_liveness_accounting
+export serial_rtc_ingress_liveness_policy
 
 """Invalid serial-run preparation, lifecycle, pacing, or accounting."""
 struct SerialRunError <: AdaptiveOpticsHILError
@@ -102,6 +126,73 @@ struct PreparedAcquisitionPublisher{
     id::AcquisitionID
     port::P
     source::S
+end
+
+"""Last bounded overload decision for one acquisition completion path."""
+@enum AcquisitionOverloadDecision::UInt8 begin
+    AcquisitionNoOverloadDecision = 0x01
+    AcquisitionProductPublished = 0x02
+    AcquisitionShedForCapacity = 0x03
+    AcquisitionShedForDeadline = 0x04
+    AcquisitionFailedForCapacity = 0x05
+    AcquisitionFailedForDeadline = 0x06
+    AcquisitionOverloadRecovered = 0x07
+end
+
+"""Preallocated single-writer publication and overload evidence."""
+mutable struct AcquisitionPublicationState
+    last_sequence::UInt64
+    products_published::UInt64
+    products_shed::UInt64
+    products_failed::UInt64
+    overload_episodes::UInt64
+    recovery_count::UInt64
+    current_descriptor_occupancy::Int
+    maximum_descriptor_occupancy::Int
+    current_product_occupancy::Int
+    maximum_product_occupancy::Int
+    latest_lateness_ns::Int64
+    maximum_lateness_ns::Int64
+    overloaded::Bool
+    recovered_to_threshold::Bool
+    decision::AcquisitionOverloadDecision
+end
+
+AcquisitionPublicationState() = AcquisitionPublicationState(
+    UInt64(0),
+    UInt64(0),
+    UInt64(0),
+    UInt64(0),
+    UInt64(0),
+    UInt64(0),
+    0,
+    0,
+    0,
+    0,
+    Int64(0),
+    Int64(0),
+    false,
+    false,
+    AcquisitionNoOverloadDecision)
+
+"""Cold immutable overload evidence for one acquisition path."""
+struct AcquisitionOverloadAccounting
+    acquisition::AcquisitionID
+    last_sequence::UInt64
+    products_published::UInt64
+    products_shed::UInt64
+    products_failed::UInt64
+    overload_episodes::UInt64
+    recovery_count::UInt64
+    current_descriptor_occupancy::Int
+    maximum_descriptor_occupancy::Int
+    current_product_occupancy::Int
+    maximum_product_occupancy::Int
+    latest_lateness_ns::Int64
+    maximum_lateness_ns::Int64
+    overloaded::Bool
+    recovered_to_threshold::Bool
+    decision::AcquisitionOverloadDecision
 end
 
 struct _SerialConstructionToken end
@@ -120,12 +211,14 @@ struct ConfiguredSerialRun{
     B<:PreparedCommandBridge,
     A<:Tuple,
     E<:AbstractOpticalExecutionConfiguration,
+    I<:Lifecycle.AbstractRTCIngressLivenessPolicy,
 }
     event_loop::L
     command_bridge::B
     acquisition_ports::A
     optical_execution::E
     lifecycle::RunLifecycleParameters
+    ingress_liveness::I
     nonstructural_controls::Tuple{}
 
     ConfiguredSerialRun(
@@ -134,18 +227,21 @@ struct ConfiguredSerialRun{
         acquisition_ports::A,
         optical_execution::E,
         lifecycle::RunLifecycleParameters,
+        ingress_liveness::I,
         nonstructural_controls::Tuple{},
         ::_SerialConstructionToken) where {
         L<:PreparedPlantEventLoop,
         B<:PreparedCommandBridge,
         A<:Tuple,
         E<:AbstractOpticalExecutionConfiguration,
-    } = new{L,B,A,E}(
+        I<:Lifecycle.AbstractRTCIngressLivenessPolicy,
+    } = new{L,B,A,E,I}(
         event_loop,
         command_bridge,
         acquisition_ports,
         optical_execution,
         lifecycle,
+        ingress_liveness,
         nonstructural_controls)
 end
 
@@ -154,23 +250,32 @@ Single-writer run state. The command bridge owns the event-loop state and its
 bounded command-correlation state; lifecycle and acquisition sequences remain
 separate mutable state.
 """
-mutable struct SerialRunState{B<:CommandBridgeState}
+mutable struct SerialRunState{
+    B<:CommandBridgeState,
+    I<:RTCIngressLivenessState,
+}
     const bridge::B
-    const published_sequences::Memory{UInt64}
+    const publications::Memory{AcquisitionPublicationState}
+    const ingress_liveness::I
     const lifecycle::RunLifecycleState
     plant_event_steps::UInt64
     products_published::UInt64
 
     SerialRunState(
         bridge::B,
-        published_sequences::Memory{UInt64},
+        publications::Memory{AcquisitionPublicationState},
+        ingress_liveness::I,
         lifecycle::RunLifecycleState,
         plant_event_steps::UInt64,
         products_published::UInt64,
-        ::_SerialConstructionToken) where {B<:CommandBridgeState} =
-        new{B}(
+        ::_SerialConstructionToken) where {
+        B<:CommandBridgeState,
+        I<:RTCIngressLivenessState,
+    } =
+        new{B,I}(
             bridge,
-            published_sequences,
+            publications,
+            ingress_liveness,
             lifecycle,
             plant_event_steps,
             products_published)
@@ -257,17 +362,21 @@ readiness succeeds inside the arm window.
 struct ArmedSerialRun{
     R<:PreparedSerialRun,
     M<:ExecutionClockMapping,
+    E<:AbstractOpticalPathBatchExecutor,
 }
     prepared::R
     timing::M
+    execution::E
 
     ArmedSerialRun(
         prepared::R,
         timing::M,
+        execution::E,
         ::_SerialConstructionToken) where {
         R<:PreparedSerialRun,
         M<:ExecutionClockMapping,
-    } = new{R,M}(prepared, timing)
+        E<:AbstractOpticalPathBatchExecutor,
+    } = new{R,M,E}(prepared, timing, execution)
 end
 
 """Typed running handle accepted by the serial hot path."""
@@ -361,6 +470,66 @@ serial_products_published(run::Union{
     RunningSerialRun,
 }) = _prepared_serial_run(run).state.products_published
 
+serial_rtc_ingress_liveness_policy(
+    run::ConfiguredSerialRun) = run.ingress_liveness
+serial_rtc_ingress_liveness_policy(run::Union{
+    PreparedSerialRun,
+    ArmingSerialRun,
+    ArmedSerialRun,
+    RunningSerialRun,
+}) = _prepared_serial_run(run).configuration.ingress_liveness
+
+serial_rtc_ingress_liveness_accounting(run::Union{
+    PreparedSerialRun,
+    ArmingSerialRun,
+    ArmedSerialRun,
+    RunningSerialRun,
+}) = Lifecycle.rtc_ingress_liveness_accounting(
+    _prepared_serial_run(run).state.ingress_liveness)
+
+@inline function _acquisition_overload_accounting(
+    publisher::PreparedAcquisitionPublisher,
+    state::AcquisitionPublicationState)
+    return AcquisitionOverloadAccounting(
+        publisher.id,
+        state.last_sequence,
+        state.products_published,
+        state.products_shed,
+        state.products_failed,
+        state.overload_episodes,
+        state.recovery_count,
+        state.current_descriptor_occupancy,
+        state.maximum_descriptor_occupancy,
+        state.current_product_occupancy,
+        state.maximum_product_occupancy,
+        state.latest_lateness_ns,
+        state.maximum_lateness_ns,
+        state.overloaded,
+        state.recovered_to_threshold,
+        state.decision)
+end
+
+function serial_acquisition_overload_accounting(
+    run::Union{
+        PreparedSerialRun,
+        ArmingSerialRun,
+        ArmedSerialRun,
+        RunningSerialRun,
+    },
+    id::AcquisitionID)
+    prepared = _prepared_serial_run(run)
+    @inbounds for index in eachindex(prepared.publishers)
+        publisher = prepared.publishers[index]
+        publisher.id == id || continue
+        return _acquisition_overload_accounting(
+            publisher, prepared.state.publications[index])
+    end
+    throw(SerialRunError(
+        :serial_run,
+        :unknown_acquisition,
+        "serial run has no acquisition overload state for $id"))
+end
+
 serial_optical_execution_configuration(
     run::ConfiguredSerialRun) = run.optical_execution
 serial_optical_execution_configuration(run::Union{
@@ -447,6 +616,31 @@ function _validate_nonstructural_controls(::Any)
         "nonstructural control declarations must be a tuple"))
 end
 
+@inline _validate_rtc_ingress_liveness(
+    ::PreparedCommandBridge,
+    ::Nothing) = NoRTCIngressLiveness()
+
+function _validate_rtc_ingress_liveness(
+    bridge::PreparedCommandBridge,
+    policy::RTCIngressLivenessPolicy)
+    submission = command_submission_port(bridge)
+    policy.endpoint == submission.endpoint ||
+        throw(SerialRunError(
+            :rtc_ingress_liveness,
+            :endpoint_mismatch,
+            "RTC-ingress-liveness policy must target the serial command endpoint"))
+    return policy
+end
+
+function _validate_rtc_ingress_liveness(
+    ::PreparedCommandBridge,
+    ::Any)
+    throw(SerialRunError(
+        :rtc_ingress_liveness,
+        :invalid_policy,
+        "RTC-ingress liveness must be nothing or RTCIngressLivenessPolicy"))
+end
+
 @inline _validate_optical_execution(
     execution::AbstractOpticalExecutionConfiguration) = execution
 
@@ -460,7 +654,7 @@ end
 """
     configure_serial_run(command_bridge, acquisition_ports;
         arm_timeout_ns, optical_execution=SerialOpticalExecution(),
-        nonstructural_controls=())
+        ingress_liveness=nothing, nonstructural_controls=())
 
 Validate and freeze the exact event-loop command route, acquisition-completion
 ports, and relative arm deadline for one serial HIL topology. Prepared
@@ -472,10 +666,13 @@ function configure_serial_run(
     acquisition_ports::Tuple;
     arm_timeout_ns::Integer,
     optical_execution=SerialOpticalExecution(),
+    ingress_liveness=nothing,
     nonstructural_controls=())
     controls = _validate_nonstructural_controls(
         nonstructural_controls)
     execution = _validate_optical_execution(optical_execution)
+    liveness = _validate_rtc_ingress_liveness(
+        command_bridge, ingress_liveness)
     event_loop = command_bridge_event_loop(command_bridge)
     event_loop === nothing && throw(SerialRunError(
         :serial_run, :command_target_without_event_loop,
@@ -492,6 +689,7 @@ function configure_serial_run(
         acquisition_ports,
         execution,
         lifecycle,
+        liveness,
         controls,
         _SERIAL_CONSTRUCTION_TOKEN)
 end
@@ -507,11 +705,15 @@ function prepare_serial_run(configuration::ConfiguredSerialRun)
         configuration.event_loop,
         configuration.acquisition_ports)
     bridge = CommandBridgeState(configuration.command_bridge)
-    sequences = Memory{UInt64}(undef, length(publishers))
-    fill!(sequences, UInt64(0))
+    publications = Memory{AcquisitionPublicationState}(
+        undef, length(publishers))
+    for index in eachindex(publications)
+        publications[index] = AcquisitionPublicationState()
+    end
     state = SerialRunState(
         bridge,
-        sequences,
+        publications,
+        RTCIngressLivenessState(configuration.ingress_liveness),
         RunLifecycleState(configuration.lifecycle),
         UInt64(0),
         UInt64(0),
@@ -735,17 +937,24 @@ function arm_serial_run!(
         attempt.window,
         readiness,
         current_execution_ns)
-    armed = ArmedSerialRun(
-        attempt.prepared,
-        mapping,
-        _SERIAL_CONSTRUCTION_TOKEN)
     try
         _arm_optical_execution!(attempt.prepared.execution)
     catch error
-        _record_serial_failure!(armed, error)
+        failed = ArmedSerialRun(
+            attempt.prepared,
+            mapping,
+            _bind_optical_execution_timing(
+                attempt.prepared.execution, mapping),
+            _SERIAL_CONSTRUCTION_TOKEN)
+        _record_serial_failure!(failed, error)
         rethrow()
     end
-    return armed
+    return ArmedSerialRun(
+        attempt.prepared,
+        mapping,
+        _bind_optical_execution_timing(
+            attempt.prepared.execution, mapping),
+        _SERIAL_CONSTRUCTION_TOKEN)
 end
 
 function start_serial_run!(armed::ArmedSerialRun)
@@ -754,8 +963,14 @@ function start_serial_run!(armed::ArmedSerialRun)
             :serial_run,
             :execution_owners_not_armed,
             "optical execution owners must be armed before the run starts"))
+    started_execution_ns =
+        _read_execution_clock(execution_clock(armed.timing))
     _start_run!(armed.prepared.state.lifecycle)
     try
+        _start_rtc_ingress_liveness!(
+            armed.prepared.state.ingress_liveness,
+            execution_clock_identity(armed.timing),
+            started_execution_ns)
         _start_optical_execution!(armed.prepared.execution)
     catch error
         _record_serial_failure!(armed, error)
@@ -813,6 +1028,137 @@ end
     return destination
 end
 
+@inline _serial_acquisition_may_shed(
+    ::AcquisitionOverloadPolicy{
+        OptionalResource,
+        DropNewestOnFull,
+    }) = true
+@inline _serial_acquisition_may_shed(
+    ::AcquisitionOverloadPolicy) = false
+
+@inline function _observe_serial_acquisition_occupancy!(
+    publication::AcquisitionPublicationState,
+    port::AcquisitionCompletionPort)
+    descriptor_occupancy = ring_accounting(port.ring).occupancy
+    products = acquisition_product_accounting(port)
+    product_occupancy = products.capacity - products.free
+    publication.current_descriptor_occupancy =
+        descriptor_occupancy
+    publication.maximum_descriptor_occupancy = max(
+        publication.maximum_descriptor_occupancy,
+        descriptor_occupancy,
+    )
+    publication.current_product_occupancy = product_occupancy
+    publication.maximum_product_occupancy = max(
+        publication.maximum_product_occupancy,
+        product_occupancy,
+    )
+    return nothing
+end
+
+@inline function _serial_lateness_is_recovered(
+    policy::AcquisitionOverloadPolicy,
+    publication::AcquisitionPublicationState)
+    maximum = policy.maximum_lateness_ns
+    return maximum === nothing ||
+        publication.latest_lateness_ns <= maximum
+end
+
+@inline function _maybe_record_serial_overload_recovery!(
+    policy::AcquisitionOverloadPolicy,
+    publication::AcquisitionPublicationState)
+    publication.overloaded || return false
+    publication.current_descriptor_occupancy <=
+        policy.recovery_occupancy ||
+        return false
+    publication.current_product_occupancy <=
+        policy.recovery_occupancy ||
+        return false
+    _serial_lateness_is_recovered(policy, publication) ||
+        return false
+    publication.overloaded = false
+    publication.recovered_to_threshold = true
+    publication.recovery_count += UInt64(1)
+    publication.decision = AcquisitionOverloadRecovered
+    return true
+end
+
+@inline function _record_serial_acquisition_lateness!(
+    publication::AcquisitionPublicationState,
+    lateness_ns::Int64)
+    nonnegative_lateness = max(Int64(0), lateness_ns)
+    publication.latest_lateness_ns = nonnegative_lateness
+    publication.maximum_lateness_ns =
+        max(publication.maximum_lateness_ns, nonnegative_lateness)
+    return nonnegative_lateness
+end
+
+@inline function _mark_serial_acquisition_overload!(
+    publication::AcquisitionPublicationState,
+    decision::AcquisitionOverloadDecision)
+    if !publication.overloaded
+        publication.overload_episodes += UInt64(1)
+    end
+    publication.overloaded = true
+    publication.recovered_to_threshold = false
+    publication.decision = decision
+    return decision
+end
+
+@inline function _shed_serial_acquisition!(
+    publication::AcquisitionPublicationState,
+    decision::AcquisitionOverloadDecision)
+    _mark_serial_acquisition_overload!(publication, decision)
+    publication.products_shed += UInt64(1)
+    return 0
+end
+
+@noinline function _fail_serial_acquisition!(
+    publication::AcquisitionPublicationState,
+    decision::AcquisitionOverloadDecision,
+    reason::Symbol,
+    message::String)
+    _mark_serial_acquisition_overload!(publication, decision)
+    publication.products_failed += UInt64(1)
+    _serial_publication_error(reason, message)
+end
+
+@inline function _handle_serial_capacity_overload!(
+    policy::AcquisitionOverloadPolicy,
+    publication::AcquisitionPublicationState)
+    _serial_acquisition_may_shed(policy) &&
+        return _shed_serial_acquisition!(
+            publication, AcquisitionShedForCapacity)
+    return _fail_serial_acquisition!(
+        publication,
+        AcquisitionFailedForCapacity,
+        :acquisition_product_capacity,
+        "the prepared acquisition completion path exhausted its bounded capacity")
+end
+
+@inline function _handle_serial_deadline_overload!(
+    policy::AcquisitionOverloadPolicy,
+    publication::AcquisitionPublicationState)
+    _serial_acquisition_may_shed(policy) &&
+        return _shed_serial_acquisition!(
+            publication, AcquisitionShedForDeadline)
+    return _fail_serial_acquisition!(
+        publication,
+        AcquisitionFailedForDeadline,
+        :acquisition_publication_deadline,
+        "the acquisition product exceeded its prepared publication lateness")
+end
+
+@inline function _abort_serial_product!(
+    port::AcquisitionCompletionPort,
+    lease::PayloadLeaseRef)
+    abort_product!(port, lease) == PayloadTransitionSucceeded ||
+        _serial_publication_error(
+            :acquisition_product_reclamation,
+            "serial publication could not reclaim its producer-owned product")
+    return nothing
+end
+
 # Julia emits no coverage counter for this exercised constant dispatch leaf.
 # COV_EXCL_START
 @inline _publish_serial_products!(
@@ -836,28 +1182,72 @@ function _publish_serial_products!(
     event_state = plant_event_loop_state(state.bridge)
     sequence = acquisition_product_sequence(
         event_loop, event_state, publisher.id)
-    last_sequence = @inbounds state.published_sequences[index]
+    publication = @inbounds state.publications[index]
+    policy = publisher.port.overload_policy
+    _observe_serial_acquisition_occupancy!(
+        publication, publisher.port)
+    _maybe_record_serial_overload_recovery!(policy, publication)
+    last_sequence = publication.last_sequence
     published = 0
     if sequence != last_sequence
         sequence == last_sequence + UInt64(1) ||
             _serial_publication_error(
                 :acquisition_sequence_gap,
                 "serial publication observed an unavailable acquisition-product history")
-        lease_ref = @inbounds workspace.product_leases[index]
-        claim_status = try_claim_product!(lease_ref, publisher.port)
-        claim_status == PayloadTransitionSucceeded ||
-            _serial_publication_error(
-                :acquisition_product_capacity,
-                "no prepared acquisition-product buffer was available")
-        lease = lease_ref[]
-        destination = producer_product(publisher.port, lease)
-        _copy_serial_acquisition_products!(
-            destination, publisher.source)
+        publication.last_sequence = sequence
         timestamp = acquisition_product_ready_timestamp(
             event_loop, event_state, publisher.id)
         timestamp === nothing && _serial_publication_error(
             :missing_acquisition_timestamp,
             "a sequenced acquisition product has no readiness timestamp")
+        lateness_ns = _record_serial_acquisition_lateness!(
+            publication,
+            execution_lateness_ns(
+                armed.timing, timestamp, publication_execution_ns))
+        _maybe_record_serial_overload_recovery!(policy, publication)
+        maximum_lateness_ns = policy.maximum_lateness_ns
+        if maximum_lateness_ns !== nothing &&
+                lateness_ns > maximum_lateness_ns
+            _handle_serial_deadline_overload!(policy, publication)
+            return _publish_serial_products!(
+                Base.tail(publishers),
+                armed,
+                state,
+                workspace,
+                publication_execution_ns,
+                index + 1)
+        end
+        lease_ref = @inbounds workspace.product_leases[index]
+        claim_status = try_claim_product!(lease_ref, publisher.port)
+        if claim_status != PayloadTransitionSucceeded
+            if claim_status == PayloadPoolExhausted
+                _handle_serial_capacity_overload!(
+                    policy, publication)
+            elseif claim_status == PayloadPoolClosed
+                _fail_serial_acquisition!(
+                    publication,
+                    AcquisitionFailedForCapacity,
+                    :acquisition_publication_rejected,
+                    "the acquisition product pool was closed while the run was active")
+            else
+                _serial_publication_error(
+                    :acquisition_product_claim,
+                    "acquisition product claim returned an invalid ownership status")
+            end
+            _observe_serial_acquisition_occupancy!(
+                publication, publisher.port)
+            return _publish_serial_products!(
+                Base.tail(publishers),
+                armed,
+                state,
+                workspace,
+                publication_execution_ns,
+                index + 1)
+        end
+        lease = lease_ref[]
+        destination = producer_product(publisher.port, lease)
+        _copy_serial_acquisition_products!(
+            destination, publisher.source)
         completion = matching_acquisition_completion(
             publisher.port,
             StreamSequence(sequence),
@@ -865,17 +1255,34 @@ function _publish_serial_products!(
             lease,
             publication_execution_ns)
         result = try_publish!(publisher.port, completion)
-        if port_status(result) != PortTransferSucceeded
-            abort_product!(publisher.port, lease)
-            reason = port_status(result) == PortFull ?
-                :acquisition_completion_full :
-                :acquisition_publication_rejected
-            _serial_publication_error(
-                reason,
+        publication_status = port_status(result)
+        if publication_status == PortFull
+            if !_serial_acquisition_may_shed(policy)
+                _abort_serial_product!(publisher.port, lease)
+            end
+            _handle_serial_capacity_overload!(policy, publication)
+            _observe_serial_acquisition_occupancy!(
+                publication, publisher.port)
+            return _publish_serial_products!(
+                Base.tail(publishers),
+                armed,
+                state,
+                workspace,
+                publication_execution_ns,
+                index + 1)
+        elseif publication_status != PortTransferSucceeded
+            _abort_serial_product!(publisher.port, lease)
+            _fail_serial_acquisition!(
+                publication,
+                AcquisitionFailedForCapacity,
+                :acquisition_publication_rejected,
                 "the complete acquisition product could not be published")
         end
-        @inbounds state.published_sequences[index] = sequence
+        publication.products_published += UInt64(1)
+        publication.decision = AcquisitionProductPublished
         state.products_published += UInt64(1)
+        _observe_serial_acquisition_occupancy!(
+            publication, publisher.port)
         published = 1
     end
     return published + _publish_serial_products!(
@@ -887,6 +1294,22 @@ function _publish_serial_products!(
         index + 1)
 end
 
+@noinline function _fail_serial_ingress_liveness!(
+    armed::ArmedSerialRun,
+    state::SerialRunState,
+    workspace::SerialRunWorkspace,
+    observed_execution_ns::Int64)
+    fail_pending_bridge_commands!(
+        armed.prepared.configuration.command_bridge,
+        state.bridge,
+        workspace.bridge,
+        observed_execution_ns)
+    throw(SerialRunError(
+        :rtc_ingress_liveness,
+        :deadline_expired,
+        "RTC-ingress-liveness observation exceeded its inclusive execution-clock deadline"))
+end
+
 function _step_serial_run!(
     armed::ArmedSerialRun,
     state::SerialRunState,
@@ -895,14 +1318,40 @@ function _step_serial_run!(
     run = armed.prepared
     configuration = run.configuration
     publication_execution_ns =
-        Clocks.time_nanos(execution_clock(armed.timing))
+        _read_execution_clock(execution_clock(armed.timing))
+    liveness_status = _observe_rtc_ingress_liveness!(
+        state.ingress_liveness,
+        execution_clock_identity(armed.timing),
+        publication_execution_ns)
+    liveness_status == RTCIngressLivenessExpired &&
+        _fail_serial_ingress_liveness!(
+            armed, state, workspace, publication_execution_ns)
     command_result = process_next_command!(
         configuration.command_bridge,
         state.bridge,
         workspace.bridge,
         publication_execution_ns)
-    command_status = port_status(command_result)
+    command_status = port_status(
+        command_processing_port_result(command_result))
     if command_status == PortTransferSucceeded
+        admission_execution_ns =
+            _read_execution_clock(execution_clock(armed.timing))
+        if command_processing_stage(command_result) ==
+                CommandSemanticallyAdmitted
+            liveness_status = _admit_rtc_ingress_liveness!(
+                state.ingress_liveness,
+                command_processing_endpoint(command_result),
+                execution_clock_identity(armed.timing),
+                admission_execution_ns)
+        else
+            liveness_status = _observe_rtc_ingress_liveness!(
+                state.ingress_liveness,
+                execution_clock_identity(armed.timing),
+                admission_execution_ns)
+        end
+        liveness_status == RTCIngressLivenessExpired &&
+            _fail_serial_ingress_liveness!(
+                armed, state, workspace, admission_execution_ns)
         descriptor = workspace.bridge.descriptor_scratch[]
         timestamp = descriptor.submission.timing.receive_timestamp
         return SerialStepResult(
@@ -932,7 +1381,7 @@ function _step_serial_run!(
         :event_timestamp_mismatch,
         "the prepared event loop did not process its advertised timestamp")
     publication_execution_ns =
-        Clocks.time_nanos(execution_clock(armed.timing))
+        _read_execution_clock(execution_clock(armed.timing))
     publish_command_dispositions!(
         configuration.command_bridge,
         state.bridge,
@@ -997,7 +1446,7 @@ function step_serial_run!(running::RunningSerialRun)
             running.armed,
             state,
             workspace,
-            run.execution)
+            running.armed.execution)
     catch error
         _record_serial_failure!(running, error)
         rethrow()
@@ -1005,6 +1454,7 @@ function step_serial_run!(running::RunningSerialRun)
 end
 
 public SerialRunState, SerialRunWorkspace
+public AcquisitionPublicationState
 public AcquisitionPortAccounting
 
 end

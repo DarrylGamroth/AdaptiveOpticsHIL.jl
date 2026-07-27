@@ -8,7 +8,7 @@ AdaptiveOpticsSim = "002fb5eb-ad68-44a0-adbe-b299bfc2febc"
 Clocks = "6b5ade5d-6e95-4584-b343-73eec2e8782b"
 
 [sources]
-AdaptiveOpticsSim = {url = "https://github.com/DarrylGamroth/AdaptiveOpticsSim.jl.git", rev = "2957a666147f2ef83543de25ac637c14ae83ef09"}
+AdaptiveOpticsSim = {url = "https://github.com/DarrylGamroth/AdaptiveOpticsSim.jl.git", rev = "6e97bbe6d70b20c251a53cd925f5a4702fe96e42"}
 Clocks = {url = "https://github.com/DarrylGamroth/Clocks.jl.git", rev = "1b705421648b70b6d171f8a95d6c2d16c2444d0b"}
 
 [compat]

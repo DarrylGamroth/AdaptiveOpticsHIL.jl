@@ -360,6 +360,25 @@ function execution_lateness_ns(mapping::ExecutionClockMapping,
 end
 
 """
+    execution_lateness_ns(mapping, target, observed_execution_ns)
+
+Return signed lateness at one already captured reading of the mapping's
+execution clock. This overload does not read the clock and is suitable when
+one publication coordinate must be shared by several bounded decisions.
+"""
+function execution_lateness_ns(
+    mapping::ExecutionClockMapping,
+    target::PlantTimestamp,
+    observed_execution_ns::Int64)
+    target_elapsed_ns = _target_elapsed_ns(mapping, target)
+    elapsed_ns = _checked_execution_elapsed_ns(
+        mapping.execution_origin_ns,
+        observed_execution_ns,
+        :execution_clock)
+    return elapsed_ns - target_elapsed_ns
+end
+
+"""
     execution_time_until_ns(mapping, target)
 
 Return signed execution time until plant `target`, in nanoseconds. A positive

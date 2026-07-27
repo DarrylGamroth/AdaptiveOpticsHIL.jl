@@ -10,8 +10,8 @@ include("errors.jl")
 include("timing.jl")
 include("ownership.jl")
 include("lifecycle.jl")
-include("execution.jl")
 include("ports.jl")
+include("execution.jl")
 include("serial.jl")
 
 export AdaptiveOpticsHILError, Execution, Lifecycle, Ownership, Ports, Serial

@@ -26,14 +26,14 @@ acquisition_completion_publication_ns(value::AcquisitionCompletion) =
 struct AcquisitionCompletionPort{
     P,
     C<:AcquisitionProductContract,
-    F<:AbstractPortFullPolicy}
+    O<:AcquisitionOverloadPolicy}
     session::RunSessionID
     descriptor_schema_id::PortSchemaID
     descriptor_schema_version::PortSchemaVersion
     acquisition::AcquisitionID
     product_contract::C
     delivery_contract::AdapterDeliveryContract
-    full_policy::F
+    overload_policy::O
     ring::SPSCDescriptorRing{AcquisitionCompletion}
     product_pool::PayloadPool{P}
 end
@@ -129,6 +129,33 @@ function _validate_acquisition_full_policy(
         "acquisition completion supports retain-producer or drop-newest full behavior"))
 end
 
+@inline _validate_acquisition_criticality(
+    ::AcquisitionOverloadPolicy) = nothing
+
+function _validate_acquisition_criticality(
+    ::AcquisitionOverloadPolicy{
+        RequiredResource,
+        DropNewestOnFull,
+    })
+    throw(PortError(
+        :acquisition_completion,
+        :required_resource_cannot_drop,
+        "a required acquisition resource cannot use drop-newest behavior"))
+end
+
+@inline function _validate_acquisition_overload_policy(
+    policy::AcquisitionOverloadPolicy,
+    maximum_outstanding::Int)
+    _validate_acquisition_full_policy(policy.full_policy)
+    _validate_acquisition_criticality(policy)
+    policy.recovery_occupancy < maximum_outstanding ||
+        throw(PortError(
+            :acquisition_completion,
+            :invalid_recovery_occupancy,
+            "overload recovery occupancy must be lower than the prepared overload threshold"))
+    return policy
+end
+
 """
     prepare_acquisition_completion_port(acquisition, products; ...)
 
@@ -148,8 +175,7 @@ function prepare_acquisition_completion_port(
         PortSchemaID(:acquisition_completion),
     descriptor_schema_version::PortSchemaVersion=PortSchemaVersion(1),
     delivery_contract::AdapterDeliveryContract,
-    full_policy::AbstractPortFullPolicy=
-        RetainProducerOnFull()) where {
+    overload_policy::AcquisitionOverloadPolicy) where {
     P<:AcquisitionProducts}
     isempty(products) && throw(PortError(
         :acquisition_completion, :invalid_product_capacity,
@@ -164,7 +190,10 @@ function prepare_acquisition_completion_port(
     _validate_distinct_acquisition_products(products)
     checked_ring_capacity =
         _checked_port_capacity(ring_capacity, :acquisition_completion)
-    _validate_acquisition_full_policy(full_policy)
+    maximum_outstanding = min(
+        checked_ring_capacity, length(products))
+    _validate_acquisition_overload_policy(
+        overload_policy, maximum_outstanding)
     pool = PayloadPool(
         products,
         product_pool_id,
@@ -177,7 +206,7 @@ function prepare_acquisition_completion_port(
         acquisition,
         contract,
         delivery_contract,
-        full_policy,
+        overload_policy,
         SPSCDescriptorRing{AcquisitionCompletion}(checked_ring_capacity),
         pool)
 end
@@ -186,13 +215,24 @@ acquisition_delivery_contract(port::AcquisitionCompletionPort) =
     port.delivery_contract
 acquisition_product_contract(port::AcquisitionCompletionPort) =
     port.product_contract
+acquisition_overload_policy(port::AcquisitionCompletionPort) =
+    port.overload_policy
+resource_criticality(port::AcquisitionCompletionPort) =
+    resource_criticality(port.overload_policy)
+maximum_resource_lateness_ns(port::AcquisitionCompletionPort) =
+    maximum_resource_lateness_ns(port.overload_policy)
+overload_recovery_occupancy(port::AcquisitionCompletionPort) =
+    overload_recovery_occupancy(port.overload_policy)
+@inline resource_is_required(port::AcquisitionCompletionPort) =
+    resource_is_required(port.overload_policy)
 
 function port_resource_policy(port::AcquisitionCompletionPort)
     capacity = ring_capacity(port.ring)
     maximum = min(
         capacity,
         payload_pool_capacity(port.product_pool))
-    return PortResourcePolicy(capacity, maximum, port.full_policy)
+    return PortResourcePolicy(
+        capacity, maximum, port.overload_policy.full_policy)
 end
 
 """
@@ -284,7 +324,7 @@ function try_publish!(
     ring_status = _producer_submission_status(port.ring)
     if ring_status != RingTransferSucceeded
         return _acquisition_publication_failure!(
-            port.full_policy,
+            port.overload_policy.full_policy,
             port,
             completion.product_lease,
             ring_status)
