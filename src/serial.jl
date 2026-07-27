@@ -339,7 +339,9 @@ function serial_run_is_quiescent(accounting::SerialRunAccounting)
         _acquisitions_are_quiescent(accounting.acquisitions)
 end
 
-@inline _reclaim_serial_command_payload_returns!(
+# Direct dispatch tests cover these inlined recursion leaves, but Julia's
+# coverage instrumentation does not retain a source counter for either line.
+@inline _reclaim_serial_command_payload_returns!( # COV_EXCL_LINE
     ::CommandSubmissionPort{<:InlineCommandPayload}) = 0
 
 @inline function _reclaim_serial_command_payload_returns!(
@@ -347,7 +349,7 @@ end
     return reclaim_command_payload_returns!(port).count
 end
 
-@inline _reclaim_serial_acquisition_returns!(::Tuple{}) = 0
+@inline _reclaim_serial_acquisition_returns!(::Tuple{}) = 0 # COV_EXCL_LINE
 
 @inline function _reclaim_serial_acquisition_returns!(publishers::Tuple)
     return reclaim_product_returns!(first(publishers).port).count +

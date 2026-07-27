@@ -160,8 +160,8 @@ end
     _lease_return_policy(pool)
 
 @inline _optional_return_lifecycle(::Nothing) = nothing
-@inline _optional_return_lifecycle(pool::PayloadPool) =
-    _return_lifecycle_state(pool) # COV_EXCL_LINE
+@inline _optional_return_lifecycle(pool::PayloadPool) = # COV_EXCL_LINE
+    _return_lifecycle_state(pool)
 
 @inline _optional_payload_deficit(::Nothing) = nothing # COV_EXCL_LINE
 @inline _optional_payload_deficit(pool::PayloadPool) =
