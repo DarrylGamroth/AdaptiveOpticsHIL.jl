@@ -1,4 +1,5 @@
 using AdaptiveOpticsHIL.Lifecycle
+using AdaptiveOpticsHIL.Execution
 using AdaptiveOpticsHIL.Ownership
 using AdaptiveOpticsHIL.Ports
 using AdaptiveOpticsHIL.Serial
@@ -29,6 +30,7 @@ using AdaptiveOpticsSim.Plant: prepare_pupil_opd_materialization
 using AdaptiveOpticsSim.Plant: prepared_acquisition
 using AdaptiveOpticsSim.Plant: prepared_command_endpoint
 using Clocks
+using LinearAlgebra: BLAS
 
 const SERIAL_TEST_PLANT = AdaptiveOpticsSim.Plant
 const SERIAL_TESTS_WITH_COVERAGE =
@@ -36,6 +38,35 @@ const SERIAL_TESTS_WITH_COVERAGE =
 const SERIAL_IDENTITY_2X2 = [1.0 0.0; 0.0 1.0]
 const SERIAL_DUE_STEP_ALLOCATION_BUDGET = 2_048
 const SERIAL_COMMAND_STEP_ALLOCATION_BUDGET = 2_048
+
+function serial_test_execution_owner_configuration(
+    mode::AbstractExecutionOwnerMode;
+    outer_owner_count::Integer=1,
+)
+    julia_threads = Threads.nthreads()
+    blas_threads = BLAS.get_num_threads()
+    fft_threads = 1
+    contexts = max(
+        julia_threads,
+        Int(outer_owner_count) * fft_threads,
+        Int(outer_owner_count) * blas_threads,
+    )
+    budget = SERIAL_TEST_PLANT.grouped_cpu_execution_budget(
+        cpu_context_count=contexts,
+        julia_thread_count=julia_threads,
+        outer_owner_count=outer_owner_count,
+        group_julia_thread_count=1,
+        fft_thread_count=fft_threads,
+        blas_thread_count=blas_threads,
+    )
+    environment = SERIAL_TEST_PLANT.CPUExecutionEnvironment(
+        available_cpu_context_count=contexts,
+        julia_thread_count=julia_threads,
+        fft_thread_count=fft_threads,
+        blas_thread_count=blas_threads,
+    )
+    return ExecutionOwnerConfiguration(mode, budget, environment)
+end
 
 mutable struct MutableIdentityNanoClock <: Clocks.AbstractNanoClock
     value::Int64
@@ -335,6 +366,7 @@ function serial_test_fixture(;
     product_ring_capacity=product_capacity,
     session=RunSessionID(0x7c00),
     arm_timeout_ns=10_000_000,
+    optical_execution=SerialOpticalExecution(),
     arm=true,
     start=true)
     core = serial_test_plant()
@@ -370,6 +402,7 @@ function serial_test_fixture(;
     configuration = configure_serial_run(
         bridge,
         (wfs_port, feedback_port);
+        optical_execution,
         arm_timeout_ns)
     run = prepare_serial_run(configuration)
     clock = CachedNanoClock(0)
@@ -540,8 +573,9 @@ function run_fake_rtc(;
     frame_count=36,
     sign=-1.0,
     delay_frames=0,
-    processing_ns=1)
-    fixture = serial_test_fixture()
+    processing_ns=1,
+    optical_execution=SerialOpticalExecution())
+    fixture = serial_test_fixture(; optical_execution)
     trace = fake_rtc_trace()
     command = zeros(Float64, 2)
     iterations = 0
@@ -610,8 +644,8 @@ function warm_serial_wait_allocations(fixture)
 end
 
 function prepare_first_wfs_publication!(fixture)
-    first = step_serial_run!(fixture.running)
-    @assert serial_step_status(first) ==
+    first_step = step_serial_run!(fixture.running)
+    @assert serial_step_status(first_step) ==
         SerialPlantEventProcessed
     pending = step_serial_run!(fixture.running)
     @assert serial_step_status(pending) ==
@@ -729,10 +763,10 @@ end
             prepared_command_endpoint(fixture.plant, :hil_dm))
         @test command_bridge_event_loop(direct_bridge) === nothing
 
-        first = @inferred step_serial_run!(fixture.running)
-        @test serial_step_status(first) ==
+        first_step = @inferred step_serial_run!(fixture.running)
+        @test serial_step_status(first_step) ==
             SerialPlantEventProcessed
-        @test serial_step_timestamp(first) == PlantTimestamp(0)
+        @test serial_step_timestamp(first_step) == PlantTimestamp(0)
         pending = @inferred step_serial_run!(fixture.running)
         @test serial_step_status(pending) ==
             SerialDeadlinePending
@@ -888,6 +922,156 @@ end
         @test overtaken_origin.reason ==
             :plant_origin_after_next_event
         @test run_phase(origin_fixture.run) == RunPrepared
+    end
+
+    @testset "Prepared execution-owner policy" begin
+        @test Base.isexported(AdaptiveOpticsHIL, :Execution)
+        @test !Base.isexported(
+            AdaptiveOpticsHIL, :PreparedExecutionOwnerExecutor)
+
+        mode = DeterministicExecutionOwners()
+        owner_configuration =
+            serial_test_execution_owner_configuration(mode)
+        fixture = serial_test_fixture(;
+            optical_execution=owner_configuration)
+        executor = @inferred serial_optical_execution(fixture.run)
+        @test executor isa PreparedExecutionOwnerExecutor
+        @test serial_optical_execution_configuration(
+            fixture.configuration) === owner_configuration
+        @test serial_optical_execution_configuration(
+            fixture.run) === owner_configuration
+        @test execution_owner_mode(executor) === mode
+        @test execution_owner_idle_policy(executor) === nothing
+        @test execution_cpu_budget(executor) ===
+            owner_configuration.cpu_budget
+        @test execution_cpu_environment(executor) ===
+            owner_configuration.cpu_environment
+        @test execution_owner_ring_capacity(executor) == 1
+        @test execution_owner_count(executor) == 1
+        @test execution_owners_phase(executor) ==
+            ExecutionOwnersRunning
+        @test execution_batches_completed(executor) == 0
+
+        owner = @inferred execution_owner(executor, 1)
+        @test execution_owner_id(owner) == ExecutionOwnerID(1)
+        @test execution_owner_id_value(execution_owner_id(owner)) == 1
+        @test sprint(show, execution_owner_id(owner)) ==
+            "ExecutionOwnerID(1)"
+        @test execution_owner_kind(owner) ==
+            PathGroupExecutionOwner
+        @test execution_owner_backend(owner) == CPUBackend()
+        @test execution_owner_compute_device(owner) ==
+            AdaptiveOpticsSim.HostComputeDevice()
+        @test execution_owner_group_count(owner) == 1
+        @test execution_owner_group_ordinal(owner, 1) == 1
+        @test_throws BoundsError execution_owner(executor, 0)
+        @test_throws BoundsError execution_owner_group_ordinal(owner, 2)
+
+        before = execution_owner_accounting(executor, 1)
+        @test before.work_submitted == 0
+        @test before.work_taken == 0
+        @test before.work_completed == 0
+        @test before.completions_taken == 0
+        @test execution_owners_are_quiescent(executor)
+        before_run_accounting =
+            serial_run_accounting(fixture.run)
+        @test length(before_run_accounting.execution_owners) == 1
+        @test first(
+            before_run_accounting.execution_owners).work_submitted == 0
+        @test serial_run_is_quiescent(before_run_accounting)
+
+        first_step = @inferred step_serial_run!(fixture.running)
+        @test serial_step_status(first_step) ==
+            SerialPlantEventProcessed
+        @test serial_step_timestamp(first_step) == PlantTimestamp(0)
+        after = execution_owner_accounting(executor, 1)
+        @test after.work_submitted == 2
+        @test after.work_taken == 2
+        @test after.work_completed == 2
+        @test after.completions_taken == 2
+        @test !after.failed
+        @test iszero(after.task_id)
+        @test after.last_thread_id == Threads.threadid()
+        @test execution_batches_completed(executor) == 1
+        @test execution_owners_are_quiescent(executor)
+        after_run_accounting = serial_run_accounting(fixture.run)
+        @test first(
+            after_run_accounting.execution_owners).work_submitted == 2
+        @test serial_run_is_quiescent(after_run_accounting)
+
+        request = RunStopRequest(
+            run_session(fixture.run),
+            execution_clock_identity(fixture.armed.timing),
+            Clocks.time_nanos(fixture.clock))
+        stopped_run_accounting =
+            stop_serial_run!(fixture.running, request)
+        @test execution_owners_phase(executor) ==
+            ExecutionOwnersStopped
+        stopped = execution_owner_accounting(executor, 1)
+        @test stopped.due.closed
+        @test stopped.completion.closed
+        @test stopped.stop_acknowledged
+        @test execution_owners_are_quiescent(executor)
+        stopped_run_owner =
+            first(stopped_run_accounting.execution_owners)
+        @test stopped_run_owner.stop_acknowledged
+        @test stopped_run_owner.due.closed
+
+        invalid_execution = captured_serial_error() do
+            serial_test_fixture(
+                optical_execution=:not_an_execution_policy,
+                arm=false,
+                start=false)
+        end
+        @test invalid_execution isa SerialRunError
+        @test invalid_execution.reason ==
+            :invalid_optical_execution
+
+        serial_oracle = run_fake_rtc(frame_count=8)
+        owner_oracle = run_fake_rtc(
+            frame_count=8;
+            optical_execution=owner_configuration)
+        @test owner_oracle.trace == serial_oracle.trace
+        @test serial_run_accounting(
+            serial_oracle.fixture.run).execution_owners === nothing
+        @test run_phase(owner_oracle.fixture.run) == RunStopped
+        @test execution_owners_phase(serial_optical_execution(
+            owner_oracle.fixture.run)) == ExecutionOwnersStopped
+
+        threaded_configuration =
+            serial_test_execution_owner_configuration(
+                ThreadedExecutionOwners();
+                outer_owner_count=1,
+            )
+        threaded_fixture = serial_test_fixture(
+            optical_execution=threaded_configuration)
+        threaded_executor =
+            serial_optical_execution(threaded_fixture.run)
+        @test execution_owners_phase(threaded_executor) ==
+            ExecutionOwnersRunning
+        threaded_before =
+            execution_owner_accounting(threaded_executor, 1)
+        @test threaded_before.startup_acknowledged
+        @test !iszero(threaded_before.task_id)
+        @test serial_step_status(step_serial_run!(
+            threaded_fixture.running)) ==
+            SerialPlantEventProcessed
+        threaded_after =
+            execution_owner_accounting(threaded_executor, 1)
+        @test threaded_after.task_id == threaded_before.task_id
+        threaded_request = RunStopRequest(
+            run_session(threaded_fixture.run),
+            execution_clock_identity(threaded_fixture.armed.timing),
+            Clocks.time_nanos(threaded_fixture.clock))
+        threaded_stopped_accounting = stop_serial_run!(
+            threaded_fixture.running, threaded_request)
+        @test execution_owners_phase(threaded_executor) ==
+            ExecutionOwnersStopped
+        @test execution_owner_accounting(
+            threaded_executor, 1).stop_acknowledged
+        threaded_stopped_owner =
+            first(threaded_stopped_accounting.execution_owners)
+        @test threaded_stopped_owner.stop_acknowledged
     end
 
     @testset "Composition and lifecycle rejection" begin
@@ -1069,7 +1253,8 @@ end
             nothing,
             accounting.command_dispositions,
             accounting.active_command_correlations,
-            accounting.acquisitions)
+            accounting.acquisitions,
+            accounting.execution_owners)
         @test serial_run_is_quiescent(inline_accounting)
     end
 

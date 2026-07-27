@@ -79,6 +79,41 @@ and remains visible in bounded deficit accounting.
 
 These are intentionally low-level foundations, not RTC transport APIs.
 
+## Prepared optical execution owners
+
+`AdaptiveOpticsHIL.Execution` binds the core's prepared optical path groups to
+fixed HIL execution owners. Every owner has a stable run-local identity, exact
+path-group/product slots, one bounded SPSC due-work ring, and one bounded SPSC
+completion ring. A compatible core device batch remains one owner on its exact
+prepared backend and compute device; descriptors never copy optical products
+through host storage.
+
+The default `SerialOpticalExecution()` retains
+`AdaptiveOpticsSim.Plant.SerialOpticalPathBatchExecutor` as the canonical
+oracle. An explicit `ExecutionOwnerConfiguration` selects either:
+
+- `DeterministicExecutionOwners()`, which drives the same bounded owner paths
+  synchronously and can vary completion order without creating tasks; or
+- `ThreadedExecutionOwners()`, which creates one long-lived Julia task per
+  owner during arm and reuses it until nominal stop.
+
+Threaded owners use an explicit yielding or bounded spin/yield idle policy.
+They are not pinned, may migrate between Julia threads, and do not pace the
+plant. Preparation validates a declared core `CPUExecutionBudget` against an
+observed `CPUExecutionEnvironment` without changing Julia, FFT, or BLAS thread
+settings.
+
+The HIL coordinator remains the sole plant-timeline and atmosphere writer. For
+each due timestamp it performs the core
+begin → materialize → seal → execute → complete contract, so independently
+owned WFS and optional science paths may execute concurrently only after all
+current-epoch inputs are materialized. Nominal stop closes every owner input,
+collects one stop acknowledgement per owner, joins threaded tasks, and verifies
+empty ring/accounting state. `serial_run_accounting` includes a cold snapshot
+of these owners alongside port, pool, and lease accounting. Coordinated
+first-failure publication, recovery, and deadline-bounded failure drain remain
+later Gate 8 work.
+
 ## RTC-facing ports
 
 `AdaptiveOpticsHIL.Ports` composes the bounded primitives into three canonical
@@ -151,15 +186,17 @@ Configuration derives the exact event loop from the command bridge and freezes
 the serial topology and policies; it accepts no independent plant/event-loop
 pair that could be mixed. Preparation resolves product sources from that same
 event loop and allocates the command state, acquisition sequence state, and
-workspaces without reading the clock, starting workers, or accepting traffic.
+workspaces without reading the clock or accepting traffic. An explicitly
+configured threaded execution policy creates one task per already-prepared,
+stable owner only during arm.
 Runtime handles retain the exact prepared run, so state and workspace from
 different runs cannot be combined. Clean stop requires quiescent current
 resources and records either a typed request or terminal event; runtime errors
 record failed termination. The accepted readiness snapshot is retained once
 in lifecycle state rather than copied into each product descriptor.
-Coordinated port closure, owner acknowledgement, bounded drain, and
-ownership-deficit finalization remain later Gate 8 work and are not claimed by
-this phase.
+Coordinated port closure, preallocated first-failure publication,
+deadline-bounded failure drain, and ownership-deficit finalization remain later
+Gate 8 work and are not claimed by this phase.
 
 The current core serial event loop exposes no prepared nonstructural
 acquisition, trigger, shutter, calibration-source, or optic-mode control seam,
@@ -174,17 +211,20 @@ nonempty tuple of acquisition-completion ports. Arming captures one immutable
 execution-clock mapping only after lifecycle validation; it does not add
 wall-clock state to AdaptiveOpticsSim.
 
-Each `step_serial_run!` call makes one bounded, nonblocking decision:
+Each `step_serial_run!` call makes one bounded scheduling decision:
 
 - process at most one already-transferred command;
 - report the time remaining until the next plant event; or
 - process one complete plant timestamp, publish terminal command outcomes, and
   copy each newly complete acquisition into its prepared product pool.
 
-The runtime never sleeps, retries, polls, invokes callbacks, starts workers, or
-chooses placement or transport. A caller may advance a `CachedNanoClock`
-exactly in deterministic tests or apply its own idle policy around a
-`SystemNanoClock` in production.
+The step call never sleeps for a pending deadline, invokes callbacks, creates
+tasks, or chooses transport. The default serial executor starts no workers.
+With an explicit threaded owner policy, an optical event waits at its prepared
+materialization and execution barriers while the coordinator and already-armed
+tasks poll only their bounded owner rings according to the selected idle
+policy. A caller may advance a `CachedNanoClock` exactly in deterministic tests
+or apply its own pacing policy around a `SystemNanoClock` in production.
 
 Sampled actuator/device feedback is simply another independently scheduled
 acquisition-completion stream. It does not share command cadence and never
@@ -243,6 +283,7 @@ contracts live in the AdaptiveOpticsSim specifications:
 - [HIL package boundaries](https://github.com/DarrylGamroth/AdaptiveOpticsSim.jl/blob/main/docs/hil/package-boundaries.md)
 - [HIL time, scheduling, and causality](https://github.com/DarrylGamroth/AdaptiveOpticsSim.jl/blob/main/docs/hil/time-and-scheduling.md)
 - [HIL RTC ports and bounded handoffs](https://github.com/DarrylGamroth/AdaptiveOpticsSim.jl/blob/main/docs/hil/rtc-ports.md)
+- [HIL execution and placement](https://github.com/DarrylGamroth/AdaptiveOpticsSim.jl/blob/main/docs/hil/execution-and-placement.md)
 - [HIL validation and acceptance](https://github.com/DarrylGamroth/AdaptiveOpticsSim.jl/blob/main/docs/hil/validation.md)
 
 Requires Julia 1.12 or newer.

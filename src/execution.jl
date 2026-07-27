@@ -1,0 +1,1655 @@
+"""
+    Execution
+
+Prepared, transport-neutral execution ownership for optical path groups.
+Core retains the deterministic plant, path-local products, numerical plans,
+and device contexts. This namespace adds fixed owner identity, bounded SPSC
+due/completion handoffs, explicit CPU admission, and optional long-lived Julia
+tasks. It does not choose placement, pin threads, move products between memory
+domains, sleep, or create one task per event.
+"""
+module Execution
+
+import AdaptiveOpticsSim.Plant
+
+using AdaptiveOpticsSim: AbstractArrayBackend, AbstractComputeDevice
+using AdaptiveOpticsSim: CPUBackend
+using AdaptiveOpticsSim.Plant: AbstractOpticalPathBatchExecutor
+using AdaptiveOpticsSim.Plant: CPUExecutionBudget, CPUExecutionEnvironment
+using AdaptiveOpticsSim.Plant: OpticalPathBatchClaim
+using AdaptiveOpticsSim.Plant: PlantEventLoopState, PlantEventLoopWorkspace
+using AdaptiveOpticsSim.Plant: PlantTimestamp, PreparedPlantEventLoop
+using AdaptiveOpticsSim.Plant: SerialOpticalPathBatchExecutor
+using AdaptiveOpticsSim.Plant: begin_optical_path_batch!
+using AdaptiveOpticsSim.Plant: complete_optical_path_batch!
+using AdaptiveOpticsSim.Plant: device_path_batch_backend
+using AdaptiveOpticsSim.Plant: device_path_batch_compute_device
+using AdaptiveOpticsSim.Plant: device_path_batch_group_count
+using AdaptiveOpticsSim.Plant: device_path_batch_group_ordinal
+using AdaptiveOpticsSim.Plant: device_path_batch_owner
+using AdaptiveOpticsSim.Plant: execute_device_path_batch!
+using AdaptiveOpticsSim.Plant: execute_path_execution_group!
+using AdaptiveOpticsSim.Plant: materialize_device_path_batch!
+using AdaptiveOpticsSim.Plant: materialize_path_execution_group!
+using AdaptiveOpticsSim.Plant: optical_path_batch_due_group_count
+using AdaptiveOpticsSim.Plant: optical_path_batch_due_group_ordinal
+using AdaptiveOpticsSim.Plant: path_execution_backend
+using AdaptiveOpticsSim.Plant: path_execution_compute_device
+using AdaptiveOpticsSim.Plant: path_execution_group
+using AdaptiveOpticsSim.Plant: path_execution_group_count
+using AdaptiveOpticsSim.Plant: path_execution_group_device_batch_owner_ordinal
+using AdaptiveOpticsSim.Plant: path_execution_group_requirements
+using AdaptiveOpticsSim.Plant: seal_optical_path_batch_materialization!
+using AdaptiveOpticsSim.Plant: validate_cpu_execution_budget
+
+import ..AdaptiveOpticsHIL: AdaptiveOpticsHILError
+using ..Lifecycle: RunSessionID
+using ..Ownership: RingAccounting, RingClosed, RingEmpty, RingFull
+using ..Ownership: RingTransferSucceeded, SPSCDescriptorRing
+using ..Ownership: close_ring!, ring_accounting
+using ..Ownership: try_submit!, try_take!
+
+export ExecutionOwnerError
+export AbstractOpticalExecutionConfiguration, SerialOpticalExecution
+export AbstractExecutionOwnerMode
+export DeterministicExecutionOwners, ThreadedExecutionOwners
+export AbstractExecutionOwnerIdlePolicy
+export YieldingExecutionOwnerIdle, HybridExecutionOwnerIdle
+export ExecutionOwnerConfiguration
+export ExecutionOwnerID, execution_owner_id_value
+export ExecutionOwnerKind, PathGroupExecutionOwner, DeviceBatchExecutionOwner
+export ExecutionOwnersPhase, ExecutionOwnersPrepared, ExecutionOwnersArmed
+export ExecutionOwnersRunning, ExecutionOwnersStopped, ExecutionOwnersFailed
+export PreparedExecutionOwner, PreparedExecutionOwnerExecutor
+export execution_owner_count, execution_owner
+export execution_owner_id, execution_owner_kind
+export execution_owner_backend, execution_owner_compute_device
+export execution_owner_group_count, execution_owner_group_ordinal
+export execution_owner_mode, execution_owner_idle_policy
+export execution_cpu_budget, execution_cpu_environment
+export execution_owner_ring_capacity, execution_owners_phase
+export execution_batches_completed
+export ExecutionOwnerAccounting, execution_owner_accounting
+export execution_owners_are_quiescent
+
+"""Invalid execution-owner configuration, ownership, or lifecycle operation."""
+struct ExecutionOwnerError <: AdaptiveOpticsHILError
+    component::Symbol
+    reason::Symbol
+    msg::String
+end
+
+@noinline function _execution_owner_error(
+    reason::Symbol,
+    message::AbstractString,
+)
+    throw(ExecutionOwnerError(
+        :execution_owners,
+        reason,
+        String(message),
+    ))
+end
+
+"""
+Configuration policy resolved while preparing one serial run.
+
+`SerialOpticalExecution` preserves the canonical core serial oracle.
+`ExecutionOwnerConfiguration` prepares bounded execution owners.
+"""
+abstract type AbstractOpticalExecutionConfiguration end
+
+"""Use the core's canonical deterministic serial path-batch executor."""
+struct SerialOpticalExecution <: AbstractOpticalExecutionConfiguration end
+
+"""Prepared owner-service policy."""
+abstract type AbstractExecutionOwnerMode end
+
+"""
+Service prepared owner rings synchronously from the coordinator.
+
+Every group retains a distinct logical writer and bounded due/completion path,
+but no Julia worker task is created. `alternate_order=true` reverses successive
+materialization and execution service orders to exercise order independence
+while retaining deterministic replay.
+"""
+struct DeterministicExecutionOwners <: AbstractExecutionOwnerMode
+    alternate_order::Bool
+end
+
+DeterministicExecutionOwners(; alternate_order::Bool=true) =
+    DeterministicExecutionOwners(alternate_order)
+
+"""Idle behavior for a long-lived execution-owner task."""
+abstract type AbstractExecutionOwnerIdlePolicy end
+
+"""Yield the current Julia task whenever its owner ring is empty."""
+struct YieldingExecutionOwnerIdle <: AbstractExecutionOwnerIdlePolicy end
+
+"""
+Poll for `spin_count` empty observations, then yield once.
+
+This is a bounded cooperative hybrid. Pure unbounded spin is deliberately not
+offered before a deployment has separately established thread affinity and a
+reserved coordinator context.
+"""
+struct HybridExecutionOwnerIdle <: AbstractExecutionOwnerIdlePolicy
+    spin_count::UInt32
+
+    function HybridExecutionOwnerIdle(spin_count::UInt32)
+        iszero(spin_count) && _execution_owner_error(
+            :invalid_idle_policy,
+            "hybrid idle spin count must be positive",
+        )
+        return new(spin_count)
+    end
+end
+
+function HybridExecutionOwnerIdle(spin_count::Integer)
+    spin_count > 0 || _execution_owner_error(
+        :invalid_idle_policy,
+        "hybrid idle spin count must be positive",
+    )
+    spin_count <= typemax(UInt32) || _execution_owner_error(
+        :invalid_idle_policy,
+        "hybrid idle spin count exceeds UInt32 range",
+    )
+    return HybridExecutionOwnerIdle(UInt32(spin_count))
+end
+
+HybridExecutionOwnerIdle(::Bool) = _execution_owner_error(
+    :invalid_idle_policy,
+    "hybrid idle spin count must be an integer count, not Bool",
+)
+
+"""
+Run every prepared execution owner in one long-lived Julia task.
+
+The task may migrate between Julia threads; this mode makes no affinity or
+ThreadPinning claim. Its prepared idle policy is applied outside the rings.
+"""
+struct ThreadedExecutionOwners{
+    P<:AbstractExecutionOwnerIdlePolicy,
+} <: AbstractExecutionOwnerMode
+    idle_policy::P
+end
+
+ThreadedExecutionOwners() =
+    ThreadedExecutionOwners(YieldingExecutionOwnerIdle())
+
+_validate_execution_owner_idle_policy(
+    ::YieldingExecutionOwnerIdle,
+) = nothing
+_validate_execution_owner_idle_policy(
+    ::HybridExecutionOwnerIdle,
+) = nothing
+
+function _validate_execution_owner_idle_policy(
+    ::AbstractExecutionOwnerIdlePolicy,
+)
+    return _execution_owner_error(
+        :unsupported_idle_policy,
+        "execution-owner idle policy is not supported",
+    )
+end
+
+_validate_execution_owner_mode(
+    ::DeterministicExecutionOwners,
+) = nothing
+
+function _validate_execution_owner_mode(
+    mode::ThreadedExecutionOwners,
+)
+    return _validate_execution_owner_idle_policy(mode.idle_policy)
+end
+
+function _validate_execution_owner_mode(
+    ::AbstractExecutionOwnerMode,
+)
+    return _execution_owner_error(
+        :unsupported_owner_mode,
+        "execution-owner mode is not supported",
+    )
+end
+
+struct _ExecutionOwnerConfigurationToken end
+const _EXECUTION_OWNER_CONFIGURATION_TOKEN =
+    _ExecutionOwnerConfigurationToken()
+
+"""
+Immutable owner-execution admission contract.
+
+The CPU budget and observed environment come from AdaptiveOpticsSim's
+HIL-neutral admission surface. Construction validates them without changing
+Julia, FFT-provider, or BLAS thread settings. `ring_capacity` bounds each
+owner's one-producer/one-consumer due and completion path.
+"""
+struct ExecutionOwnerConfiguration{
+    M<:AbstractExecutionOwnerMode,
+    B<:CPUExecutionBudget,
+} <: AbstractOpticalExecutionConfiguration
+    mode::M
+    cpu_budget::B
+    cpu_environment::CPUExecutionEnvironment
+    ring_capacity::Int
+
+    function ExecutionOwnerConfiguration(
+        mode::M,
+        cpu_budget::B,
+        cpu_environment::CPUExecutionEnvironment,
+        ring_capacity::Int,
+        ::_ExecutionOwnerConfigurationToken,
+    ) where {
+        M<:AbstractExecutionOwnerMode,
+        B<:CPUExecutionBudget,
+    }
+        return new{M,B}(
+            mode,
+            cpu_budget,
+            cpu_environment,
+            ring_capacity,
+        )
+    end
+end
+
+function _checked_execution_ring_capacity(capacity::Integer)
+    capacity > 0 || _execution_owner_error(
+        :invalid_ring_capacity,
+        "execution-owner ring capacity must be positive",
+    )
+    capacity <= typemax(Int) || _execution_owner_error(
+        :invalid_ring_capacity,
+        "execution-owner ring capacity exceeds the supported Int range",
+    )
+    return Int(capacity)
+end
+
+_checked_execution_ring_capacity(::Bool) = _execution_owner_error(
+    :invalid_ring_capacity,
+    "execution-owner ring capacity must be an integer count, not Bool",
+)
+
+function ExecutionOwnerConfiguration(
+    mode::M,
+    cpu_budget::B,
+    cpu_environment::CPUExecutionEnvironment;
+    ring_capacity::Integer=1,
+) where {
+    M<:AbstractExecutionOwnerMode,
+    B<:CPUExecutionBudget,
+}
+    _validate_execution_owner_mode(mode)
+    validate_cpu_execution_budget(cpu_budget, cpu_environment)
+    return ExecutionOwnerConfiguration(
+        mode,
+        cpu_budget,
+        cpu_environment,
+        _checked_execution_ring_capacity(ring_capacity),
+        _EXECUTION_OWNER_CONFIGURATION_TOKEN,
+    )
+end
+
+struct _ExecutionOwnerIDToken end
+const _EXECUTION_OWNER_ID_TOKEN = _ExecutionOwnerIDToken()
+
+"""Stable positive ordinal of one prepared execution owner."""
+struct ExecutionOwnerID
+    value::UInt32
+
+    ExecutionOwnerID(value::UInt32, ::_ExecutionOwnerIDToken) = new(value)
+end
+
+function ExecutionOwnerID(value::Integer)
+    value > 0 || _execution_owner_error(
+        :invalid_owner_identity,
+        "execution-owner identity must be positive",
+    )
+    value <= typemax(UInt32) || _execution_owner_error(
+        :invalid_owner_identity,
+        "execution-owner identity exceeds UInt32 range",
+    )
+    return ExecutionOwnerID(UInt32(value), _EXECUTION_OWNER_ID_TOKEN)
+end
+
+ExecutionOwnerID(::Bool) = _execution_owner_error(
+    :invalid_owner_identity,
+    "execution-owner identity must be an integer count, not Bool",
+)
+
+Base.:(==)(left::ExecutionOwnerID, right::ExecutionOwnerID) =
+    left.value == right.value
+Base.isequal(left::ExecutionOwnerID, right::ExecutionOwnerID) =
+    isequal(left.value, right.value)
+Base.hash(value::ExecutionOwnerID, seed::UInt) =
+    hash(value.value, hash(ExecutionOwnerID, seed))
+
+function Base.show(io::IO, value::ExecutionOwnerID)
+    print(io, nameof(typeof(value)), "(", value.value, ")")
+end
+
+execution_owner_id_value(value::ExecutionOwnerID) = value.value
+
+"""Fixed core target owned by one HIL execution owner."""
+@enum ExecutionOwnerKind::UInt8 begin
+    PathGroupExecutionOwner = 0x01
+    DeviceBatchExecutionOwner = 0x02
+end
+
+@enum _ExecutionOwnerWorkPhase::UInt8 begin
+    _ExecutionOwnerStartup = 0x01
+    _ExecutionOwnerMaterialization = 0x02
+    _ExecutionOwnerExecution = 0x03
+    _ExecutionOwnerStop = 0x04
+end
+
+@enum _ExecutionOwnerCompletionStatus::UInt8 begin
+    _ExecutionOwnerWorkCompleted = 0x01
+    _ExecutionOwnerWorkFailed = 0x02
+end
+
+struct _ExecutionOwnerWorkDescriptor
+    session::RunSessionID
+    owner::ExecutionOwnerID
+    batch_sequence::UInt64
+    phase::_ExecutionOwnerWorkPhase
+    claim::OpticalPathBatchClaim
+end
+
+struct _ExecutionOwnerCompletion
+    session::RunSessionID
+    owner::ExecutionOwnerID
+    batch_sequence::UInt64
+    phase::_ExecutionOwnerWorkPhase
+    status::_ExecutionOwnerCompletionStatus
+end
+
+"""
+Run-immutable execution owner.
+
+The target is either one independent path group or one exact prepared core
+device-batch owner. `group_ordinals` identifies the fixed path-local product
+slots; the descriptor rings never carry those products.
+"""
+struct PreparedExecutionOwner
+    id::ExecutionOwnerID
+    kind::ExecutionOwnerKind
+    target_ordinal::UInt32
+    group_ordinals::Memory{UInt32}
+    backend::AbstractArrayBackend
+    compute_device::AbstractComputeDevice
+    due::SPSCDescriptorRing{_ExecutionOwnerWorkDescriptor}
+    completion::SPSCDescriptorRing{_ExecutionOwnerCompletion}
+end
+
+execution_owner_id(owner::PreparedExecutionOwner) = owner.id
+execution_owner_kind(owner::PreparedExecutionOwner) = owner.kind
+execution_owner_backend(owner::PreparedExecutionOwner) = owner.backend
+execution_owner_compute_device(owner::PreparedExecutionOwner) =
+    owner.compute_device
+execution_owner_group_count(owner::PreparedExecutionOwner) =
+    length(owner.group_ordinals)
+
+function execution_owner_group_ordinal(
+    owner::PreparedExecutionOwner,
+    index::Integer,
+)
+    checkbounds(owner.group_ordinals, index)
+    return Int(@inbounds owner.group_ordinals[Int(index)])
+end
+
+@enum _ExecutionOwnerActivity::UInt8 begin
+    _ExecutionOwnerIdle = 0x01
+    _ExecutionOwnerWorking = 0x02
+    _ExecutionOwnerStoppedActivity = 0x03
+    _ExecutionOwnerFailedActivity = 0x04
+end
+
+mutable struct _ExecutionOwnerState
+    activity::_ExecutionOwnerActivity
+    active_batch_sequence::UInt64
+    work_taken::UInt64
+    work_completed::UInt64
+    task_id::UInt
+    last_thread_id::Int
+    failure::Any
+end
+
+struct _ExecutionOwnerWorkspace
+    work::Base.RefValue{_ExecutionOwnerWorkDescriptor}
+end
+
+"""Operational phase of a prepared owner executor."""
+@enum ExecutionOwnersPhase::UInt8 begin
+    ExecutionOwnersPrepared = 0x01
+    ExecutionOwnersArmed = 0x02
+    ExecutionOwnersRunning = 0x03
+    ExecutionOwnersStopped = 0x04
+    ExecutionOwnersFailed = 0x05
+end
+
+mutable struct _ExecutionCoordinatorState
+    phase::ExecutionOwnersPhase
+    batch_sequence::UInt64
+    batch_count::UInt64
+    submitted::Memory{UInt64}
+    completions::Memory{UInt64}
+    startup_acknowledged::Memory{Bool}
+    stop_acknowledged::Memory{Bool}
+end
+
+struct _ExecutionCoordinatorWorkspace
+    due_owner_ordinals::Memory{UInt32}
+    owner_due::Memory{Bool}
+    completion_seen::Memory{Bool}
+    completions::Memory{Base.RefValue{_ExecutionOwnerCompletion}}
+end
+
+"""
+Prepared bounded owner executor accepted by the core path-batch policy seam.
+
+The object retains exact state/workspace identity, so it cannot be mixed with
+another prepared serial run. Worker tasks are created only while arming a
+threaded mode and remain stable until nominal stop.
+"""
+struct PreparedExecutionOwnerExecutor{
+    M<:AbstractExecutionOwnerMode,
+    B<:CPUExecutionBudget,
+    P<:PreparedPlantEventLoop,
+    S<:PlantEventLoopState,
+    W<:PlantEventLoopWorkspace,
+} <: AbstractOpticalPathBatchExecutor
+    session::RunSessionID
+    prepared::P
+    state::S
+    workspace::W
+    owners::Memory{PreparedExecutionOwner}
+    group_owner_ordinals::Memory{UInt32}
+    owner_states::Memory{_ExecutionOwnerState}
+    owner_workspaces::Memory{_ExecutionOwnerWorkspace}
+    coordinator::_ExecutionCoordinatorState
+    coordinator_workspace::_ExecutionCoordinatorWorkspace
+    tasks::Memory{Task}
+    mode::M
+    cpu_budget::B
+    cpu_environment::CPUExecutionEnvironment
+    ring_capacity::Int
+end
+
+execution_owner_count(executor::PreparedExecutionOwnerExecutor) =
+    length(executor.owners)
+
+function execution_owner(
+    executor::PreparedExecutionOwnerExecutor,
+    ordinal::Integer,
+)
+    checkbounds(executor.owners, ordinal)
+    return @inbounds executor.owners[Int(ordinal)]
+end
+
+execution_owner_mode(executor::PreparedExecutionOwnerExecutor) =
+    executor.mode
+execution_owner_idle_policy(
+    executor::PreparedExecutionOwnerExecutor{
+        <:ThreadedExecutionOwners,
+    },
+) = executor.mode.idle_policy
+execution_owner_idle_policy(
+    ::PreparedExecutionOwnerExecutor{
+        <:DeterministicExecutionOwners,
+    },
+) = nothing
+execution_cpu_budget(executor::PreparedExecutionOwnerExecutor) =
+    executor.cpu_budget
+execution_cpu_environment(executor::PreparedExecutionOwnerExecutor) =
+    executor.cpu_environment
+execution_owner_ring_capacity(executor::PreparedExecutionOwnerExecutor) =
+    executor.ring_capacity
+execution_owners_phase(executor::PreparedExecutionOwnerExecutor) =
+    executor.coordinator.phase
+execution_batches_completed(executor::PreparedExecutionOwnerExecutor) =
+    executor.coordinator.batch_count
+
+_is_cpu_execution_owner(::CPUBackend) = true
+_is_cpu_execution_owner(::AbstractArrayBackend) = false
+
+function _copy_uint32_memory(values)
+    destination = Memory{UInt32}(undef, length(values))
+    @inbounds for index in eachindex(values)
+        destination[index] = UInt32(values[index])
+    end
+    return destination
+end
+
+function _copy_owner_memory(values::Vector{PreparedExecutionOwner})
+    destination =
+        Memory{PreparedExecutionOwner}(undef, length(values))
+    copyto!(destination, values)
+    return destination
+end
+
+function _prepared_owner(
+    configuration::ExecutionOwnerConfiguration,
+    id::ExecutionOwnerID,
+    kind::ExecutionOwnerKind,
+    target_ordinal::Int,
+    group_ordinals,
+    backend::AbstractArrayBackend,
+    compute_device::AbstractComputeDevice,
+)
+    return PreparedExecutionOwner(
+        id,
+        kind,
+        UInt32(target_ordinal),
+        _copy_uint32_memory(group_ordinals),
+        backend,
+        compute_device,
+        SPSCDescriptorRing{_ExecutionOwnerWorkDescriptor}(
+            configuration.ring_capacity),
+        SPSCDescriptorRing{_ExecutionOwnerCompletion}(
+            configuration.ring_capacity),
+    )
+end
+
+function _prepare_execution_owner_topology(
+    configuration::ExecutionOwnerConfiguration,
+    prepared::PreparedPlantEventLoop,
+)
+    group_count = path_execution_group_count(prepared)
+    group_owner_ordinals = Memory{UInt32}(undef, group_count)
+    fill!(group_owner_ordinals, zero(UInt32))
+    owners = PreparedExecutionOwner[]
+
+    @inbounds for group_ordinal in 1:group_count
+        iszero(group_owner_ordinals[group_ordinal]) || continue
+        device_owner_ordinal =
+            path_execution_group_device_batch_owner_ordinal(
+                prepared, group_ordinal)
+        owner_id = ExecutionOwnerID(length(owners) + 1)
+        if device_owner_ordinal === nothing
+            group = path_execution_group(prepared, group_ordinal)
+            requirements = path_execution_group_requirements(group)
+            owner = _prepared_owner(
+                configuration,
+                owner_id,
+                PathGroupExecutionOwner,
+                group_ordinal,
+                (group_ordinal,),
+                path_execution_backend(requirements),
+                path_execution_compute_device(requirements),
+            )
+            push!(owners, owner)
+            group_owner_ordinals[group_ordinal] =
+                execution_owner_id_value(owner_id)
+            continue
+        end
+
+        core_owner =
+            device_path_batch_owner(prepared, device_owner_ordinal)
+        member_count = device_path_batch_group_count(core_owner)
+        members = Vector{Int}(undef, member_count)
+        @inbounds for member_index in 1:member_count
+            member = device_path_batch_group_ordinal(
+                core_owner, member_index)
+            iszero(group_owner_ordinals[member]) ||
+                _execution_owner_error(
+                    :duplicate_group_owner,
+                    "path execution group $member belongs to more than " *
+                    "one HIL execution owner",
+                )
+            members[member_index] = member
+        end
+        owner = _prepared_owner(
+            configuration,
+            owner_id,
+            DeviceBatchExecutionOwner,
+            device_owner_ordinal,
+            members,
+            device_path_batch_backend(core_owner),
+            device_path_batch_compute_device(core_owner),
+        )
+        push!(owners, owner)
+        for member in members
+            group_owner_ordinals[member] =
+                execution_owner_id_value(owner_id)
+        end
+    end
+
+    all(!iszero, group_owner_ordinals) || _execution_owner_error(
+        :unassigned_path_group,
+        "every prepared path execution group must have one HIL owner",
+    )
+    return _copy_owner_memory(owners), group_owner_ordinals
+end
+
+function _simultaneous_cpu_owner_count(
+    ::DeterministicExecutionOwners,
+    count::Int,
+)
+    return min(count, 1)
+end
+
+function _simultaneous_cpu_owner_count(
+    ::ThreadedExecutionOwners,
+    count::Int,
+)
+    return count
+end
+
+function _validate_execution_owner_budget(
+    configuration::ExecutionOwnerConfiguration,
+    owners::Memory{PreparedExecutionOwner},
+)
+    cpu_owner_count = count(
+        owner -> _is_cpu_execution_owner(owner.backend),
+        owners,
+    )
+    simultaneous = _simultaneous_cpu_owner_count(
+        configuration.mode, cpu_owner_count)
+    simultaneous <= configuration.cpu_budget.outer_owner_count ||
+        _execution_owner_error(
+            :cpu_owner_capacity,
+            "prepared CPU execution owners exceed the declared simultaneous owner budget",
+        )
+    return nothing
+end
+
+function _owner_states(count::Int)
+    values = Memory{_ExecutionOwnerState}(undef, count)
+    @inbounds for index in eachindex(values)
+        values[index] = _ExecutionOwnerState(
+            _ExecutionOwnerIdle,
+            UInt64(0),
+            UInt64(0),
+            UInt64(0),
+            UInt(0),
+            0,
+            nothing,
+        )
+    end
+    return values
+end
+
+function _owner_workspaces(count::Int)
+    values = Memory{_ExecutionOwnerWorkspace}(undef, count)
+    @inbounds for index in eachindex(values)
+        values[index] = _ExecutionOwnerWorkspace(
+            Ref{_ExecutionOwnerWorkDescriptor}())
+    end
+    return values
+end
+
+function _completion_scratch(count::Int)
+    values = Memory{
+        Base.RefValue{_ExecutionOwnerCompletion}}(undef, count)
+    @inbounds for index in eachindex(values)
+        values[index] = Ref{_ExecutionOwnerCompletion}()
+    end
+    return values
+end
+
+_task_storage(::DeterministicExecutionOwners, ::Int) =
+    Memory{Task}(undef, 0)
+_task_storage(::ThreadedExecutionOwners, count::Int) =
+    Memory{Task}(undef, count)
+
+function _prepare_optical_execution(
+    ::SerialOpticalExecution,
+    ::PreparedPlantEventLoop,
+    ::PlantEventLoopState,
+    ::PlantEventLoopWorkspace,
+    ::RunSessionID,
+)
+    return SerialOpticalPathBatchExecutor()
+end
+
+function _prepare_optical_execution(
+    ::AbstractOpticalExecutionConfiguration,
+    ::PreparedPlantEventLoop,
+    ::PlantEventLoopState,
+    ::PlantEventLoopWorkspace,
+    ::RunSessionID,
+)
+    return _execution_owner_error(
+        :unsupported_execution_configuration,
+        "optical execution configuration is not supported",
+    )
+end
+
+function _prepare_optical_execution(
+    configuration::ExecutionOwnerConfiguration,
+    prepared::PreparedPlantEventLoop,
+    state::PlantEventLoopState,
+    workspace::PlantEventLoopWorkspace,
+    session::RunSessionID,
+)
+    owners, group_owner_ordinals =
+        _prepare_execution_owner_topology(configuration, prepared)
+    isempty(owners) && _execution_owner_error(
+        :empty_owner_topology,
+        "an owner executor requires at least one prepared path group",
+    )
+    _validate_execution_owner_budget(configuration, owners)
+    owner_count = length(owners)
+    submitted = Memory{UInt64}(undef, owner_count)
+    completions = Memory{UInt64}(undef, owner_count)
+    startup = Memory{Bool}(undef, owner_count)
+    stopped = Memory{Bool}(undef, owner_count)
+    fill!(submitted, UInt64(0))
+    fill!(completions, UInt64(0))
+    fill!(startup, false)
+    fill!(stopped, false)
+    due_owner_ordinals = Memory{UInt32}(undef, owner_count)
+    owner_due = Memory{Bool}(undef, owner_count)
+    completion_seen = Memory{Bool}(undef, owner_count)
+    fill!(owner_due, false)
+    fill!(completion_seen, false)
+    return PreparedExecutionOwnerExecutor(
+        session,
+        prepared,
+        state,
+        workspace,
+        owners,
+        group_owner_ordinals,
+        _owner_states(owner_count),
+        _owner_workspaces(owner_count),
+        _ExecutionCoordinatorState(
+            ExecutionOwnersPrepared,
+            UInt64(0),
+            UInt64(0),
+            submitted,
+            completions,
+            startup,
+            stopped,
+        ),
+        _ExecutionCoordinatorWorkspace(
+            due_owner_ordinals,
+            owner_due,
+            completion_seen,
+            _completion_scratch(owner_count),
+        ),
+        _task_storage(configuration.mode, owner_count),
+        configuration.mode,
+        configuration.cpu_budget,
+        configuration.cpu_environment,
+        configuration.ring_capacity,
+    )
+end
+
+_execution_is_armed(::SerialOpticalPathBatchExecutor) = true
+_execution_is_quiescent(::SerialOpticalPathBatchExecutor) = true
+_arm_optical_execution!(executor::SerialOpticalPathBatchExecutor) = executor
+_start_optical_execution!(executor::SerialOpticalPathBatchExecutor) = executor
+_stop_optical_execution!(executor::SerialOpticalPathBatchExecutor) = executor
+_mark_optical_execution_failed!(
+    executor::SerialOpticalPathBatchExecutor) = executor
+
+@inline _next_idle_poll(
+    ::YieldingExecutionOwnerIdle,
+    ::UInt32,
+) = (yield(); zero(UInt32))
+
+@inline function _next_idle_poll(
+    policy::HybridExecutionOwnerIdle,
+    poll_count::UInt32,
+)
+    next = poll_count + one(UInt32)
+    if next >= policy.spin_count
+        yield()
+        return zero(UInt32)
+    end
+    GC.safepoint()
+    return next
+end
+
+@inline function _wait_idle(
+    mode::ThreadedExecutionOwners,
+    poll_count::UInt32,
+)
+    return _next_idle_poll(mode.idle_policy, poll_count)
+end
+
+@noinline function _wait_for_owner_progress(
+    ::DeterministicExecutionOwners,
+    ::UInt32,
+    reason::Symbol,
+    message::AbstractString,
+)
+    return _execution_owner_error(reason, message)
+end
+
+@inline function _wait_for_owner_progress(
+    mode::ThreadedExecutionOwners,
+    poll_count::UInt32,
+    ::Symbol,
+    ::AbstractString,
+)
+    return _wait_idle(mode, poll_count)
+end
+
+function _submit_completion!(
+    executor::PreparedExecutionOwnerExecutor{
+        <:ThreadedExecutionOwners,
+    },
+    owner::PreparedExecutionOwner,
+    completion::_ExecutionOwnerCompletion,
+)
+    poll_count = zero(UInt32)
+    while true
+        status = try_submit!(owner.completion, completion)
+        status == RingTransferSucceeded && return nothing
+        status == RingFull || _execution_owner_error(
+            :completion_publication,
+            "execution owner could not publish a completion acknowledgement",
+        )
+        poll_count = _wait_idle(executor.mode, poll_count)
+    end
+end
+
+function _submit_completion!(
+    ::PreparedExecutionOwnerExecutor{
+        <:DeterministicExecutionOwners,
+    },
+    owner::PreparedExecutionOwner,
+    completion::_ExecutionOwnerCompletion,
+)
+    try_submit!(owner.completion, completion) ==
+        RingTransferSucceeded || _execution_owner_error(
+            :completion_publication,
+            "deterministic execution owner could not publish a completion acknowledgement",
+        )
+    return nothing
+end
+
+function _execute_owner_target!(
+    executor::PreparedExecutionOwnerExecutor,
+    owner::PreparedExecutionOwner,
+    descriptor::_ExecutionOwnerWorkDescriptor,
+)
+    descriptor.session == executor.session || _execution_owner_error(
+        :stale_session,
+        "execution-owner work belongs to another run/session",
+    )
+    descriptor.owner == owner.id || _execution_owner_error(
+        :wrong_owner,
+        "execution-owner work was delivered to another owner",
+    )
+    if owner.kind == PathGroupExecutionOwner
+        ordinal = Int(owner.target_ordinal)
+        if descriptor.phase == _ExecutionOwnerMaterialization
+            materialize_path_execution_group!(
+                executor.prepared,
+                executor.state,
+                executor.workspace,
+                descriptor.claim,
+                ordinal,
+            )
+        else
+            descriptor.phase == _ExecutionOwnerExecution ||
+                _execution_owner_error(
+                    :invalid_work_phase,
+                    "path-group owner received a non-execution work phase",
+                )
+            execute_path_execution_group!(
+                executor.prepared,
+                executor.state,
+                executor.workspace,
+                descriptor.claim,
+                ordinal,
+            )
+        end
+        return nothing
+    end
+
+    owner.kind == DeviceBatchExecutionOwner ||
+        _execution_owner_error(
+            :invalid_owner_kind,
+            "execution owner has an unknown target kind",
+        )
+    core_owner = device_path_batch_owner(
+        executor.prepared, Int(owner.target_ordinal))
+    if descriptor.phase == _ExecutionOwnerMaterialization
+        materialize_device_path_batch!(
+            core_owner,
+            executor.prepared,
+            executor.state,
+            executor.workspace,
+            descriptor.claim,
+        )
+    else
+        descriptor.phase == _ExecutionOwnerExecution ||
+            _execution_owner_error(
+                :invalid_work_phase,
+                "device-batch owner received a non-execution work phase",
+            )
+        execute_device_path_batch!(
+            core_owner,
+            executor.prepared,
+            executor.state,
+            executor.workspace,
+            descriptor.claim,
+        )
+    end
+    return nothing
+end
+
+function _service_owner_work!(
+    executor::PreparedExecutionOwnerExecutor,
+    owner_ordinal::Int,
+    descriptor::_ExecutionOwnerWorkDescriptor,
+)
+    owner = @inbounds executor.owners[owner_ordinal]
+    state = @inbounds executor.owner_states[owner_ordinal]
+    state.activity == _ExecutionOwnerIdle ||
+        _execution_owner_error(
+            :owner_not_idle,
+            "execution owner received work while it was not idle",
+        )
+    state.activity = _ExecutionOwnerWorking
+    state.active_batch_sequence = descriptor.batch_sequence
+    state.work_taken += UInt64(1)
+    state.last_thread_id = Threads.threadid()
+    failed = false
+    failure = try
+        _execute_owner_target!(executor, owner, descriptor)
+        nothing
+    catch caught
+        failed = true
+        caught
+    end
+    if !failed
+        state.work_completed += UInt64(1)
+        state.active_batch_sequence = UInt64(0)
+        state.activity = _ExecutionOwnerIdle
+        status = _ExecutionOwnerWorkCompleted
+    else
+        state.failure = failure
+        state.activity = _ExecutionOwnerFailedActivity
+        status = _ExecutionOwnerWorkFailed
+    end
+    _submit_completion!(
+        executor,
+        owner,
+        _ExecutionOwnerCompletion(
+            executor.session,
+            owner.id,
+            descriptor.batch_sequence,
+            descriptor.phase,
+            status,
+        ),
+    )
+    return nothing
+end
+
+function _execution_owner_loop!(
+    executor::PreparedExecutionOwnerExecutor{
+        <:ThreadedExecutionOwners,
+    },
+    owner_ordinal::Int,
+)
+    owner = @inbounds executor.owners[owner_ordinal]
+    state = @inbounds executor.owner_states[owner_ordinal]
+    workspace = @inbounds executor.owner_workspaces[owner_ordinal]
+    state.task_id = objectid(current_task())
+    state.last_thread_id = Threads.threadid()
+    _submit_completion!(
+        executor,
+        owner,
+        _ExecutionOwnerCompletion(
+            executor.session,
+            owner.id,
+            UInt64(0),
+            _ExecutionOwnerStartup,
+            _ExecutionOwnerWorkCompleted,
+        ),
+    )
+    poll_count = zero(UInt32)
+    while true
+        status = try_take!(workspace.work, owner.due)
+        if status == RingTransferSucceeded
+            poll_count = zero(UInt32)
+            _service_owner_work!(
+                executor, owner_ordinal, workspace.work[])
+            state.activity == _ExecutionOwnerFailedActivity && break
+            continue
+        end
+        status == RingClosed && break
+        status == RingEmpty || _execution_owner_error(
+            :due_work_consumption,
+            "execution owner observed an invalid due-work ring result",
+        )
+        poll_count = _wait_idle(executor.mode, poll_count)
+    end
+    if state.activity != _ExecutionOwnerFailedActivity
+        state.activity = _ExecutionOwnerStoppedActivity
+        state.active_batch_sequence = UInt64(0)
+    end
+    _submit_completion!(
+        executor,
+        owner,
+        _ExecutionOwnerCompletion(
+            executor.session,
+            owner.id,
+            UInt64(0),
+            _ExecutionOwnerStop,
+            state.activity == _ExecutionOwnerFailedActivity ?
+                _ExecutionOwnerWorkFailed :
+                _ExecutionOwnerWorkCompleted,
+        ),
+    )
+    close_ring!(owner.completion) == RingTransferSucceeded ||
+        _execution_owner_error(
+            :completion_closure,
+            "execution owner could not close its completion path",
+        )
+    return nothing
+end
+
+function _spawn_execution_owner(
+    executor::PreparedExecutionOwnerExecutor{
+        <:ThreadedExecutionOwners,
+    },
+    owner_ordinal::Int,
+)
+    return Threads.@spawn _execution_owner_loop!(
+        executor, owner_ordinal)
+end
+
+function _take_expected_completion!(
+    executor::PreparedExecutionOwnerExecutor,
+    owner_ordinal::Int,
+    batch_sequence::UInt64,
+    phase::_ExecutionOwnerWorkPhase,
+)
+    owner = @inbounds executor.owners[owner_ordinal]
+    scratch = @inbounds executor.coordinator_workspace.completions[
+        owner_ordinal]
+    poll_count = zero(UInt32)
+    while true
+        status = try_take!(scratch, owner.completion)
+        if status == RingTransferSucceeded
+            completion = scratch[]
+            completion.session == executor.session ||
+                _execution_owner_error(
+                    :stale_completion_session,
+                    "execution-owner completion belongs to another run/session",
+                )
+            completion.owner == owner.id ||
+                _execution_owner_error(
+                    :wrong_completion_owner,
+                    "execution-owner completion came from another owner",
+                )
+            completion.batch_sequence == batch_sequence ||
+                _execution_owner_error(
+                    :stale_completion_batch,
+                    "execution-owner completion belongs to another batch",
+                )
+            completion.phase == phase ||
+                _execution_owner_error(
+                    :wrong_completion_phase,
+                    "execution-owner completion reports another phase",
+                )
+            return completion
+        end
+        status == RingClosed && _execution_owner_error(
+            :completion_closed,
+            "execution-owner completion path closed before its expected acknowledgement",
+        )
+        status == RingEmpty ||
+            _execution_owner_error(
+                :completion_consumption,
+                "coordinator observed an invalid completion-ring result",
+            )
+        poll_count = _wait_for_owner_progress(
+            executor.mode,
+            poll_count,
+            :missing_deterministic_completion,
+            "deterministic owner did not publish its completion",
+        )
+    end
+end
+
+function _collect_lifecycle_acknowledgements!(
+    executor::PreparedExecutionOwnerExecutor,
+    phase::_ExecutionOwnerWorkPhase,
+    destination::Memory{Bool},
+)
+    @inbounds for owner_ordinal in eachindex(executor.owners)
+        completion = _take_expected_completion!(
+            executor, owner_ordinal, UInt64(0), phase)
+        completion.status == _ExecutionOwnerWorkCompleted ||
+            _execution_owner_error(
+                :owner_lifecycle_failure,
+                "execution owner failed during lifecycle acknowledgement",
+            )
+        destination[owner_ordinal] = true
+    end
+    return nothing
+end
+
+function _arm_optical_execution!(
+    executor::PreparedExecutionOwnerExecutor{
+        <:DeterministicExecutionOwners,
+    },
+)
+    executor.coordinator.phase == ExecutionOwnersPrepared ||
+        _execution_owner_error(
+            :invalid_phase,
+            "deterministic execution owners can arm only from prepared",
+        )
+    executor.coordinator.phase = ExecutionOwnersArmed
+    return executor
+end
+
+function _arm_optical_execution!(
+    executor::PreparedExecutionOwnerExecutor{
+        <:ThreadedExecutionOwners,
+    },
+)
+    executor.coordinator.phase == ExecutionOwnersPrepared ||
+        _execution_owner_error(
+            :invalid_phase,
+            "threaded execution owners can arm only from prepared",
+        )
+    @inbounds for owner_ordinal in eachindex(executor.owners)
+        executor.tasks[owner_ordinal] =
+            _spawn_execution_owner(executor, owner_ordinal)
+    end
+    _collect_lifecycle_acknowledgements!(
+        executor,
+        _ExecutionOwnerStartup,
+        executor.coordinator.startup_acknowledged,
+    )
+    executor.coordinator.phase = ExecutionOwnersArmed
+    return executor
+end
+
+_execution_is_armed(executor::PreparedExecutionOwnerExecutor) =
+    executor.coordinator.phase == ExecutionOwnersArmed
+
+function _start_optical_execution!(
+    executor::PreparedExecutionOwnerExecutor,
+)
+    executor.coordinator.phase == ExecutionOwnersArmed ||
+        _execution_owner_error(
+            :invalid_phase,
+            "execution owners can start only from armed",
+        )
+    executor.coordinator.phase = ExecutionOwnersRunning
+    return executor
+end
+
+function _mark_optical_execution_failed!(
+    executor::PreparedExecutionOwnerExecutor,
+)
+    executor.coordinator.phase in (
+        ExecutionOwnersPrepared,
+        ExecutionOwnersArmed,
+        ExecutionOwnersRunning,
+    ) || return executor
+    executor.coordinator.phase = ExecutionOwnersFailed
+    return executor
+end
+
+function _deterministic_stop!(
+    executor::PreparedExecutionOwnerExecutor{
+        <:DeterministicExecutionOwners,
+    },
+)
+    @inbounds for owner_ordinal in eachindex(executor.owners)
+        owner = executor.owners[owner_ordinal]
+        close_ring!(owner.due) == RingTransferSucceeded ||
+            _execution_owner_error(
+                :due_work_closure,
+                "deterministic owner due-work path was already closed",
+            )
+        state = executor.owner_states[owner_ordinal]
+        state.activity = _ExecutionOwnerStoppedActivity
+        _submit_completion!(
+            executor,
+            owner,
+            _ExecutionOwnerCompletion(
+                executor.session,
+                owner.id,
+                UInt64(0),
+                _ExecutionOwnerStop,
+                _ExecutionOwnerWorkCompleted,
+            ),
+        )
+    end
+    _collect_lifecycle_acknowledgements!(
+        executor,
+        _ExecutionOwnerStop,
+        executor.coordinator.stop_acknowledged,
+    )
+    @inbounds for owner in executor.owners
+        close_ring!(owner.completion) == RingTransferSucceeded ||
+            _execution_owner_error(
+                :completion_closure,
+                "deterministic owner completion path was already closed",
+            )
+    end
+    return executor
+end
+
+function _threaded_stop!(
+    executor::PreparedExecutionOwnerExecutor{
+        <:ThreadedExecutionOwners,
+    },
+)
+    @inbounds for owner in executor.owners
+        close_ring!(owner.due) == RingTransferSucceeded ||
+            _execution_owner_error(
+                :due_work_closure,
+                "threaded owner due-work path was already closed",
+            )
+    end
+    _collect_lifecycle_acknowledgements!(
+        executor,
+        _ExecutionOwnerStop,
+        executor.coordinator.stop_acknowledged,
+    )
+    @inbounds for task in executor.tasks
+        wait(task)
+    end
+    return executor
+end
+
+_stop_owner_mode!(
+    executor::PreparedExecutionOwnerExecutor{
+        <:DeterministicExecutionOwners,
+    },
+) = _deterministic_stop!(executor)
+
+_stop_owner_mode!(
+    executor::PreparedExecutionOwnerExecutor{
+        <:ThreadedExecutionOwners,
+    },
+) = _threaded_stop!(executor)
+
+function _stop_optical_execution!(
+    executor::PreparedExecutionOwnerExecutor,
+)
+    executor.coordinator.phase in (
+        ExecutionOwnersArmed,
+        ExecutionOwnersRunning,
+    ) || _execution_owner_error(
+        :invalid_phase,
+        "execution owners can stop only from armed or running",
+    )
+    execution_owners_are_quiescent(executor) ||
+        _execution_owner_error(
+            :owners_not_quiescent,
+            "clean execution-owner stop requires empty due and completion paths",
+        )
+    _stop_owner_mode!(executor)
+    executor.coordinator.phase = ExecutionOwnersStopped
+    execution_owners_are_quiescent(executor) ||
+        _execution_owner_error(
+            :stop_accounting,
+            "execution owners did not reach quiescent stopped accounting",
+        )
+    return executor
+end
+
+function _execution_is_quiescent(
+    executor::PreparedExecutionOwnerExecutor,
+)
+    return execution_owners_are_quiescent(executor)
+end
+
+"""Cold, externally synchronized accounting for one execution owner."""
+struct ExecutionOwnerAccounting
+    id::ExecutionOwnerID
+    due::RingAccounting
+    completion::RingAccounting
+    work_submitted::UInt64
+    work_taken::UInt64
+    work_completed::UInt64
+    completions_taken::UInt64
+    startup_acknowledged::Bool
+    stop_acknowledged::Bool
+    task_id::UInt
+    last_thread_id::Int
+    failed::Bool
+end
+
+function execution_owner_accounting(
+    executor::PreparedExecutionOwnerExecutor,
+    ordinal::Integer,
+)
+    checkbounds(executor.owners, ordinal)
+    index = Int(ordinal)
+    owner = @inbounds executor.owners[index]
+    state = @inbounds executor.owner_states[index]
+    coordinator = executor.coordinator
+    return ExecutionOwnerAccounting(
+        owner.id,
+        ring_accounting(owner.due),
+        ring_accounting(owner.completion),
+        @inbounds(coordinator.submitted[index]),
+        state.work_taken,
+        state.work_completed,
+        @inbounds(coordinator.completions[index]),
+        @inbounds(coordinator.startup_acknowledged[index]),
+        @inbounds(coordinator.stop_acknowledged[index]),
+        state.task_id,
+        state.last_thread_id,
+        state.activity == _ExecutionOwnerFailedActivity,
+    )
+end
+
+_execution_accounting(::SerialOpticalPathBatchExecutor) = nothing
+
+function _execution_accounting(
+    executor::PreparedExecutionOwnerExecutor,
+)
+    values = Memory{ExecutionOwnerAccounting}(
+        undef, execution_owner_count(executor))
+    @inbounds for ordinal in eachindex(values)
+        values[ordinal] =
+            execution_owner_accounting(executor, ordinal)
+    end
+    return values
+end
+
+_execution_accounting_is_quiescent(::Nothing) = true
+
+function _execution_accounting_is_quiescent(
+    values::Memory{ExecutionOwnerAccounting},
+)
+    @inbounds for value in values
+        iszero(value.due.occupancy) || return false
+        iszero(value.completion.occupancy) || return false
+        value.work_submitted == value.work_taken ==
+            value.work_completed == value.completions_taken ||
+            return false
+        value.failed && return false
+    end
+    return true
+end
+
+function execution_owners_are_quiescent(
+    executor::PreparedExecutionOwnerExecutor,
+)
+    @inbounds for index in eachindex(executor.owners)
+        owner = executor.owners[index]
+        due = ring_accounting(owner.due)
+        completion = ring_accounting(owner.completion)
+        iszero(due.occupancy) || return false
+        iszero(completion.occupancy) || return false
+        state = executor.owner_states[index]
+        state.activity in (
+            _ExecutionOwnerIdle,
+            _ExecutionOwnerStoppedActivity,
+        ) || return false
+        iszero(state.active_batch_sequence) || return false
+        state.work_taken == state.work_completed || return false
+        executor.coordinator.submitted[index] ==
+            executor.coordinator.completions[index] || return false
+    end
+    return true
+end
+
+function _require_executor_binding(
+    executor::PreparedExecutionOwnerExecutor,
+    prepared::PreparedPlantEventLoop,
+    state::PlantEventLoopState,
+    workspace::PlantEventLoopWorkspace,
+)
+    prepared === executor.prepared || _execution_owner_error(
+        :foreign_prepared_plant,
+        "execution-owner executor received another prepared event loop",
+    )
+    state === executor.state || _execution_owner_error(
+        :foreign_state_owner,
+        "execution-owner executor received another event-loop state",
+    )
+    workspace === executor.workspace || _execution_owner_error(
+        :foreign_workspace_owner,
+        "execution-owner executor received another event-loop workspace",
+    )
+    executor.coordinator.phase == ExecutionOwnersRunning ||
+        _execution_owner_error(
+            :invalid_phase,
+            "execution-owner batch work requires a running owner runtime",
+        )
+    return nothing
+end
+
+function _next_batch_sequence!(executor::PreparedExecutionOwnerExecutor)
+    current = executor.coordinator.batch_sequence
+    current == typemax(UInt64) && _execution_owner_error(
+        :batch_sequence_overflow,
+        "execution-owner batch sequence exhausted UInt64",
+    )
+    next = current + UInt64(1)
+    executor.coordinator.batch_sequence = next
+    return next
+end
+
+function _collect_due_execution_owners!(
+    executor::PreparedExecutionOwnerExecutor,
+    claim::OpticalPathBatchClaim,
+)
+    scratch = executor.coordinator_workspace
+    fill!(scratch.owner_due, false)
+    due_count = optical_path_batch_due_group_count(
+        executor.prepared,
+        executor.state,
+        executor.workspace,
+        claim,
+    )
+    owner_count = 0
+    @inbounds for index in 1:due_count
+        group_ordinal = optical_path_batch_due_group_ordinal(
+            executor.prepared,
+            executor.state,
+            executor.workspace,
+            claim,
+            index,
+        )
+        owner_ordinal = Int(
+            executor.group_owner_ordinals[group_ordinal])
+        scratch.owner_due[owner_ordinal] && continue
+        scratch.owner_due[owner_ordinal] = true
+        owner_count += 1
+        scratch.due_owner_ordinals[owner_count] =
+            UInt32(owner_ordinal)
+    end
+    return owner_count
+end
+
+function _submit_owner_phase!(
+    executor::PreparedExecutionOwnerExecutor,
+    claim::OpticalPathBatchClaim,
+    batch_sequence::UInt64,
+    owner_count::Int,
+    phase::_ExecutionOwnerWorkPhase,
+)
+    due_ordinals =
+        executor.coordinator_workspace.due_owner_ordinals
+    @inbounds for index in 1:owner_count
+        owner_ordinal = Int(due_ordinals[index])
+        owner = executor.owners[owner_ordinal]
+        descriptor = _ExecutionOwnerWorkDescriptor(
+            executor.session,
+            owner.id,
+            batch_sequence,
+            phase,
+            claim,
+        )
+        try_submit!(owner.due, descriptor) ==
+            RingTransferSucceeded || _execution_owner_error(
+                :due_work_publication,
+                "bounded due-work path rejected an owner descriptor",
+            )
+        executor.coordinator.submitted[owner_ordinal] += UInt64(1)
+    end
+    return nothing
+end
+
+function _deterministic_service_reversed(
+    mode::DeterministicExecutionOwners,
+    batch_sequence::UInt64,
+    phase::_ExecutionOwnerWorkPhase,
+)
+    mode.alternate_order || return false
+    phase_offset = phase == _ExecutionOwnerExecution
+    return isodd(batch_sequence) ⊻ phase_offset
+end
+
+function _service_deterministic_phase!(
+    executor::PreparedExecutionOwnerExecutor{
+        <:DeterministicExecutionOwners,
+    },
+    batch_sequence::UInt64,
+    owner_count::Int,
+    phase::_ExecutionOwnerWorkPhase,
+)
+    ordinals =
+        executor.coordinator_workspace.due_owner_ordinals
+    reversed = _deterministic_service_reversed(
+        executor.mode, batch_sequence, phase)
+    @inbounds for service_index in 1:owner_count
+        index = reversed ? owner_count - service_index + 1 :
+            service_index
+        owner_ordinal = Int(ordinals[index])
+        owner = executor.owners[owner_ordinal]
+        workspace = executor.owner_workspaces[owner_ordinal]
+        try_take!(workspace.work, owner.due) ==
+            RingTransferSucceeded || _execution_owner_error(
+                :deterministic_due_work,
+                "deterministic owner could not consume its due descriptor",
+            )
+        _service_owner_work!(
+            executor, owner_ordinal, workspace.work[])
+    end
+    return nothing
+end
+
+_service_deterministic_phase!(
+    ::PreparedExecutionOwnerExecutor{<:ThreadedExecutionOwners},
+    ::UInt64,
+    ::Int,
+    ::_ExecutionOwnerWorkPhase,
+) = nothing
+
+function _collect_owner_phase!(
+    executor::PreparedExecutionOwnerExecutor,
+    batch_sequence::UInt64,
+    owner_count::Int,
+    phase::_ExecutionOwnerWorkPhase,
+)
+    workspace = executor.coordinator_workspace
+    fill!(workspace.completion_seen, false)
+    _service_deterministic_phase!(
+        executor, batch_sequence, owner_count, phase)
+    remaining = owner_count
+    failure_seen = false
+    first_failure = nothing
+    poll_count = zero(UInt32)
+    while remaining > 0
+        made_progress = false
+        @inbounds for due_index in 1:owner_count
+            owner_ordinal =
+                Int(workspace.due_owner_ordinals[due_index])
+            workspace.completion_seen[owner_ordinal] && continue
+            owner = executor.owners[owner_ordinal]
+            scratch = workspace.completions[owner_ordinal]
+            status = try_take!(scratch, owner.completion)
+            status == RingEmpty && continue
+            status == RingTransferSucceeded ||
+                _execution_owner_error(
+                    :completion_consumption,
+                    "owner completion path closed before the expected work acknowledgement",
+                )
+            completion = scratch[]
+            completion.session == executor.session ||
+                _execution_owner_error(
+                    :stale_completion_session,
+                    "owner completion belongs to another run/session",
+                )
+            completion.owner == owner.id ||
+                _execution_owner_error(
+                    :wrong_completion_owner,
+                    "owner completion came from another completion path",
+                )
+            completion.batch_sequence == batch_sequence ||
+                _execution_owner_error(
+                    :stale_completion_batch,
+                    "owner completion belongs to another batch",
+                )
+            completion.phase == phase ||
+                _execution_owner_error(
+                    :wrong_completion_phase,
+                    "owner completion reports another work phase",
+                )
+            workspace.completion_seen[owner_ordinal] = true
+            executor.coordinator.completions[owner_ordinal] += UInt64(1)
+            remaining -= 1
+            made_progress = true
+            if completion.status == _ExecutionOwnerWorkFailed &&
+                !failure_seen
+                first_failure =
+                    executor.owner_states[owner_ordinal].failure
+                failure_seen = true
+            end
+        end
+        made_progress && (poll_count = zero(UInt32); continue)
+        poll_count = _wait_for_owner_progress(
+            executor.mode,
+            poll_count,
+            :missing_deterministic_completion,
+            "deterministic owner phase did not complete",
+        )
+    end
+    failure_seen && throw(first_failure)
+    return nothing
+end
+
+function Plant.execute_optical_path_batch!(
+    executor::PreparedExecutionOwnerExecutor,
+    prepared::PreparedPlantEventLoop,
+    state::PlantEventLoopState,
+    workspace::PlantEventLoopWorkspace,
+    timestamp::PlantTimestamp,
+)
+    _require_executor_binding(executor, prepared, state, workspace)
+    claim = begin_optical_path_batch!(
+        prepared, state, workspace, timestamp)
+    owner_count = _collect_due_execution_owners!(executor, claim)
+    batch_sequence = _next_batch_sequence!(executor)
+    _submit_owner_phase!(
+        executor,
+        claim,
+        batch_sequence,
+        owner_count,
+        _ExecutionOwnerMaterialization,
+    )
+    _collect_owner_phase!(
+        executor,
+        batch_sequence,
+        owner_count,
+        _ExecutionOwnerMaterialization,
+    )
+    seal_optical_path_batch_materialization!(
+        prepared, state, workspace, claim)
+    _submit_owner_phase!(
+        executor,
+        claim,
+        batch_sequence,
+        owner_count,
+        _ExecutionOwnerExecution,
+    )
+    _collect_owner_phase!(
+        executor,
+        batch_sequence,
+        owner_count,
+        _ExecutionOwnerExecution,
+    )
+    completed = complete_optical_path_batch!(
+        prepared, state, workspace, claim)
+    executor.coordinator.batch_count += UInt64(1)
+    return completed
+end
+
+end
