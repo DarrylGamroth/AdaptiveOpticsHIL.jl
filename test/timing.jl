@@ -81,6 +81,7 @@ end
         @test timestamp_rate_denominator(mapping) == 10
         @test timestamp_valid_from_ticks(mapping) == 900
         @test timestamp_valid_through_ticks(mapping) == 1_100
+        @test timestamp_mapping_uncertainty(mapping) == PlantDuration(7)
         @test source_timestamp_ticks(mapped) == 1_010
         @test mapped_plant_timestamp(mapped) == PlantTimestamp(10_011)
         @test timestamp_mapping_uncertainty(mapped) == PlantDuration(7)
@@ -501,7 +502,9 @@ end
         @test clock isa CachedExecutionClock
         @test time_nanos(clock) == 1_000
         @test cached_clock_update_owner(clock) == owner
+        @test cached_clock_update_owner(controller) == owner
         @test cached_clock_update_cadence_ns(clock) == 100
+        @test cached_clock_update_cadence_ns(controller) == 100
         @test cached_clock_maximum_observed_staleness_ns(clock) == 0
         @test cached_clock_refresh_count(clock) == 0
         @test !applicable(Clocks.update!, clock, Int64(2_000))
