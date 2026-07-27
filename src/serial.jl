@@ -847,7 +847,7 @@ end
 Perform one nonblocking command, deadline, or plant-event decision. A pending
 deadline is returned to the caller; this function never sleeps or retries.
 """
-@inline _serial_failure_component(::Any) = :serial_run
+@inline _serial_failure_component(::Any) = :serial_run # COV_EXCL_LINE
 @inline _serial_failure_component(error::SerialRunError) =
     error.component
 

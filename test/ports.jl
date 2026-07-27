@@ -301,17 +301,24 @@ end
         @test_throws PortError PortSchemaVersion(0)
         @test_throws PortError PortSchemaVersion(false)
         session = RunSessionID(7)
+        sequence = StreamSequence(8)
         schema_id = PortSchemaID(:command_submission)
+        schema_version = PortSchemaVersion(9)
         timestamp_domain = ExternalTimestampDomainID(:rtc_ptp)
         @test isequal(session, RunSessionID(7))
         @test hash(session) == hash(RunSessionID(7))
+        @test isequal(sequence, StreamSequence(8))
+        @test hash(sequence) == hash(StreamSequence(8))
         @test isequal(schema_id, PortSchemaID(:command_submission))
         @test hash(schema_id) == hash(PortSchemaID(:command_submission))
+        @test isequal(schema_version, PortSchemaVersion(9))
         @test isequal(
             timestamp_domain, ExternalTimestampDomainID(:rtc_ptp))
         @test hash(timestamp_domain) ==
             hash(ExternalTimestampDomainID(:rtc_ptp))
         @test sprint(show, session) == "RunSessionID(7)"
+        @test sprint(show, sequence) == "StreamSequence(8)"
+        @test sprint(show, schema_version) == "PortSchemaVersion(9)"
         @test sprint(show, schema_id) ==
             "PortSchemaID(:command_submission)"
 

@@ -711,7 +711,10 @@ end
             command_disposition_workspace(fixture.run.workspace.bridge)
         @test run_phase(fixture.configuration) == RunConfigured
         @test run_phase(fixture.running) == RunRunning
+        @test run_session(fixture.configuration) ==
+            RunSessionID(0x7c00)
         @test run_session(fixture.running) == RunSessionID(0x7c00)
+        @test run_arm_window(fixture.configuration) === nothing
         @test run_execution_clock_identity(fixture.configuration) ===
             nothing
         @test run_execution_clock_identity(fixture.running) ==
@@ -719,6 +722,7 @@ end
         @test run_adapter_readiness(fixture.configuration) === nothing
         @test run_adapter_readiness(fixture.running) ===
             fixture.readiness
+        @test run_termination(fixture.configuration) === nothing
         @test run_termination(fixture.running) === nothing
         direct_bridge = prepare_command_bridge(
             fixture.command_ports,
@@ -1149,6 +1153,20 @@ end
         @test closed_error.reason ==
             :acquisition_publication_rejected
         @test run_phase(closed.run) == RunFailed
+
+        generic_failure = serial_test_fixture()
+        generic_error = ArgumentError("test generic runtime failure")
+        invalid_reading_termination = Base.invokelatest(
+            AdaptiveOpticsHIL.Serial._record_serial_failure!,
+            generic_failure.running,
+            generic_error)
+        @test run_phase(generic_failure.run) == RunFailed
+        @test run_termination(generic_failure.run) ===
+            invalid_reading_termination
+        @test run_termination_component(
+            invalid_reading_termination) == :serial_run
+        @test run_termination_reason(
+            invalid_reading_termination) == :ArgumentError
 
         armed = serial_test_fixture(start=false)
         armed_request = RunStopRequest(
