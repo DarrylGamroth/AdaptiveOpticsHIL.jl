@@ -98,22 +98,81 @@ in-process boundaries:
 
 Command timing records either canonical plant receive time or an already
 mapped, versioned external timestamp. Mapping estimation remains the
-integration owner's responsibility. Adapter readiness, complete-product lead
-time, and maximum lease hold time are explicit orchestration data.
+integration owner's responsibility. Complete-product lead time and maximum
+lease hold time are explicit port data; run identity and adapter readiness
+belong to `AdaptiveOpticsHIL.Lifecycle`. Acquisition-completion descriptors
+carry the run/session identity but do not duplicate the run-level readiness
+snapshot.
 
 The ports contain no TCP, UDP, Aeron, iceoryx2, ZeroMQ, packet, client/server,
 or progressive-readout semantics. Integration code decodes its chosen
 transport into these descriptors and owns its own blocking, polling, or
 backoff policy.
 
+## Operational lifecycle
+
+`AdaptiveOpticsHIL.Lifecycle` owns the transport-neutral operational contract:
+
+- one positive `RunSessionID` shared by every resource in a run;
+- immutable lifecycle parameters with a required relative arm timeout;
+- configured, prepared, arming, armed, running, stopped, and failed phases;
+- an inclusive arm window tied to the selected execution-clock identity;
+- same-session adapter readiness observed on that execution clock; and
+- typed stop requests, configured terminal events, failures, and immutable
+  terminal records.
+
+User integration may establish readiness through any transport or local
+mechanism, but the snapshot contains no connection, client/server, or health
+protocol semantics. A prior session or another execution clock cannot arm a
+run, and the selected execution-clock identity cannot change during an arm
+attempt. Readiness exactly at the arm deadline is accepted; the first later
+clock reading records an arm-timeout failure. Arm and active-run interval
+checks use the same bounded modular arithmetic as execution-clock pacing,
+including `Int64` representation wrap.
+
+The serial path exposes the complete breaking lifecycle directly:
+
+```julia
+configuration = configure_serial_run(
+    command_bridge, acquisition_ports;
+    arm_timeout_ns=1_000_000_000)
+run = prepare_serial_run(configuration)
+attempt = begin_serial_arm!(run, clock)
+readiness = AdapterReadinessSnapshot(
+    run_session(run),
+    execution_clock_identity(clock),
+    AdapterReady,
+    Clocks.time_nanos(clock))
+armed = arm_serial_run!(attempt, readiness)
+running = start_serial_run!(armed)
+```
+
+Configuration derives the exact event loop from the command bridge and freezes
+the serial topology and policies; it accepts no independent plant/event-loop
+pair that could be mixed. Preparation resolves product sources from that same
+event loop and allocates the command state, acquisition sequence state, and
+workspaces without reading the clock, starting workers, or accepting traffic.
+Runtime handles retain the exact prepared run, so state and workspace from
+different runs cannot be combined. Clean stop requires quiescent current
+resources and records either a typed request or terminal event; runtime errors
+record failed termination. The accepted readiness snapshot is retained once
+in lifecycle state rather than copied into each product descriptor.
+Coordinated port closure, owner acknowledgement, bounded drain, and
+ownership-deficit finalization remain later Gate 8 work and are not claimed by
+this phase.
+
+The current core serial event loop exposes no prepared nonstructural
+acquisition, trigger, shutter, calibration-source, or optic-mode control seam,
+so serial configuration rejects such declarations instead of accepting
+callbacks or mutable structural changes.
+
 ## Deterministic serial runtime
 
 `AdaptiveOpticsHIL.Serial` composes one prepared
 `AdaptiveOpticsSim.Plant` event loop with an event-loop command bridge and a
-nonempty tuple of acquisition-completion ports. The prepared run has an exact
-state/workspace binding and is armed only after the user-owned integration
-reports its adapter ready. Arming captures one immutable execution-clock
-mapping; it does not add wall-clock state to AdaptiveOpticsSim.
+nonempty tuple of acquisition-completion ports. Arming captures one immutable
+execution-clock mapping only after lifecycle validation; it does not add
+wall-clock state to AdaptiveOpticsSim.
 
 Each `step_serial_run!` call makes one bounded, nonblocking decision:
 

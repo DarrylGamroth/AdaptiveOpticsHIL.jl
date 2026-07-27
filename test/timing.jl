@@ -6,6 +6,14 @@ using InteractiveUtils
 struct WrongWidthNanoClock <: Clocks.AbstractNanoClock end
 Clocks.time_nanos(::WrongWidthNanoClock) = Int32(0)
 
+struct IdentifiedNanoClock <: Clocks.AbstractNanoClock
+    value::Int64
+end
+Clocks.time_nanos(clock::IdentifiedNanoClock) = clock.value
+AdaptiveOpticsHIL.Timing.execution_clock_identity(
+    ::IdentifiedNanoClock) =
+    ExecutionClockID(:identified_test_clock)
+
 const TIMING_TESTS_WITH_COVERAGE =
     Base.JLOptions().code_coverage != 0
 
@@ -368,10 +376,17 @@ end
 
         @test mapping isa ExecutionClockMapping{CachedNanoClock}
         @test @inferred(execution_clock(mapping)) === clock
+        @test @inferred(execution_clock_identity(clock)) ==
+            ExecutionClockID(:execution_clock)
         @test @inferred(execution_clock_identity(mapping)) ==
             ExecutionClockID(:execution_clock)
         @test @inferred(plant_time_origin(mapping)) == origin
         @test @inferred(execution_clock_origin_ns(mapping)) == 1_000
+
+        identified = IdentifiedNanoClock(2_000)
+        identified_mapping = @inferred arm_execution_clock(identified)
+        @test execution_clock_identity(identified_mapping) ==
+            ExecutionClockID(:identified_test_clock)
 
         @test @inferred(execution_lateness_ns(mapping, target)) == -250
         @test @inferred(execution_time_until_ns(mapping, target)) == 250
@@ -500,6 +515,8 @@ end
             update_cadence_ns=100)
         clock = cached_execution_clock(controller)
         @test clock isa CachedExecutionClock
+        @test execution_clock_identity(clock) ==
+            ExecutionClockID(:scheduler_cache)
         @test time_nanos(clock) == 1_000
         @test cached_clock_update_owner(clock) == owner
         @test cached_clock_update_owner(controller) == owner

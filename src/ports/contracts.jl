@@ -123,17 +123,6 @@ end
     throw(PortError(component, :invalid_version,
         "$label must be an integer count, not Bool"))
 
-"""Positive run-local epoch shared by every port and payload pool in a run."""
-struct RunSessionID
-    value::UInt64
-
-    RunSessionID(value::UInt64, ::_PositiveCounterToken) = new(value)
-end
-
-RunSessionID(value::Integer) = RunSessionID(
-    _checked_positive_uint64(value, :session, "run/session identity"),
-    _POSITIVE_COUNTER_TOKEN)
-
 """Positive producer-assigned sequence within one session and one stream."""
 struct StreamSequence
     value::UInt64
@@ -170,7 +159,6 @@ PortSchemaVersion(value::Integer) = PortSchemaVersion(
     _POSITIVE_COUNTER_TOKEN)
 
 const _PortCounter = Union{
-    RunSessionID,
     StreamSequence,
     PortSchemaVersion,
 }
@@ -196,9 +184,6 @@ end
 function Base.show(io::IO, value::PortSchemaID)
     print(io, nameof(typeof(value)), "(", repr(value.name), ")")
 end
-
-"""Return the numeric run/session epoch."""
-run_session_value(value::RunSessionID) = value.value
 
 """Return the numeric per-stream sequence."""
 stream_sequence_value(value::StreamSequence) = value.value
@@ -430,24 +415,6 @@ end
         return CommandTimestampMismatch
     return NoPortRejection
 end
-
-"""Adapter availability reported to orchestration without transport semantics."""
-@enum AdapterReadinessStatus::UInt8 begin
-    AdapterNotReady = 0x01
-    AdapterReady = 0x02
-    AdapterFailed = 0x03
-end
-
-"""Run-time readiness observation on the canonical plant timeline."""
-struct AdapterReadinessSnapshot
-    status::AdapterReadinessStatus
-    observed_timestamp::PlantTimestamp
-end
-
-adapter_readiness_status(snapshot::AdapterReadinessSnapshot) =
-    snapshot.status
-adapter_readiness_timestamp(snapshot::AdapterReadinessSnapshot) =
-    snapshot.observed_timestamp
 
 """
 Adapter-side delivery bounds consumed by orchestration. Lead time begins when a

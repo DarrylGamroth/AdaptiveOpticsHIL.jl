@@ -217,9 +217,10 @@ struct ExecutionClockMapping{C<:Clocks.AbstractNanoClock}
     execution_origin_ns::Int64
 end
 
-_default_execution_clock_identity(::Clocks.AbstractNanoClock) =
+"""Return the stable run-facing identity selected for an execution clock."""
+execution_clock_identity(::Clocks.AbstractNanoClock) =
     ExecutionClockID(:execution_clock)
-_default_execution_clock_identity(clock::CachedExecutionClock) =
+execution_clock_identity(clock::CachedExecutionClock) =
     clock.identity
 
 _validate_execution_clock_identity(
@@ -247,7 +248,7 @@ function arm_execution_clock(
     clock::C,
     plant_origin::PlantTimestamp=zero(PlantTimestamp);
     identity::ExecutionClockID=
-        _default_execution_clock_identity(clock)) where {
+        execution_clock_identity(clock)) where {
     C<:Clocks.AbstractNanoClock}
     _validate_execution_clock_identity(clock, identity)
     execution_origin_ns = _read_execution_clock(clock)

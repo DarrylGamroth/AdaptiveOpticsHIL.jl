@@ -3,6 +3,7 @@ using Aqua
 using Test
 
 include("timing.jl")
+include("lifecycle.jl")
 include("ownership.jl")
 include("ports.jl")
 include("serial.jl")
