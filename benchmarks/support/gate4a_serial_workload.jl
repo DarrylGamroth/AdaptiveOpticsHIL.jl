@@ -1,8 +1,10 @@
 module Gate4ASerialWorkload
 
+using AdaptiveOpticsHIL.Lifecycle
 using AdaptiveOpticsHIL.Ownership
 using AdaptiveOpticsHIL.Ports
 using AdaptiveOpticsHIL.Serial
+using AdaptiveOpticsHIL.Timing: execution_clock_identity
 using AdaptiveOpticsSim
 using AdaptiveOpticsSim.Plant
 using AdaptiveOpticsSim.Plant: AbsoluteCommand, ClipInvalidCommand
@@ -449,18 +451,19 @@ function prepare_gate4a_fixture(
         product_pool_id=UInt64(0x7c21),
         ring_capacity=config.feedback_product_capacity,
         delivery_contract=delivery)
-    run = prepare_serial_run(
-        core.plant,
-        core.event_loop,
+    configuration = configure_serial_run(
         bridge,
-        (wfs_port, feedback_port))
-    state = SerialRunState(run)
-    workspace = SerialRunWorkspace(run)
+        (wfs_port, feedback_port);
+        arm_timeout_ns=1_000_000_000)
+    run = prepare_serial_run(configuration)
+    attempt = begin_serial_arm!(run, clock)
     readiness = AdapterReadinessSnapshot(
-        AdapterReady, PlantTimestamp(0))
-    armed = arm_serial_run(
-        run, state, workspace, clock, readiness)
-    start_serial_run!(armed, state)
+        session,
+        execution_clock_identity(clock),
+        AdapterReady,
+        Clocks.time_nanos(clock))
+    armed = arm_serial_run!(attempt, readiness)
+    running = start_serial_run!(armed)
     return merge(
         core,
         (;
@@ -469,21 +472,23 @@ function prepare_gate4a_fixture(
             bridge,
             wfs_port,
             feedback_port,
+            configuration,
             run,
-            state,
-            workspace,
             clock,
-            armed))
+            attempt,
+            readiness,
+            armed,
+            running))
 end
 
 primary_product_sequence(fixture) = acquisition_product_sequence(
     fixture.event_loop,
-    plant_event_loop_state(fixture.state.bridge),
+    plant_event_loop_state(fixture.run.state.bridge),
     :hil_wfs)
 
 feedback_product_sequence(fixture) = acquisition_product_sequence(
     fixture.event_loop,
-    plant_event_loop_state(fixture.state.bridge),
+    plant_event_loop_state(fixture.run.state.bridge),
     :hil_dm_feedback)
 
 function latest_optical_sample_timestamp(fixture)

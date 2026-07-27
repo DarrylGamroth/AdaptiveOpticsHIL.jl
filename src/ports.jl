@@ -53,6 +53,7 @@ using AdaptiveOpticsSim.Plant: validate_acquisition_product_contract
 import AdaptiveOpticsSim.Plant: acquisition_product_contract
 
 import ..AdaptiveOpticsHIL: AdaptiveOpticsHILError
+using ..Lifecycle: RunSessionID, run_session_value
 using ..Timing: ExternalTimestampDomainID, MappedExternalTimestamp
 using ..Timing: TimestampMappingVersion
 using ..Timing: _NO_EXTERNAL_TIMESTAMP_DOMAIN
@@ -251,8 +252,8 @@ function payload_ownership_deficit(port::Union{
 end
 
 export PortError
-export RunSessionID, StreamSequence, PortSchemaID, PortSchemaVersion
-export run_session_value, stream_sequence_value
+export StreamSequence, PortSchemaID, PortSchemaVersion
+export stream_sequence_value
 export PortStatus, PortTransferSucceeded, PortFull, PortEmpty, PortClosed
 export PortRejected, PortRejectionReason, NoPortRejection
 export SessionMismatch, DescriptorSchemaMismatch, CommandBasisMismatch
@@ -286,9 +287,7 @@ export mapped_source_timestamp, command_receive_timestamp
 export command_effective_timestamp, timestamp_mapping_uncertainty
 export AbstractCommandTimingContract, ReceiveTimeTimingContract
 export MappedSourceTimingContract
-export AdapterReadinessStatus, AdapterNotReady, AdapterReady, AdapterFailed
-export AdapterReadinessSnapshot, AdapterDeliveryContract
-export adapter_readiness_status, adapter_readiness_timestamp
+export AdapterDeliveryContract
 export complete_product_lead_time, maximum_lease_hold_time
 
 export InlineCommandPayload, LeasedCommandPayload, CommandSubmission
@@ -327,7 +326,6 @@ export prepare_acquisition_completion_port, matching_acquisition_completion
 export close_acquisition_completion!, close_acquisition_return_path!
 export acquisition_completion_session, acquisition_completion_sequence
 export acquisition_completion_id, acquisition_completion_timestamp
-export acquisition_completion_readiness
 export acquisition_completion_publication_ns
 export try_claim_product!, producer_product, abort_product!, completed_product
 export try_publish!, release_product!, acquisition_product_accounting

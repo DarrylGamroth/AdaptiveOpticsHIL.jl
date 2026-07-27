@@ -1,4 +1,5 @@
 import AdaptiveOpticsHIL
+using AdaptiveOpticsHIL.Lifecycle
 using AdaptiveOpticsHIL.Ownership
 using AdaptiveOpticsHIL.Ports
 using AdaptiveOpticsHIL.Timing
@@ -7,6 +8,15 @@ import AdaptiveOpticsSim
 const PORT_TEST_PLANT = AdaptiveOpticsSim.Plant
 const PORT_TESTS_WITH_COVERAGE =
     Base.JLOptions().code_coverage != 0
+const PORT_TEST_EXECUTION_CLOCK =
+    ExecutionClockID(:port_test_clock)
+
+port_test_readiness(session, execution_ns) =
+    AdapterReadinessSnapshot(
+        session,
+        PORT_TEST_EXECUTION_CLOCK,
+        AdapterReady,
+        execution_ns)
 
 function port_test_mapped_timestamp(
     domain::ExternalTimestampDomainID,
@@ -248,7 +258,6 @@ function acquisition_port_cycle!(
         port,
         StreamSequence(stream),
         timestamp,
-        AdapterReadinessSnapshot(AdapterReady, timestamp),
         lease_ref[],
         Int64(timestamp_ns))
     publish_result = try_publish!(port, completion)
@@ -274,6 +283,10 @@ end
             AdaptiveOpticsHIL.Ports, :ExternalTimestampDomainID)
         @test !Base.isexported(
             AdaptiveOpticsHIL.Ports, :TimestampMappingVersion)
+        @test Base.isexported(
+            AdaptiveOpticsHIL.Lifecycle, :RunSessionID)
+        @test !Base.isexported(
+            AdaptiveOpticsHIL.Ports, :RunSessionID)
         @test_throws PortError PortResourcePolicy(
             true, 1, RetainProducerOnFull())
         @test_throws PortError PortResourcePolicy(
@@ -282,7 +295,7 @@ end
             0, 0, RetainProducerOnFull())
         @test_throws PortError PortResourcePolicy(
             1, 2, RetainProducerOnFull())
-        @test_throws PortError RunSessionID(0)
+        @test_throws RunLifecycleError RunSessionID(0)
         @test_throws PortError StreamSequence(false)
         @test_throws PortError PortSchemaID(Symbol(""))
         @test_throws PortError PortSchemaVersion(0)
@@ -395,9 +408,13 @@ end
         delivery = AdapterDeliveryContract(
             PORT_TEST_PLANT.PlantDuration(25),
             PORT_TEST_PLANT.PlantDuration(1_000))
-        readiness = AdapterReadinessSnapshot(AdapterReady, receive)
+        readiness =
+            port_test_readiness(RunSessionID(1), Int64(90))
         @test adapter_readiness_status(readiness) == AdapterReady
-        @test adapter_readiness_timestamp(readiness) == receive
+        @test run_session(readiness) == RunSessionID(1)
+        @test run_execution_clock_identity(readiness) ==
+            PORT_TEST_EXECUTION_CLOCK
+        @test adapter_readiness_execution_ns(readiness) == 90
         @test complete_product_lead_time(delivery) ==
             PORT_TEST_PLANT.PlantDuration(25)
         @test maximum_lease_hold_time(delivery) ==
@@ -1609,6 +1626,9 @@ end
 end
 
 @testset "Complete acquisition ports" begin
+    @test !Base.isexported(
+        AdaptiveOpticsHIL.Ports, :acquisition_completion_readiness)
+    @test !hasfield(AcquisitionCompletion, :readiness)
     products = [
         PORT_TEST_PLANT.AcquisitionProducts(
             zeros(Float32, 2, 2); metadata=(kind=:pixels,)),
@@ -1655,20 +1675,16 @@ end
         PayloadTransitionSucceeded
     producer_product(port, leases[1][]).observation .= 1
     producer_product(port, leases[2][]).observation .= 2
-    readiness = AdapterReadinessSnapshot(
-        AdapterReady, PORT_TEST_PLANT.PlantTimestamp(100))
     first = matching_acquisition_completion(
         port,
         StreamSequence(1),
         PORT_TEST_PLANT.PlantTimestamp(100),
-        readiness,
         leases[1][],
         Int64(1_000))
     second = matching_acquisition_completion(
         port,
         StreamSequence(2),
         PORT_TEST_PLANT.PlantTimestamp(200),
-        readiness,
         leases[2][],
         Int64(2_000))
     @test acquisition_completion_session(first) == session
@@ -1677,7 +1693,6 @@ end
         PORT_TEST_PLANT.AcquisitionID(:wfs_pixels)
     @test acquisition_completion_timestamp(first) ==
         PORT_TEST_PLANT.PlantTimestamp(100)
-    @test acquisition_completion_readiness(first) == readiness
     @test acquisition_completion_publication_ns(first) == 1_000
     @test try_publish!(port, first).status == PortTransferSucceeded
     @test try_publish!(port, second).status == PortFull
@@ -1734,8 +1749,6 @@ end
         port,
         StreamSequence(6),
         PORT_TEST_PLANT.PlantTimestamp(600),
-        AdapterReadinessSnapshot(
-            AdapterReady, PORT_TEST_PLANT.PlantTimestamp(600)),
         mismatch_lease[],
         Int64(600))
     wrong_session = AcquisitionCompletion(
@@ -1745,7 +1758,6 @@ end
         base_completion.stream_sequence,
         base_completion.acquisition,
         base_completion.completion_timestamp,
-        base_completion.readiness,
         base_completion.product_lease,
         base_completion.publication_execution_ns)
     @test try_publish!(port, wrong_session).reason == SessionMismatch
@@ -1756,7 +1768,6 @@ end
         base_completion.stream_sequence,
         base_completion.acquisition,
         base_completion.completion_timestamp,
-        base_completion.readiness,
         base_completion.product_lease,
         base_completion.publication_execution_ns)
     @test try_publish!(port, wrong_schema).reason ==
@@ -1768,7 +1779,6 @@ end
         base_completion.stream_sequence,
         PORT_TEST_PLANT.AcquisitionID(:other_acquisition),
         base_completion.completion_timestamp,
-        base_completion.readiness,
         base_completion.product_lease,
         base_completion.publication_execution_ns)
     @test try_publish!(port, wrong_acquisition).reason ==
@@ -1823,18 +1833,12 @@ end
             drop_port,
             StreamSequence(1),
             PORT_TEST_PLANT.PlantTimestamp(1),
-            AdapterReadinessSnapshot(
-                AdapterReady,
-                PORT_TEST_PLANT.PlantTimestamp(1)),
             drop_leases[1][],
             Int64(1))
         dropped_completion = matching_acquisition_completion(
             drop_port,
             StreamSequence(2),
             PORT_TEST_PLANT.PlantTimestamp(2),
-            AdapterReadinessSnapshot(
-                AdapterReady,
-                PORT_TEST_PLANT.PlantTimestamp(2)),
             drop_leases[2][],
             Int64(2))
         @test try_publish!(drop_port, first_drop_completion).status ==
@@ -1860,9 +1864,6 @@ end
             drop_port,
             StreamSequence(3),
             PORT_TEST_PLANT.PlantTimestamp(3),
-            AdapterReadinessSnapshot(
-                AdapterReady,
-                PORT_TEST_PLANT.PlantTimestamp(3)),
             third_lease[],
             Int64(3))
         @test try_publish!(drop_port, third_completion).status ==
@@ -1880,9 +1881,6 @@ end
             drop_port,
             StreamSequence(4),
             PORT_TEST_PLANT.PlantTimestamp(4),
-            AdapterReadinessSnapshot(
-                AdapterReady,
-                PORT_TEST_PLANT.PlantTimestamp(4)),
             closed_lease[],
             Int64(4))
         @test try_publish!(drop_port, closed_completion).status ==
@@ -1935,9 +1933,6 @@ end
             invariant_port,
             StreamSequence(1),
             PORT_TEST_PLANT.PlantTimestamp(1),
-            AdapterReadinessSnapshot(
-                AdapterReady,
-                PORT_TEST_PLANT.PlantTimestamp(1)),
             invariant_lease[],
             Int64(1))
         @test try_publish!(

@@ -1,5 +1,6 @@
 module Gate4ABoundaryHarness
 
+using AdaptiveOpticsHIL.Lifecycle
 using AdaptiveOpticsHIL.Ownership
 using AdaptiveOpticsHIL.Ports
 using AdaptiveOpticsHIL.Serial
@@ -844,7 +845,7 @@ function _run_is_complete(driver::BoundaryDriver)
         descriptor_accounting(
             command_completion_port(
                 driver.fixture.command_ports)).occupancy == 0 &&
-        active_command_correlations(driver.fixture.state.bridge) == 0
+        active_command_correlations(driver.fixture.run.state.bridge) == 0
 end
 
 struct BoundaryRunResult{
@@ -864,10 +865,7 @@ end
 function execute_boundary_run!(driver::BoundaryDriver)
     wall_start = time_ns()
     while true
-        result = step_serial_run!(
-            driver.fixture.armed,
-            driver.fixture.state,
-            driver.fixture.workspace)
+        result = step_serial_run!(driver.fixture.running)
         elapsed = _execution_elapsed_ns(driver)
         _update_offered_arrivals!(driver, elapsed)
 
@@ -903,10 +901,14 @@ function execute_boundary_run!(driver::BoundaryDriver)
     _observe_feedback_products!(driver)
     reclaim_serial_returns!(driver.fixture.run)
     wall_end = time_ns()
+    request = RunStopRequest(
+        run_session(driver.fixture.run),
+        execution_clock_identity(driver.fixture.armed.timing),
+        Clocks.time_nanos(driver.fixture.clock);
+        reason=:benchmark_complete)
     accounting = stop_serial_run!(
-        driver.fixture.armed,
-        driver.fixture.state,
-        driver.fixture.workspace)
+        driver.fixture.running,
+        request)
     return BoundaryRunResult(
         driver.histograms,
         driver.counters,
@@ -998,10 +1000,14 @@ function _exercise_instrumentation!(
 end
 
 function _stop_instrumentation_driver!(driver::BoundaryDriver)
+    request = RunStopRequest(
+        run_session(driver.fixture.run),
+        execution_clock_identity(driver.fixture.armed.timing),
+        Clocks.time_nanos(driver.fixture.clock);
+        reason=:instrumentation_complete)
     stop_serial_run!(
-        driver.fixture.armed,
-        driver.fixture.state,
-        driver.fixture.workspace)
+        driver.fixture.running,
+        request)
     return nothing
 end
 

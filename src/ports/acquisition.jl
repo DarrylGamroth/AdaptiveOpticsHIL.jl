@@ -10,7 +10,6 @@ struct AcquisitionCompletion
     stream_sequence::StreamSequence
     acquisition::AcquisitionID
     completion_timestamp::PlantTimestamp
-    readiness::AdapterReadinessSnapshot
     product_lease::PayloadLeaseRef
     publication_execution_ns::Int64
 end
@@ -21,8 +20,6 @@ acquisition_completion_sequence(value::AcquisitionCompletion) =
 acquisition_completion_id(value::AcquisitionCompletion) = value.acquisition
 acquisition_completion_timestamp(value::AcquisitionCompletion) =
     value.completion_timestamp
-acquisition_completion_readiness(value::AcquisitionCompletion) =
-    value.readiness
 acquisition_completion_publication_ns(value::AcquisitionCompletion) =
     value.publication_execution_ns
 
@@ -247,7 +244,6 @@ function matching_acquisition_completion(
     port::AcquisitionCompletionPort,
     stream_sequence::StreamSequence,
     completion_timestamp::PlantTimestamp,
-    readiness::AdapterReadinessSnapshot,
     product_lease::PayloadLeaseRef,
     publication_execution_ns::Int64)
     return AcquisitionCompletion(
@@ -257,7 +253,6 @@ function matching_acquisition_completion(
         stream_sequence,
         port.acquisition,
         completion_timestamp,
-        readiness,
         product_lease,
         publication_execution_ns)
 end
