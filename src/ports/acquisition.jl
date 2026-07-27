@@ -192,7 +192,10 @@ acquisition_product_contract(port::AcquisitionCompletionPort) =
 
 function port_resource_policy(port::AcquisitionCompletionPort)
     capacity = ring_capacity(port.ring)
-    return PortResourcePolicy(capacity, capacity, port.full_policy)
+    maximum = min(
+        capacity,
+        payload_pool_capacity(port.product_pool))
+    return PortResourcePolicy(capacity, maximum, port.full_policy)
 end
 
 """

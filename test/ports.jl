@@ -1929,6 +1929,17 @@ end
         product_pool_id=UInt64(147),
         delivery_contract=delivery,
         full_policy=ReservedFullIsInvariant())
+    oversized_ring_port = prepare_acquisition_completion_port(
+        PORT_TEST_PLANT.AcquisitionID(:oversized_ring),
+        products;
+        session,
+        product_pool_id=UInt64(149),
+        ring_capacity=4,
+        delivery_contract=delivery)
+    oversized_ring_policy =
+        port_resource_policy(oversized_ring_port)
+    @test resource_capacity(oversized_ring_policy) == 4
+    @test maximum_outstanding(oversized_ring_policy) == 2
 
     # Sampled device feedback deliberately uses this same complete-product
     # contract; it is not a CommandOutcome or a separate instrument API.
