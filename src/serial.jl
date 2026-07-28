@@ -151,7 +151,11 @@ struct SerialRunError <: AdaptiveOpticsHILError
     component::Symbol
     reason::Symbol
     msg::String
+    context::NamedTuple
 end
+
+SerialRunError(component::Symbol, reason::Symbol, msg::String) =
+    SerialRunError(component, reason, msg, (;))
 
 struct PreparedAcquisitionPublisher{
     P<:AcquisitionCompletionPort,
@@ -1540,22 +1544,51 @@ end
 end
 
 @noinline function _fail_serial_acquisition!(
+    publisher::PreparedAcquisitionPublisher,
     publication::AcquisitionPublicationState,
     decision::AcquisitionOverloadDecision,
     reason::Symbol,
     message::String)
     _mark_serial_acquisition_overload!(publication, decision)
     publication.products_failed += UInt64(1)
-    _serial_publication_error(reason, message)
+    descriptors = ring_accounting(publisher.port.ring)
+    products = acquisition_product_accounting(publisher.port)
+    context = (
+        acquisition=publisher.id,
+        sequence=publication.last_sequence,
+        descriptor_occupancy=descriptors.occupancy,
+        descriptor_capacity=descriptors.capacity,
+        product_occupancy=products.capacity - products.free,
+        product_capacity=products.capacity,
+        latest_lateness_ns=publication.latest_lateness_ns,
+        maximum_lateness_ns=publication.maximum_lateness_ns,
+        decision,
+    )
+    throw(SerialRunError(
+        publisher.id.name,
+        reason,
+        string(
+            message,
+            " (acquisition=", publisher.id.name,
+            ", sequence=", publication.last_sequence,
+            ", descriptor_occupancy=", context.descriptor_occupancy,
+            '/', context.descriptor_capacity,
+            ", product_occupancy=", context.product_occupancy,
+            '/', context.product_capacity,
+            ", latest_lateness_ns=", publication.latest_lateness_ns,
+            ')'),
+        context))
 end
 
 @inline function _handle_serial_capacity_overload!(
     policy::AcquisitionOverloadPolicy,
+    publisher::PreparedAcquisitionPublisher,
     publication::AcquisitionPublicationState)
     _serial_acquisition_may_shed(policy) &&
         return _shed_serial_acquisition!(
             publication, AcquisitionShedForCapacity)
     return _fail_serial_acquisition!(
+        publisher,
         publication,
         AcquisitionFailedForCapacity,
         :acquisition_product_capacity,
@@ -1564,11 +1597,13 @@ end
 
 @inline function _handle_serial_deadline_overload!(
     policy::AcquisitionOverloadPolicy,
+    publisher::PreparedAcquisitionPublisher,
     publication::AcquisitionPublicationState)
     _serial_acquisition_may_shed(policy) &&
         return _shed_serial_acquisition!(
             publication, AcquisitionShedForDeadline)
     return _fail_serial_acquisition!(
+        publisher,
         publication,
         AcquisitionFailedForDeadline,
         :acquisition_publication_deadline,
@@ -1634,7 +1669,8 @@ function _publish_serial_products!(
         maximum_lateness_ns = policy.maximum_lateness_ns
         if maximum_lateness_ns !== nothing &&
                 lateness_ns > maximum_lateness_ns
-            _handle_serial_deadline_overload!(policy, publication)
+            _handle_serial_deadline_overload!(
+                policy, publisher, publication)
             return _publish_serial_products!(
                 Base.tail(publishers),
                 armed,
@@ -1648,9 +1684,10 @@ function _publish_serial_products!(
         if claim_status != PayloadTransitionSucceeded
             if claim_status == PayloadPoolExhausted
                 _handle_serial_capacity_overload!(
-                    policy, publication)
+                    policy, publisher, publication)
             elseif claim_status == PayloadPoolClosed
                 _fail_serial_acquisition!(
+                    publisher,
                     publication,
                     AcquisitionFailedForCapacity,
                     :acquisition_publication_rejected,
@@ -1691,7 +1728,8 @@ function _publish_serial_products!(
             if !_serial_acquisition_may_shed(policy)
                 _abort_serial_product!(publisher.port, lease)
             end
-            _handle_serial_capacity_overload!(policy, publication)
+            _handle_serial_capacity_overload!(
+                policy, publisher, publication)
             _observe_serial_acquisition_occupancy!(
                 publication, publisher.port)
             return _publish_serial_products!(
@@ -1704,6 +1742,7 @@ function _publish_serial_products!(
         elseif publication_status != PortTransferSucceeded
             _abort_serial_product!(publisher.port, lease)
             _fail_serial_acquisition!(
+                publisher,
                 publication,
                 AcquisitionFailedForCapacity,
                 :acquisition_publication_rejected,

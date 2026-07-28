@@ -870,9 +870,11 @@ end
 
 @inline function serial_optional_shed_allocations!(
     policy,
+    publisher,
     publication)
     return @allocated AdaptiveOpticsHIL.Serial.
-        _handle_serial_capacity_overload!(policy, publication)
+        _handle_serial_capacity_overload!(
+            policy, publisher, publication)
 end
 
 @inline function serial_acquisition_accounting_allocations(
@@ -1361,11 +1363,20 @@ end
                 AcquisitionID(:hil_dm_feedback)) == 0
             allocation_state =
                 AdaptiveOpticsHIL.Serial.AcquisitionPublicationState()
+            optional_publisher = only(
+                publisher
+                for publisher in fixture.run.publishers
+                if publisher.id == AcquisitionID(:hil_dm_feedback)
+            )
             AdaptiveOpticsHIL.Serial.
                 _handle_serial_capacity_overload!(
-                    optional_policy, allocation_state)
+                    optional_policy,
+                    optional_publisher,
+                    allocation_state)
             @test serial_optional_shed_allocations!(
-                optional_policy, allocation_state) == 0
+                optional_policy,
+                optional_publisher,
+                allocation_state) == 0
         end
 
         deadline_policy = AcquisitionOverloadPolicy(
@@ -1969,6 +1980,12 @@ end
         @test exhausted_error isa SerialRunError
         @test exhausted_error.reason ==
             :acquisition_product_capacity
+        @test exhausted_error.component == :hil_wfs
+        @test exhausted_error.context.acquisition ==
+            AcquisitionID(:hil_wfs)
+        @test exhausted_error.context.sequence == UInt64(2)
+        @test exhausted_error.context.product_occupancy ==
+            exhausted_error.context.product_capacity
         @test run_phase(exhausted.run) == RunFailed
         @test run_termination_kind(run_termination(exhausted.run)) ==
             ResourcePolicyRunFailure
