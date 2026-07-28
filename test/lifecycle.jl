@@ -257,6 +257,24 @@ end
         coordinator =
             HIL_LIFECYCLE._prepare_run_failure_coordinator(
                 session, policy, owners)
+        prepared_coordinator_owner = owners[1]
+        owners[1] = RunOwnerID(:mutated_input_owner, 1)
+        @test HIL_LIFECYCLE._run_failure_owner(
+            coordinator, 1) == prepared_coordinator_owner
+        owners[1] = prepared_coordinator_owner
+        @test_throws RunLifecycleError begin
+            HIL_LIFECYCLE._prepare_run_failure_coordinator(
+                session,
+                policy,
+                Memory{RunOwnerID}(undef, 0))
+        end
+        duplicate_owners = Memory{RunOwnerID}(undef, 2)
+        duplicate_owners[1] = owners[1]
+        duplicate_owners[2] = owners[1]
+        @test_throws RunLifecycleError begin
+            HIL_LIFECYCLE._prepare_run_failure_coordinator(
+                session, policy, duplicate_owners)
+        end
         owner_failure = ArgumentError("owner failure")
         record = RunFailureRecord(
             DeviceRunFailure,
@@ -292,6 +310,34 @@ end
             :owner,
             :failure;
             work_sequence=false)
+        stale_record = RunFailureRecord(
+            DeviceRunFailure,
+            RunSessionID(999),
+            owners[3],
+            OwnerDeviceCompletion,
+            nothing,
+            :execution_owner,
+            :stale_session)
+        @test_throws RunLifecycleError begin
+            HIL_LIFECYCLE._publish_run_failure!(
+                coordinator, 3, stale_record)
+        end
+        wrong_owner_record = RunFailureRecord(
+            DeviceRunFailure,
+            session,
+            owners[2],
+            OwnerDeviceCompletion,
+            nothing,
+            :execution_owner,
+            :wrong_owner)
+        @test_throws RunLifecycleError begin
+            HIL_LIFECYCLE._publish_run_failure!(
+                coordinator, 3, wrong_owner_record)
+        end
+        @test_throws RunLifecycleError begin
+            HIL_LIFECYCLE._publish_run_failure!(
+                coordinator, 0, record)
+        end
 
         @test HIL_LIFECYCLE._publish_run_failure!(
             coordinator, 3, record)

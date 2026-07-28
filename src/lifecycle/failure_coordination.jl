@@ -252,26 +252,32 @@ function _prepare_run_failure_coordinator(
         :run_failure_coordinator,
         :empty_owner_set,
         "a run failure coordinator requires at least its coordinator owner"))
-    @inbounds for right in 2:length(owners)
+    prepared_owners = copy(owners)
+    @inbounds for right in 2:length(prepared_owners)
         for left in 1:(right - 1)
-            owners[left] == owners[right] && throw(RunLifecycleError(
-                :run_failure_coordinator,
-                :duplicate_owner,
-                "prepared run-owner identities must be unique"))
+            prepared_owners[left] == prepared_owners[right] &&
+                throw(RunLifecycleError(
+                    :run_failure_coordinator,
+                    :duplicate_owner,
+                    "prepared run-owner identities must be unique"))
         end
     end
-    signals = Memory{_RunOwnerFailureSignal}(undef, length(owners))
+    signals = Memory{_RunOwnerFailureSignal}(
+        undef, length(prepared_owners))
     @inbounds for index in eachindex(signals)
-        signals[index] = _RunOwnerFailureSignal(session, owners[index])
+        signals[index] = _RunOwnerFailureSignal(
+            session, prepared_owners[index])
     end
-    acknowledgement_timed_out = Memory{Bool}(undef, length(owners))
-    acknowledgement_observed = Memory{Bool}(undef, length(owners))
+    acknowledgement_timed_out = Memory{Bool}(
+        undef, length(prepared_owners))
+    acknowledgement_observed = Memory{Bool}(
+        undef, length(prepared_owners))
     fill!(acknowledgement_observed, false)
     fill!(acknowledgement_timed_out, false)
     return PreparedRunFailureCoordinator(
         session,
         policy,
-        owners,
+        prepared_owners,
         signals,
         _RunFailureCoordinatorState(
             _RunShutdownInactive,
@@ -285,6 +291,17 @@ function _prepare_run_failure_coordinator(
             false))
 end
 
+@inline function _checked_run_failure_owner_slot(
+    coordinator::PreparedRunFailureCoordinator,
+    slot::Int)
+    1 <= slot <= length(coordinator.owners) ||
+        throw(RunLifecycleError(
+            :run_failure_coordinator,
+            :unknown_owner_slot,
+            "run-failure owner slot is outside the prepared owner set"))
+    return slot
+end
+
 @inline _run_failure_owner_count(
     coordinator::PreparedRunFailureCoordinator) =
     length(coordinator.owners)
@@ -292,7 +309,8 @@ end
 @inline function _run_failure_owner(
     coordinator::PreparedRunFailureCoordinator,
     slot::Int)
-    return @inbounds coordinator.owners[slot]
+    index = _checked_run_failure_owner_slot(coordinator, slot)
+    return @inbounds coordinator.owners[index]
 end
 
 @inline function _run_shutdown_stop_epoch(
@@ -334,7 +352,18 @@ end
     coordinator::PreparedRunFailureCoordinator,
     slot::Int,
     record::RunFailureRecord)
-    signal = @inbounds coordinator.signals[slot]
+    index = _checked_run_failure_owner_slot(coordinator, slot)
+    record.session == coordinator.session || throw(
+        RunLifecycleError(
+            :run_failure_coordinator,
+            :stale_failure_session,
+            "run-failure record belongs to another run/session"))
+    record.owner == (@inbounds coordinator.owners[index]) ||
+        throw(RunLifecycleError(
+            :run_failure_coordinator,
+            :wrong_failure_owner,
+            "run-failure record belongs to another prepared owner"))
+    signal = @inbounds coordinator.signals[index]
     iszero(@atomic :monotonic signal.published_stop_epoch) ||
         return false
     signal.record = record
@@ -401,7 +430,8 @@ end
     slot::Int,
     epoch::UInt64)
     iszero(epoch) && return false
-    signal = @inbounds coordinator.signals[slot]
+    index = _checked_run_failure_owner_slot(coordinator, slot)
+    signal = @inbounds coordinator.signals[index]
     acknowledged =
         @atomic :monotonic signal.acknowledged_stop_epoch
     acknowledged == epoch && return true
@@ -415,7 +445,8 @@ end
     slot::Int)
     epoch = _run_shutdown_stop_epoch(coordinator)
     iszero(epoch) && return false
-    signal = @inbounds coordinator.signals[slot]
+    index = _checked_run_failure_owner_slot(coordinator, slot)
+    signal = @inbounds coordinator.signals[index]
     return (@atomic :acquire signal.acknowledged_stop_epoch) ==
         epoch
 end
