@@ -179,6 +179,70 @@ end
     @test workload.science_product_capacity ==
         contract["workload"]["science_product_capacity"]
 
+    soak_samples = minimum_soak_sample_count(
+        contract, workload)
+    soak_horizon_ns =
+        workload.primary_exposure_ns +
+        (soak_samples - 1) * workload.primary_period_ns
+    @test soak_samples == 600_002
+    @test soak_horizon_ns >=
+        contract["soak_duration_ns"] +
+        workload.primary_period_ns
+
+    latency_report(run, p99_ns, p99_9_ns) = Dict{String,Any}(
+        "run" => run,
+        "histograms" => Dict{String,Any}(
+            metric => Dict{String,Any}(
+                "p99_ns" => p99_ns,
+                "p99_9_ns" => p99_9_ns)
+            for metric in (
+                "publication_lateness_ns",
+                "adapter_observation_delay_ns",
+                "closed_loop_response_ns",
+            )))
+    latency = target_latency_gate(
+        [
+            latency_report(1, 10, 100),
+            latency_report(2, 20, 200),
+            latency_report(3, 30, 300),
+        ],
+        contract)
+    publication =
+        latency["publication_lateness_ns"]
+    @test publication["worst_p99_ns"] == 30
+    @test publication["worst_p99_9_ns"] == 300
+    @test [run["run"] for run in publication["runs"]] ==
+        [1, 2, 3]
+
+    overload = Dict{String,Any}(
+        "first_failure" => Dict{String,Any}(
+            "kind" => "ResourcePolicyRunFailure"),
+        "start_to_failure_ns" => 3_000_000_000,
+        "violation_to_failure_ns" => 0,
+        "violation_observation_is_failure_boundary" => true,
+        "ingress_closed" => true,
+        "failure_to_acknowledgement_ns" => 100,
+        "failure_to_shutdown_ns" => 200,
+        "failure_accounting" => Dict{String,Any}(
+            "owners" => [
+                Dict{String,Any}(
+                    "acknowledged" => true,
+                    "acknowledgement_timed_out" => false)
+                for _ in 1:2
+            ]),
+        "accounting" => Dict{String,Any}(
+            "ownership_drained" => true))
+    overload_gate = required_overload_gate(
+        overload, contract)
+    @test overload_gate["passed"]
+    @test overload_gate["start_to_failure_is_diagnostic"]
+    @test overload_gate[
+        "maximum_violation_to_failure_ns"] ==
+        contract["overload_failure_bound_ns"]
+    overload["accounting"]["ownership_drained"] = false
+    @test !required_overload_gate(
+        overload, contract)["passed"]
+
     doubled_rate = workload_at_rate(
         workload, 2 * contract["target_rate_hz"])
     @test doubled_rate.primary_period_ns ==

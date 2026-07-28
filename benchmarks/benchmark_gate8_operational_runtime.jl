@@ -1642,16 +1642,26 @@ function target_latency_gate(
     observations = Dict{String,Any}()
     passed = true
     for (metric, p99_key, p99_9_key) in metric_contracts
+        run_observations = [
+            Dict{String,Any}(
+                "run" => report["run"],
+                "p99_ns" =>
+                    histogram_metric(report, metric, "p99_ns"),
+                "p99_9_ns" =>
+                    histogram_metric(report, metric, "p99_9_ns"))
+            for report in reports
+        ]
         worst_p99 = maximum(
-            histogram_metric(report, metric, "p99_ns")
-            for report in reports)
+            observation["p99_ns"]
+            for observation in run_observations)
         worst_p99_9 = maximum(
-            histogram_metric(report, metric, "p99_9_ns")
-            for report in reports)
+            observation["p99_9_ns"]
+            for observation in run_observations)
         metric_passed =
             worst_p99 <= contract[p99_key] &&
             worst_p99_9 <= contract[p99_9_key]
         observations[metric] = Dict{String,Any}(
+            "runs" => run_observations,
             "worst_p99_ns" => worst_p99,
             "maximum_p99_ns" => contract[p99_key],
             "worst_p99_9_ns" => worst_p99_9,
@@ -1715,6 +1725,59 @@ function relative_latency_gate(
     return report
 end
 
+function required_overload_gate(overload, contract)
+    owners = overload["failure_accounting"]["owners"]
+    owners_acknowledged = all(
+        owner -> owner["acknowledged"],
+        owners)
+    acknowledgement_timed_out = any(
+        owner -> owner["acknowledgement_timed_out"],
+        owners)
+    ownership_drained =
+        overload["accounting"]["ownership_drained"]
+    failure_kind = overload["first_failure"]["kind"]
+    passed =
+        failure_kind == "ResourcePolicyRunFailure" &&
+        overload[
+            "violation_observation_is_failure_boundary"] &&
+        overload["violation_to_failure_ns"] <=
+            contract["overload_failure_bound_ns"] &&
+        overload["ingress_closed"] &&
+        overload["failure_to_acknowledgement_ns"] <=
+            contract["acknowledgement_timeout_ns"] &&
+        overload["failure_to_shutdown_ns"] <=
+            contract["drain_timeout_ns"] &&
+        owners_acknowledged &&
+        !acknowledgement_timed_out &&
+        ownership_drained
+    return Dict{String,Any}(
+        "failure_kind" => failure_kind,
+        "start_to_failure_ns" =>
+            overload["start_to_failure_ns"],
+        "start_to_failure_is_diagnostic" => true,
+        "violation_to_failure_ns" =>
+            overload["violation_to_failure_ns"],
+        "violation_observation_is_failure_boundary" =>
+            overload[
+                "violation_observation_is_failure_boundary"],
+        "maximum_violation_to_failure_ns" =>
+            contract["overload_failure_bound_ns"],
+        "ingress_closed" => overload["ingress_closed"],
+        "failure_to_acknowledgement_ns" =>
+            overload["failure_to_acknowledgement_ns"],
+        "maximum_acknowledgement_ns" =>
+            contract["acknowledgement_timeout_ns"],
+        "failure_to_shutdown_ns" =>
+            overload["failure_to_shutdown_ns"],
+        "maximum_shutdown_ns" =>
+            contract["drain_timeout_ns"],
+        "owners_acknowledged" => owners_acknowledged,
+        "acknowledgement_timed_out" =>
+            acknowledgement_timed_out,
+        "ownership_drained" => ownership_drained,
+        "passed" => passed)
+end
+
 function gate8_gate_report(
     correctness,
     baseline_reports,
@@ -1743,8 +1806,6 @@ function gate8_gate_report(
         baseline_reports, target_reports, contract)
     burst_counters = burst_report["counters"]
     science_counters = science_report["counters"]
-    overload_kind =
-        overload["first_failure"]["kind"]
     injected_passed = all(injected_reports) do report
         failure = report["first_failure"]
         failure["present"] &&
@@ -1866,34 +1927,8 @@ function gate8_gate_report(
                     report -> bounded_success_accounting(
                         report, contract),
                     saturation_reports)),
-        "required_overload" => Dict(
-            "failure_kind" => overload_kind,
-            "start_to_failure_ns" =>
-                overload["start_to_failure_ns"],
-            "violation_to_failure_ns" =>
-                overload["violation_to_failure_ns"],
-            "violation_observation_is_failure_boundary" =>
-                overload[
-                    "violation_observation_is_failure_boundary"],
-            "maximum_ns" =>
-                contract["overload_failure_bound_ns"],
-            "passed" =>
-                overload_kind == "ResourcePolicyRunFailure" &&
-                overload[
-                    "violation_observation_is_failure_boundary"] &&
-                overload["violation_to_failure_ns"] <=
-                    contract["overload_failure_bound_ns"] &&
-                overload["ingress_closed"] &&
-                overload["failure_to_acknowledgement_ns"] <=
-                    contract["acknowledgement_timeout_ns"] &&
-                overload["failure_to_shutdown_ns"] <=
-                    contract["drain_timeout_ns"] &&
-                all(
-                    owner -> owner["acknowledged"] &&
-                        !owner["acknowledgement_timed_out"],
-                    overload[
-                        "failure_accounting"]["owners"]) &&
-                overload["accounting"]["ownership_drained"]),
+        "required_overload" =>
+            required_overload_gate(overload, contract),
         "fresh_run_recovery" => Dict(
             "passed" => bounded_success_accounting(
                 recovery_report, contract)),
@@ -2021,6 +2056,21 @@ function derived_rate(
         rounding_hz
     rate > 0 || error("derived operational rate was not positive")
     return rate
+end
+
+function minimum_soak_sample_count(contract, workload)
+    scheduled_samples = cld(
+        max(
+            0,
+            contract["soak_duration_ns"] -
+                workload.primary_exposure_ns),
+        workload.primary_period_ns) + 1
+    # The execution-clock origin precedes the benchmark loop's wall start.
+    # One additional schedule period keeps that setup skew from shortening
+    # the measured wall interval below the unchanged soak-duration gate.
+    return max(
+        contract["soak_minimum_samples"],
+        scheduled_samples + 1)
 end
 
 function gate8_summary_report(
@@ -2366,12 +2416,8 @@ function gate8_main(arguments=ARGS)
     deficit = named_deficit_report(
         Operational.execute_named_drain_deficit(contract))
 
-    soak_samples = max(
-        contract["soak_minimum_samples"],
-        cld(
-            contract["soak_duration_ns"] -
-                workload.primary_exposure_ns,
-            workload.primary_period_ns) + 1)
+    soak_samples = minimum_soak_sample_count(
+        contract, workload)
     println(
         "Gate 8: 300 s soak ($soak_samples WFS products)")
     flush(stdout)
