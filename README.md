@@ -96,14 +96,24 @@ oracle. An explicit `ExecutionOwnerConfiguration` selects either:
 
 - `DeterministicExecutionOwners()`, which drives the same bounded owner paths
   synchronously and can vary completion order without creating tasks; or
-- `ThreadedExecutionOwners()`, which creates one long-lived Julia task per
-  owner during arm and reuses it until nominal stop.
+- `AgentExecutionOwners(factory; placement)`, which creates one long-lived
+  Agrona-style Agent.jl duty-cycle agent per owner during arm and reuses it
+  until nominal stop.
 
-Threaded owners use an explicit yielding or bounded spin/yield idle policy.
-They are not pinned, may migrate between Julia threads, and do not pace the
-plant. Preparation validates a declared core `CPUExecutionBudget` against an
-observed `CPUExecutionEnvironment` without changing Julia, FFT, or BLAS thread
-settings.
+The factory creates one independent Agent.jl idle strategy for every owner and
+one for the coordinator wait path. Scheduler-managed placement is portable and
+cooperative. `ThreadAssignedExecutionOwnerPlacement` assigns owners to unique
+Julia default-pool threads. This mode must be armed, started, and run from one
+sticky coordinator task on a different managed Julia thread; arm rejects a
+coordinator/owner thread collision. The coordinator may use the default or
+interactive pool. Optional CPU IDs use Agent.jl's ThreadPinning.jl extension
+when the caller has loaded ThreadPinning.jl. Assignment or affinity does not
+reserve a physical core, establish OS scheduling priority, or prove
+SMT/interrupt isolation.
+Preparation validates a declared core `CPUExecutionBudget` against an observed
+`CPUExecutionEnvironment` without changing Julia, FFT, or BLAS thread settings.
+Busy-spin strategies are appropriate only when the deployment has separately
+reserved the corresponding cores and accepted their power and thermal cost.
 
 Every `ExecutionOwnerConfiguration` also requires one immutable
 `ExecutionOwnerOverloadPolicy`. A base policy classifies all owners as
@@ -119,8 +129,8 @@ each due timestamp it performs the core
 begin → materialize → seal → execute → complete contract, so independently
 owned WFS and optional science paths may execute concurrently only after all
 current-epoch inputs are materialized. Nominal stop closes every owner input,
-collects one stop acknowledgement per owner, joins threaded tasks, and verifies
-empty ring/accounting state. `serial_run_accounting` includes a cold snapshot
+collects one stop acknowledgement per owner, joins Agent runner tasks, and
+verifies empty ring/accounting state. `serial_run_accounting` includes a cold snapshot
 of these owners alongside port, pool, and lease accounting. Each coordinator,
 path owner, and device-submission owner has one preallocated compact
 first-failure slot and stop acknowledgement. Failure never retries or rolls
@@ -251,8 +261,8 @@ the serial topology and policies; it accepts no independent plant/event-loop
 pair that could be mixed. Preparation resolves product sources from that same
 event loop and allocates the command state, acquisition sequence state, and
 workspaces without reading the clock or accepting traffic. An explicitly
-configured threaded execution policy creates one task per already-prepared,
-stable owner only during arm.
+configured Agent execution policy creates one task per already-prepared, stable
+owner only during arm.
 Runtime handles retain the exact prepared run, so state and workspace from
 different runs cannot be combined. Clean stop requires quiescent current
 resources and records either a typed request or terminal event. Runtime errors
@@ -307,10 +317,10 @@ gap.
 
 The step call never sleeps for a pending deadline, invokes callbacks, creates
 tasks, or chooses transport. The default serial executor starts no workers.
-With an explicit threaded owner policy, an optical event waits at its prepared
+With an explicit Agent execution-owner mode, an optical event waits at its prepared
 materialization and execution barriers while the coordinator and already-armed
 tasks poll only their bounded owner rings according to the selected idle
-policy. A caller may advance a `CachedNanoClock` exactly in deterministic tests
+strategy. A caller may advance a `CachedNanoClock` exactly in deterministic tests
 or apply its own pacing policy around a `SystemNanoClock` in production.
 
 Acquisition publication observes descriptor and product-pool occupancy
@@ -361,7 +371,7 @@ contains the current qualified baseline.
 
 The maintained Gate 8.9 contract separately qualifies the single-host,
 in-memory, two-owner CPU runtime over the same reduced-order boundary. It
-preserves exact serial/deterministic/threaded replay and records fixed 2 kHz
+preserves exact serial/deterministic/Agent-owner replay and records fixed 2 kHz
 target load, consumer interruption, optional-stream shedding, calibrated
 capacity, near-saturation, saturation, required overload, fresh recovery,
 injected owner failure, a named drain deficit, clean lifecycle timing, and a

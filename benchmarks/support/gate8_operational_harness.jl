@@ -8,6 +8,7 @@ using AdaptiveOpticsHIL.Ports
 using AdaptiveOpticsHIL.Serial
 using AdaptiveOpticsHIL.Timing
 import AdaptiveOpticsSim
+import Agent
 using Clocks
 using HdrHistogram
 using LinearAlgebra
@@ -64,44 +65,50 @@ Gate8FailureControl() = Gate8FailureControl(
     Threads.Atomic{UInt64}(0),
     Threads.Atomic{UInt64}(0))
 
-struct Gate8FailureIdlePolicy <:
-    AbstractExecutionOwnerIdlePolicy
+struct Gate8FailureIdleStrategy <: Agent.IdleStrategy
     control::Gate8FailureControl
     coordinator_task_id::UInt
-    spin_count::UInt32
+    yielding::Agent.YieldingIdleStrategy
 end
 
-Gate8FailureIdlePolicy(
+struct Gate8FailureIdleStrategyFactory
+    control::Gate8FailureControl
+    coordinator_task_id::UInt
+end
+
+function Gate8FailureIdleStrategyFactory(
     control::Gate8FailureControl,
-    spin_count::Integer) = Gate8FailureIdlePolicy(
+)
+    return Gate8FailureIdleStrategyFactory(
         control,
         objectid(current_task()),
-        UInt32(spin_count))
-
-AdaptiveOpticsHIL.Execution._validate_execution_owner_idle_policy(
-    ::Gate8FailureIdlePolicy) = nothing
-
-function AdaptiveOpticsHIL.Execution._next_idle_poll(
-    policy::Gate8FailureIdlePolicy,
-    poll_count::UInt32)
-    if objectid(current_task()) !=
-            policy.coordinator_task_id &&
-            policy.control.trigger[] &&
-            Threads.atomic_cas!(
-                policy.control.fired, false, true) == false
-        injection_wall_ns = time_ns()
-        policy.control.injection_wall_ns[] = injection_wall_ns
-        throw(Gate8InjectedOwnerFailure(
-            policy.control.trigger_batch_sequence[]))
-    end
-    next = poll_count + one(UInt32)
-    if next >= policy.spin_count
-        yield()
-        return zero(UInt32)
-    end
-    GC.safepoint()
-    return next
+    )
 end
+
+function (factory::Gate8FailureIdleStrategyFactory)()
+    return Gate8FailureIdleStrategy(
+        factory.control,
+        factory.coordinator_task_id,
+        Agent.YieldingIdleStrategy(),
+    )
+end
+
+function Agent.idle(strategy::Gate8FailureIdleStrategy)
+    if objectid(current_task()) !=
+            strategy.coordinator_task_id &&
+            strategy.control.trigger[] &&
+            Threads.atomic_cas!(
+                strategy.control.fired, false, true) == false
+        injection_wall_ns = time_ns()
+        strategy.control.injection_wall_ns[] = injection_wall_ns
+        throw(Gate8InjectedOwnerFailure(
+            strategy.control.trigger_batch_sequence[]))
+    end
+    return Agent.idle(strategy.yielding)
+end
+
+Agent.reset(strategy::Gate8FailureIdleStrategy) =
+    Agent.reset(strategy.yielding)
 
 struct Gate8FailureTriggerObserver <:
     Boundary.AbstractBoundaryObserver
@@ -209,11 +216,28 @@ function execution_owner_configuration(
         owner_policy)
 end
 
-threaded_execution_configuration(contract) =
+function gate8_owner_thread_ids(contract)
+    owner_count = contract["execution_owner_count"]
+    default_threads = filter(
+        thread_id -> Threads.threadpool(thread_id) === :default,
+        1:Threads.maxthreadid(),
+    )
+    length(default_threads) > owner_count ||
+        error(
+            "Gate 8 Agent owners require one coordinator context " *
+            "beyond the assigned owner threads")
+    return Tuple(default_threads[(end - owner_count + 1):end])
+end
+
+gate8_owner_idle_strategy_factory(::Any) =
+    Agent.YieldingIdleStrategy
+
+agent_execution_configuration(contract) =
     execution_owner_configuration(
-        ThreadedExecutionOwners(
-            HybridExecutionOwnerIdle(
-                contract["execution_owner_idle_spin_count"])),
+        AgentExecutionOwners(
+            gate8_owner_idle_strategy_factory(contract);
+            placement=ThreadAssignedExecutionOwnerPlacement(
+                gate8_owner_thread_ids(contract))),
         contract)
 
 deterministic_execution_configuration(contract) =
@@ -278,12 +302,12 @@ function precompile_and_discard_driver!(driver)
     return nothing
 end
 
-function validate_threaded_owner_result(result, expected_count::Integer)
+function validate_agent_owner_result(result, expected_count::Integer)
     owners = result.accounting.execution_owners
     owners === nothing && error(
-        "threaded qualification did not retain execution-owner accounting")
+        "Agent-owner qualification did not retain execution-owner accounting")
     length(owners) == expected_count || error(
-        "threaded qualification prepared an unexpected owner count")
+        "Agent-owner qualification prepared an unexpected owner count")
     task_ids = UInt64[]
     for owner in owners
         owner.startup_acknowledged || error(
@@ -291,13 +315,13 @@ function validate_threaded_owner_result(result, expected_count::Integer)
         owner.stop_acknowledged || error(
             "an execution owner did not acknowledge stop")
         iszero(owner.task_id) && error(
-            "a threaded execution owner did not retain a task identity")
+            "an Agent execution owner did not retain a task identity")
         push!(task_ids, owner.task_id)
     end
     allunique(task_ids) || error(
         "execution owners did not retain distinct task identities")
     serial_run_is_quiescent(result.accounting) || error(
-        "threaded result retained ownership after clean stop")
+        "Agent-owner result retained ownership after clean stop")
     return true
 end
 
@@ -389,11 +413,13 @@ function execute_injected_owner_failure(
     clock::Clocks.AbstractNanoClock=Clocks.SystemNanoClock())
     workload = workload_from_contract(contract)
     control = Gate8FailureControl()
-    idle_policy = Gate8FailureIdlePolicy(
-        control,
-        contract["execution_owner_idle_spin_count"])
+    idle_strategy_factory = Gate8FailureIdleStrategyFactory(
+        control)
     optical_execution = execution_owner_configuration(
-        ThreadedExecutionOwners(idle_policy),
+        AgentExecutionOwners(
+            idle_strategy_factory;
+            placement=ThreadAssignedExecutionOwnerPlacement(
+                gate8_owner_thread_ids(contract))),
         contract)
     observer = Gate8FailureTriggerObserver(
         control,
@@ -500,7 +526,7 @@ function execute_named_drain_deficit(contract)
             clock,
             workload;
             optical_execution=
-                threaded_execution_configuration(contract),
+                agent_execution_configuration(contract),
             arm_timeout_ns=contract["arm_timeout_ns"],
             shutdown_policy=RunShutdownPolicy(
                 acknowledgement_timeout_ns=contract[
@@ -606,7 +632,7 @@ function execute_required_overload(
         workload,
         run_config,
         histogram_config,
-        threaded_execution_configuration(contract))
+        agent_execution_configuration(contract))
     wall_start_ns = time_ns()
     caught = nothing
     observed_wall_ns = UInt64(0)

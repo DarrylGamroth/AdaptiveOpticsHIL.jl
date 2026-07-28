@@ -25,7 +25,10 @@ const GATE8_FROZEN_CONTRACT_VALUES = (
     "fft_threads" => 1,
     "execution_owner_count" => 2,
     "execution_owner_ring_capacity" => 8,
-    "execution_owner_idle_spin_count" => 32,
+    "execution_owner_idle_strategy" =>
+        "Agent.YieldingIdleStrategy",
+    "execution_owner_placement" =>
+        "unique Julia default-pool threads; no OS affinity",
     "execution_owner_maximum_lateness_ns" => 50_000_000,
     "required_product_capacity_horizon_ns" => 64_000_000,
     "arm_timeout_ns" => 5_000_000_000,
@@ -180,8 +183,12 @@ function validate_gate8_contract(contract)
         "the frozen Gate 8 topology requires one FFT-provider thread")
     contract["execution_owner_ring_capacity"] == 8 || error(
         "the frozen Gate 8 owner-ring capacity is eight")
-    contract["execution_owner_idle_spin_count"] == 32 || error(
-        "the frozen Gate 8 hybrid idle policy spins 32 times")
+    contract["execution_owner_idle_strategy"] ==
+        "Agent.YieldingIdleStrategy" || error(
+        "the Gate 8 candidate requires Agent.YieldingIdleStrategy")
+    contract["execution_owner_placement"] ==
+        "unique Julia default-pool threads; no OS affinity" || error(
+        "the Gate 8 Agent candidate requires explicit Julia-thread assignment")
     contract["execution_owner_maximum_lateness_ns"] ==
         50_000_000 || error(
             "the amended Gate 8 owner watchdog is 50 ms")
@@ -717,7 +724,7 @@ function execute_recorded_run(
     optical_execution;
     phase::AbstractString,
     run_index::Integer,
-    threaded::Bool)
+    agent_owned::Bool)
     estimated_wall_ns =
         run_config.samples * workload.primary_period_ns
     interval_capacity = max(
@@ -734,7 +741,7 @@ function execute_recorded_run(
         histogram_config,
         optical_execution;
         observer)
-    threaded && Operational.validate_threaded_owner_result(
+    agent_owned && Operational.validate_agent_owner_result(
         result, contract["execution_owner_count"])
     return recorded_run_report(
         result,
@@ -813,9 +820,9 @@ function execute_unpaced_run(
         workload,
         run_config,
         histogram_config,
-        Operational.threaded_execution_configuration(contract);
+        Operational.agent_execution_configuration(contract);
         observer)
-    Operational.validate_threaded_owner_result(
+    Operational.validate_agent_owner_result(
         result, contract["execution_owner_count"])
     return unpaced_run_report(
         result,
@@ -970,11 +977,11 @@ function operational_policy_manifest(contract, workload)
             "coordinated_omission_correction" => false),
         "execution_owners" => Dict{String,Any}(
             "count" => contract["execution_owner_count"],
-            "mode" => "ThreadedExecutionOwners",
-            "idle_policy" => "HybridExecutionOwnerIdle",
-            "spin_count" =>
-                contract["execution_owner_idle_spin_count"],
-            "after_spin_action" => "yield",
+            "mode" => "AgentExecutionOwners",
+            "idle_strategy" =>
+                contract["execution_owner_idle_strategy"],
+            "placement" =>
+                contract["execution_owner_placement"],
             "due_and_completion_ring_capacity" =>
                 contract["execution_owner_ring_capacity"],
             "overload_action" => "FailRunOnOwnerOverload",
@@ -1153,14 +1160,14 @@ function cold_lifecycle_report(
             cold_workload,
             run_config,
             cold_histogram_config,
-            Operational.threaded_execution_configuration(
+            Operational.agent_execution_configuration(
                 cold_contract))
     wall_start_ns = time_ns()
     result = nothing
     first_use_allocated_bytes = @allocated result =
         Harness.execute_boundary_run!(driver)
     Harness.validate_boundary_result(result, run_config)
-    Operational.validate_threaded_owner_result(
+    Operational.validate_agent_owner_result(
         result, contract["execution_owner_count"])
     first_use_ns = Int(
         result.first_response_wall_ns - wall_start_ns)
@@ -1293,38 +1300,38 @@ function exact_correctness_report(
         run_config,
         Operational.deterministic_execution_configuration(
             contract))
-    threaded = execute_correctness_trace(
+    agent = execute_correctness_trace(
         workload,
         histogram_config,
         run_config,
-        Operational.threaded_execution_configuration(contract))
-    Operational.validate_threaded_owner_result(
-        threaded.result,
+        Operational.agent_execution_configuration(contract))
+    Operational.validate_agent_owner_result(
+        agent.result,
         contract["execution_owner_count"])
     serial_trace = exact_trace_signature(serial.observer)
     deterministic_trace =
         exact_trace_signature(deterministic.observer)
-    threaded_trace =
-        exact_trace_signature(threaded.observer)
-    serial_trace == deterministic_trace == threaded_trace || error(
-        "serial, deterministic-owner, and threaded-owner event/product traces differ")
+    agent_trace =
+        exact_trace_signature(agent.observer)
+    serial_trace == deterministic_trace == agent_trace || error(
+        "serial, deterministic-owner, and Agent-owner event/product traces differ")
     serial_signature =
         semantic_counter_signature(serial.result.counters)
     serial_signature ==
         semantic_counter_signature(
             deterministic.result.counters) ==
         semantic_counter_signature(
-            threaded.result.counters) || error(
+            agent.result.counters) || error(
                 "execution topologies changed semantic counters")
     checkpoint_snapshot(serial.result) ==
         checkpoint_snapshot(deterministic.result) ==
-        checkpoint_snapshot(threaded.result) || error(
+        checkpoint_snapshot(agent.result) || error(
             "execution topologies changed cached-clock arrival checkpoints")
     deterministic_histogram_signature(serial.result) ==
         deterministic_histogram_signature(
             deterministic.result) ==
         deterministic_histogram_signature(
-            threaded.result) || error(
+            agent.result) || error(
             "execution topologies changed cached-clock boundary timing")
     return Dict{String,Any}(
         "passed" => true,
@@ -1337,16 +1344,16 @@ function exact_correctness_report(
         "deterministic_owner_lifecycle" =>
             successful_lifecycle_snapshot(
                 deterministic.result),
-        "threaded_owner_lifecycle" =>
-            successful_lifecycle_snapshot(threaded.result),
+        "agent_owner_lifecycle" =>
+            successful_lifecycle_snapshot(agent.result),
         "serial_accounting" =>
             gate8_accounting_snapshot(serial.result.accounting),
         "deterministic_owner_accounting" =>
             gate8_accounting_snapshot(
                 deterministic.result.accounting),
-        "threaded_owner_accounting" =>
+        "agent_owner_accounting" =>
             gate8_accounting_snapshot(
-                threaded.result.accounting))
+                agent.result.accounting))
 end
 
 function execute_gate8_warmup!(
@@ -1361,8 +1368,8 @@ function execute_gate8_warmup!(
     compilation_coverage_config = Harness.BoundaryRunConfig(
         samples=compilation_coverage_frames,
         checkpoint_stride=compilation_coverage_frames)
-    threaded_execution =
-        Operational.threaded_execution_configuration(contract)
+    agent_execution =
+        Operational.agent_execution_configuration(contract)
     compilation_contract = deepcopy(contract)
     compilation_contract[
         "execution_owner_maximum_lateness_ns"] =
@@ -1376,7 +1383,7 @@ function execute_gate8_warmup!(
     for compilation_execution in (
             Operational.deterministic_execution_configuration(
                 compilation_contract),
-            Operational.threaded_execution_configuration(
+            Operational.agent_execution_configuration(
                 compilation_contract))
         observer = Operational.OperationalIntervalObserver(
             4, 100_000_000; probe_stride=1)
@@ -1423,7 +1430,7 @@ function execute_gate8_warmup!(
         workload,
         run_config,
         histogram_config,
-        threaded_execution;
+        agent_execution;
         observer)
     Operational.reset_operational_observer!(observer)
     result = try
@@ -1457,14 +1464,14 @@ function execute_gate8_warmup!(
     Operational.finish_operational_observer!(
         observer, driver)
     Harness.validate_boundary_result(result, run_config)
-    Operational.validate_threaded_owner_result(
+    Operational.validate_agent_owner_result(
         result, contract["execution_owner_count"])
     Operational.execute_run(
         Clocks.CachedNanoClock(0),
         workload,
         one_frame_config,
         histogram_config,
-        threaded_execution;
+        agent_execution;
         observer=Operational.OperationalIntervalObserver(
             4, contract["interval_ns"]))
     GC.gc()
@@ -1751,7 +1758,7 @@ function relative_latency_gate(
         metric_passed = observed <= maximum_ns
         report[metric] = Dict{String,Any}(
             "deterministic_median_p99_ns" => baseline,
-            "threaded_median_p99_ns" => observed,
+            "agent_median_p99_ns" => observed,
             "maximum_ns" => maximum_ns,
             "passed" => metric_passed)
         passed &= metric_passed
@@ -1875,7 +1882,7 @@ function gate8_gate_report(
         for acquisition in
             deficit["accounting_at_deadline"]["acquisitions"]
         if acquisition["acquisition"] == "hil_wfs")
-    threaded_success_reports = vcat(
+    agent_success_reports = vcat(
         target_reports,
         [burst_report, science_report],
         calibration_reports,
@@ -1946,12 +1953,12 @@ function gate8_gate_report(
                     report -> bounded_success_accounting(
                         report, contract),
                     calibration_reports)),
-        "threaded_owner_identity" => Dict(
+        "agent_owner_identity" => Dict(
             "recorded_runs" => length(
-                threaded_success_reports),
+                agent_success_reports),
             "passed" => all(
                 owner_tasks_are_stable,
-                threaded_success_reports)),
+                agent_success_reports)),
         "near_saturation" => Dict(
             "passed" =>
                 rate_fidelity_passed(
@@ -2200,12 +2207,12 @@ function gate8_main(arguments=ARGS)
     cold = cold_lifecycle_report(
         workload, histogram_config, contract)
 
-    println("Gate 8: exact serial/deterministic/threaded replay")
+    println("Gate 8: exact serial/deterministic/Agent-owner replay")
     flush(stdout)
     correctness = exact_correctness_report(
         workload, histogram_config, contract)
 
-    println("Gate 8: warming threaded SystemNanoClock runtime")
+    println("Gate 8: warming Agent-owner SystemNanoClock runtime")
     flush(stdout)
     execute_gate8_warmup!(
         workload, histogram_config, contract)
@@ -2240,7 +2247,7 @@ function gate8_main(arguments=ARGS)
                     contract);
                 phase="deterministic_baseline",
                 run_index,
-                threaded=false))
+                agent_owned=false))
     end
 
     target_config = Harness.BoundaryRunConfig(
@@ -2259,11 +2266,11 @@ function gate8_main(arguments=ARGS)
                 target_config,
                 histogram_config,
                 contract,
-                Operational.threaded_execution_configuration(
+                Operational.agent_execution_configuration(
                     contract);
                 phase="target",
                 run_index,
-                threaded=true))
+                agent_owned=true))
     end
 
     println("Gate 8: 16-frame consumer-interruption burst")
@@ -2279,10 +2286,10 @@ function gate8_main(arguments=ARGS)
         burst_config,
         histogram_config,
         contract,
-        Operational.threaded_execution_configuration(contract);
+        Operational.agent_execution_configuration(contract);
         phase="consumer_interruption_burst",
         run_index=1,
-        threaded=true)
+        agent_owned=true)
 
     println("Gate 8: optional science shedding and recovery")
     flush(stdout)
@@ -2298,10 +2305,10 @@ function gate8_main(arguments=ARGS)
         science_config,
         histogram_config,
         contract,
-        Operational.threaded_execution_configuration(contract);
+        Operational.agent_execution_configuration(contract);
         phase="optional_science_shedding",
         run_index=1,
-        threaded=true)
+        agent_owned=true)
 
     calibration_config = Harness.BoundaryRunConfig(
         samples=contract["calibration_samples_per_run"],
@@ -2370,11 +2377,11 @@ function gate8_main(arguments=ARGS)
                 near_config,
                 histogram_config,
                 contract,
-                Operational.threaded_execution_configuration(
+                Operational.agent_execution_configuration(
                     contract);
                 phase="near_saturation",
                 run_index,
-                threaded=true))
+                agent_owned=true))
     end
 
     saturation_workload = workload_at_rate(
@@ -2399,11 +2406,11 @@ function gate8_main(arguments=ARGS)
                 saturation_config,
                 histogram_config,
                 contract,
-                Operational.threaded_execution_configuration(
+                Operational.agent_execution_configuration(
                     contract);
                 phase="saturation",
                 run_index,
-                threaded=true))
+                agent_owned=true))
     end
 
     println(
@@ -2434,10 +2441,10 @@ function gate8_main(arguments=ARGS)
         recovery_config,
         histogram_config,
         contract,
-        Operational.threaded_execution_configuration(contract);
+        Operational.agent_execution_configuration(contract);
         phase="fresh_run_recovery",
         run_index=1,
-        threaded=true)
+        agent_owned=true)
 
     println("Gate 8: warming injected-fault specialization")
     flush(stdout)
@@ -2480,10 +2487,10 @@ function gate8_main(arguments=ARGS)
         soak_config,
         histogram_config,
         contract,
-        Operational.threaded_execution_configuration(contract);
+        Operational.agent_execution_configuration(contract);
         phase="soak",
         run_index=1,
-        threaded=true)
+        agent_owned=true)
 
     gates = gate8_gate_report(
         correctness,

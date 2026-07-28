@@ -68,11 +68,11 @@ end
         run_config,
         GATE8_TEST_HISTOGRAM,
         contract,
-        Operational.threaded_execution_configuration(
+        Operational.agent_execution_configuration(
             contract);
         phase="ci_operational_smoke",
         run_index=1,
-        threaded=true)
+        agent_owned=true)
     @test length(report["intervals"]) >= 2
     @test report["intervals"][1][
         "achieved_offered_rate_hz"] > 0
@@ -132,7 +132,7 @@ end
         GATE8_TEST_WORKLOAD,
         run_config,
         GATE8_TEST_HISTOGRAM,
-        Operational.threaded_execution_configuration(
+        Operational.agent_execution_configuration(
             GATE8_TEST_CONTRACT))
     @test result.counters.stall_end_offered -
         result.counters.stall_start_offered == 16
@@ -153,9 +153,9 @@ end
         GATE8_TEST_WORKLOAD,
         run_config,
         GATE8_TEST_HISTOGRAM,
-        Operational.threaded_execution_configuration(
+        Operational.agent_execution_configuration(
             GATE8_TEST_CONTRACT))
-    @test Operational.validate_threaded_owner_result(
+    @test Operational.validate_agent_owner_result(
         result,
         GATE8_TEST_CONTRACT["execution_owner_count"])
     @test result.counters.shed_science >= 8

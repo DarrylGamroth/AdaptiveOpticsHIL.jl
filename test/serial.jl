@@ -1466,7 +1466,7 @@ end
         @test serial_optical_execution_configuration(
             fixture.run) === owner_configuration
         @test execution_owner_mode(executor) === mode
-        @test execution_owner_idle_policy(executor) === nothing
+        @test execution_owner_idle_strategy_factory(executor) === nothing
         @test execution_cpu_budget(executor) ===
             owner_configuration.cpu_budget
         @test execution_cpu_environment(executor) ===
@@ -1674,40 +1674,40 @@ end
         @test execution_owners_phase(serial_optical_execution(
             owner_oracle.fixture.run)) == ExecutionOwnersStopped
 
-        threaded_configuration =
+        agent_configuration =
             serial_test_execution_owner_configuration(
-                ThreadedExecutionOwners();
+                AgentExecutionOwners();
                 outer_owner_count=1,
             )
-        threaded_fixture = serial_test_fixture(
-            optical_execution=threaded_configuration)
-        threaded_executor =
-            serial_optical_execution(threaded_fixture.run)
-        @test execution_owners_phase(threaded_executor) ==
+        agent_fixture = serial_test_fixture(
+            optical_execution=agent_configuration)
+        agent_executor =
+            serial_optical_execution(agent_fixture.run)
+        @test execution_owners_phase(agent_executor) ==
             ExecutionOwnersRunning
-        threaded_before =
-            execution_owner_accounting(threaded_executor, 1)
-        @test threaded_before.startup_acknowledged
-        @test !iszero(threaded_before.task_id)
+        agent_before =
+            execution_owner_accounting(agent_executor, 1)
+        @test agent_before.startup_acknowledged
+        @test !iszero(agent_before.task_id)
         @test serial_step_status(step_serial_run!(
-            threaded_fixture.running)) ==
+            agent_fixture.running)) ==
             SerialPlantEventProcessed
-        threaded_after =
-            execution_owner_accounting(threaded_executor, 1)
-        @test threaded_after.task_id == threaded_before.task_id
-        threaded_request = RunStopRequest(
-            run_session(threaded_fixture.run),
-            execution_clock_identity(threaded_fixture.armed.timing),
-            Clocks.time_nanos(threaded_fixture.clock))
-        threaded_stopped_accounting = finish_serial_stop!(
-            threaded_fixture, threaded_request)
-        @test execution_owners_phase(threaded_executor) ==
+        agent_after =
+            execution_owner_accounting(agent_executor, 1)
+        @test agent_after.task_id == agent_before.task_id
+        agent_request = RunStopRequest(
+            run_session(agent_fixture.run),
+            execution_clock_identity(agent_fixture.armed.timing),
+            Clocks.time_nanos(agent_fixture.clock))
+        agent_stopped_accounting = finish_serial_stop!(
+            agent_fixture, agent_request)
+        @test execution_owners_phase(agent_executor) ==
             ExecutionOwnersStopped
         @test execution_owner_accounting(
-            threaded_executor, 1).stop_acknowledged
-        threaded_stopped_owner =
-            first(threaded_stopped_accounting.execution_owners)
-        @test threaded_stopped_owner.stop_acknowledged
+            agent_executor, 1).stop_acknowledged
+        agent_stopped_owner =
+            first(agent_stopped_accounting.execution_owners)
+        @test agent_stopped_owner.stop_acknowledged
     end
 
     @testset "Composition and lifecycle rejection" begin
