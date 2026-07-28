@@ -1188,10 +1188,10 @@ begin_serial_stop!(
         _pool_is_quiescent(outcome_credit_accounting(submission))
 end
 
-@inline _progress_serial_acquisition_return_paths!(
+@inline _progress_serial_acquisition_return_paths!( # COV_EXCL_LINE
     ::Tuple{},
     ::SerialShutdownState,
-    ::Int) = true # COV_EXCL_LINE
+    ::Int) = true
 
 function _progress_serial_acquisition_return_paths!(
     publishers::Tuple,
@@ -1215,8 +1215,8 @@ function _progress_serial_acquisition_return_paths!(
     )
 end
 
-@inline _serial_acquisition_ownership_is_drained(
-    ::Tuple{}) = true # COV_EXCL_LINE
+@inline _serial_acquisition_ownership_is_drained( # COV_EXCL_LINE
+    ::Tuple{}) = true
 
 @inline function _serial_acquisition_ownership_is_drained(
     publishers::Tuple)

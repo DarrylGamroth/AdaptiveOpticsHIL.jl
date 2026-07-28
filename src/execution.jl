@@ -1193,15 +1193,15 @@ end
 # Julia emits no coverage counters for these exercised constant dispatch leaves.
 _execution_is_armed(::SerialOpticalPathBatchExecutor) = true # COV_EXCL_LINE
 _execution_is_quiescent(::SerialOpticalPathBatchExecutor) = true # COV_EXCL_LINE
-_execution_ownership_is_drained(
-    ::SerialOpticalPathBatchExecutor) = true # COV_EXCL_LINE
+_execution_ownership_is_drained( # COV_EXCL_LINE
+    ::SerialOpticalPathBatchExecutor) = true
 _arm_optical_execution!(executor::SerialOpticalPathBatchExecutor) = executor
 _start_optical_execution!(executor::SerialOpticalPathBatchExecutor) = executor
 _stop_optical_execution!(executor::SerialOpticalPathBatchExecutor) = executor
 _begin_optical_execution_shutdown!(
     executor::SerialOpticalPathBatchExecutor) = executor
-_progress_optical_execution_shutdown!(
-    ::SerialOpticalPathBatchExecutor) = true # COV_EXCL_LINE
+_progress_optical_execution_shutdown!( # COV_EXCL_LINE
+    ::SerialOpticalPathBatchExecutor) = true
 _finalize_optical_execution_shutdown!(
     executor::SerialOpticalPathBatchExecutor) = executor
 _mark_optical_execution_failed!(
@@ -1209,8 +1209,8 @@ _mark_optical_execution_failed!(
 
 _begin_optical_execution_shutdown!(
     executor::AbstractOpticalPathBatchExecutor) = executor
-_progress_optical_execution_shutdown!(
-    ::AbstractOpticalPathBatchExecutor) = true # COV_EXCL_LINE
+_progress_optical_execution_shutdown!( # COV_EXCL_LINE
+    ::AbstractOpticalPathBatchExecutor) = true
 _finalize_optical_execution_shutdown!(
     executor::AbstractOpticalPathBatchExecutor) =
     _stop_optical_execution!(executor)
@@ -1884,11 +1884,11 @@ function _drain_execution_owner_completions!(
     end
 end
 
-@inline _execution_owner_task_done(
+@inline _execution_owner_task_done( # COV_EXCL_LINE
     ::PreparedExecutionOwnerExecutor{
         <:DeterministicExecutionOwners,
     },
-    ::Int) = true # COV_EXCL_LINE
+    ::Int) = true
 
 @inline function _execution_owner_task_done(
     executor::PreparedExecutionOwnerExecutor{
@@ -2121,14 +2121,14 @@ function _execution_owner_stops_are_acknowledged(
     return true
 end
 
-@inline _execution_batch_active(
-    ::AbstractOpticalPathBatchExecutor) = false # COV_EXCL_LINE
+@inline _execution_batch_active( # COV_EXCL_LINE
+    ::AbstractOpticalPathBatchExecutor) = false
 @inline _execution_batch_active(
     executor::PreparedExecutionOwnerExecutor) =
     executor.coordinator.active_claim !== nothing
 
-@inline _abandon_failed_optical_path_batch!(
-    ::AbstractOpticalPathBatchExecutor) = true # COV_EXCL_LINE
+@inline _abandon_failed_optical_path_batch!( # COV_EXCL_LINE
+    ::AbstractOpticalPathBatchExecutor) = true
 
 function _abandon_failed_optical_path_batch!(
     executor::PreparedExecutionOwnerExecutor)
