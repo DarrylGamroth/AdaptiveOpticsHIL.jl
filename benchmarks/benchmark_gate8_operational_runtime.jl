@@ -908,6 +908,8 @@ function operational_policy_manifest(contract, workload)
             "coverage_goal" =>
                 "exercise every slower acquisition stream before the production-deadline warmup",
             "maximum_lateness_ns" => 600_000_000_000,
+            "production_rate_smoke_primary_products" => 1,
+            "production_rate_smoke_uses_compilation_policy" => true,
             "explicit_gc_before_production_warmup" => true,
             "recorded_as_evidence" => false),
         "cpu_admission" => Dict{String,Any}(
@@ -1261,9 +1263,6 @@ function execute_gate8_warmup!(
     compilation_coverage_config = Harness.BoundaryRunConfig(
         samples=compilation_coverage_frames,
         checkpoint_stride=compilation_coverage_frames)
-    deterministic_execution =
-        Operational.deterministic_execution_configuration(
-            contract)
     threaded_execution =
         Operational.threaded_execution_configuration(contract)
     compilation_contract = deepcopy(contract)
@@ -1276,17 +1275,11 @@ function execute_gate8_warmup!(
         histogram_config.significant_figures)
     compilation_workload = workload_at_rate(
         workload, 0.25)
-    for (optical_execution, compilation_execution) in (
-            (
-                deterministic_execution,
-                Operational.deterministic_execution_configuration(
-                    compilation_contract),
-            ),
-            (
-                threaded_execution,
-                Operational.threaded_execution_configuration(
-                    compilation_contract),
-            ))
+    for compilation_execution in (
+            Operational.deterministic_execution_configuration(
+                compilation_contract),
+            Operational.threaded_execution_configuration(
+                compilation_contract))
         observer = Operational.OperationalIntervalObserver(
             4, 100_000_000; probe_stride=1)
         driver = Operational.prepare_driver(
@@ -1309,8 +1302,8 @@ function execute_gate8_warmup!(
             Clocks.SystemNanoClock(),
             workload,
             one_frame_config,
-            histogram_config,
-            optical_execution;
+            compilation_histogram_config,
+            compilation_execution;
             observer=Operational.OperationalIntervalObserver(
                 4, contract["interval_ns"]))
     end
