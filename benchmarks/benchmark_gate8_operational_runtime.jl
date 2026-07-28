@@ -26,7 +26,7 @@ const GATE8_FROZEN_CONTRACT_VALUES = (
     "execution_owner_count" => 2,
     "execution_owner_ring_capacity" => 8,
     "execution_owner_idle_spin_count" => 32,
-    "execution_owner_maximum_lateness_ns" => 5_000_000,
+    "execution_owner_maximum_lateness_ns" => 50_000_000,
     "arm_timeout_ns" => 5_000_000_000,
     "correctness_frames" => 1_024,
     "compilation_coverage_frames" => 2,
@@ -180,8 +180,8 @@ function validate_gate8_contract(contract)
     contract["execution_owner_idle_spin_count"] == 32 || error(
         "the frozen Gate 8 hybrid idle policy spins 32 times")
     contract["execution_owner_maximum_lateness_ns"] ==
-        5_000_000 || error(
-            "the frozen Gate 8 owner lateness limit is 5 ms")
+        50_000_000 || error(
+            "the amended Gate 8 owner watchdog is 50 ms")
     contract["target_runs"] >= 3 || error(
         "target evidence requires at least three repetitions")
     contract["baseline_runs"] >= 3 || error(

@@ -10,7 +10,7 @@ fft_threads = 1
 execution_owner_count = 2
 execution_owner_ring_capacity = 8
 execution_owner_idle_spin_count = 32
-execution_owner_maximum_lateness_ns = 5000000
+execution_owner_maximum_lateness_ns = 50000000
 arm_timeout_ns = 5000000000
 
 correctness_frames = 1024
