@@ -249,6 +249,20 @@ end
         contract["workload"]["science_period_ns"]
     @test workload.science_product_capacity ==
         contract["workload"]["science_product_capacity"]
+    required_horizon_ns =
+        contract["required_product_capacity_horizon_ns"]
+    @test workload.primary_product_capacity == 128
+    @test contract["workload"]["primary_completion_capacity"] == 128
+    @test workload.feedback_product_capacity == 86
+    @test contract["workload"]["feedback_completion_capacity"] == 86
+    @test workload.primary_product_capacity *
+        workload.primary_period_ns >= required_horizon_ns
+    @test (workload.primary_product_capacity - 1) *
+        workload.primary_period_ns < required_horizon_ns
+    @test workload.feedback_product_capacity *
+        workload.feedback_period_ns >= required_horizon_ns
+    @test (workload.feedback_product_capacity - 1) *
+        workload.feedback_period_ns < required_horizon_ns
 
     science_stall_config = Harness.BoundaryRunConfig(
         samples=128,

@@ -27,6 +27,7 @@ const GATE8_FROZEN_CONTRACT_VALUES = (
     "execution_owner_ring_capacity" => 8,
     "execution_owner_idle_spin_count" => 32,
     "execution_owner_maximum_lateness_ns" => 50_000_000,
+    "required_product_capacity_horizon_ns" => 64_000_000,
     "arm_timeout_ns" => 5_000_000_000,
     "correctness_frames" => 1_024,
     "compilation_coverage_frames" => 2,
@@ -118,10 +119,10 @@ const GATE8_FROZEN_WORKLOAD_VALUES = (
     "command_payload_pool_capacity" => 8,
     "command_submission_capacity" => 8,
     "command_completion_capacity" => 8,
-    "primary_product_capacity" => 64,
-    "primary_completion_capacity" => 64,
-    "feedback_product_capacity" => 64,
-    "feedback_completion_capacity" => 64,
+    "primary_product_capacity" => 128,
+    "primary_completion_capacity" => 128,
+    "feedback_product_capacity" => 86,
+    "feedback_completion_capacity" => 86,
     "science_product_capacity" => 8,
     "science_completion_capacity" => 8,
     "complete_product_lead_time_ns" => 500_000,
@@ -183,6 +184,12 @@ function validate_gate8_contract(contract)
     contract["execution_owner_maximum_lateness_ns"] ==
         50_000_000 || error(
             "the amended Gate 8 owner watchdog is 50 ms")
+    contract["required_product_capacity_horizon_ns"] ==
+        64_000_000 || error(
+            "the amended Gate 8 required-product horizon is 64 ms")
+    contract["required_product_capacity_horizon_ns"] >
+        contract["execution_owner_maximum_lateness_ns"] || error(
+            "required-product capacity must outlast the owner watchdog")
     contract["target_runs"] >= 3 || error(
         "target evidence requires at least three repetitions")
     contract["baseline_runs"] >= 3 || error(
@@ -238,10 +245,28 @@ function validate_gate8_contract(contract)
         "Gate 8 requires the frozen Float64 workload")
     workload["run_seed"] == 31_744 || error(
         "Gate 8 requires the frozen deterministic seed")
-    workload["primary_product_capacity"] == 64 || error(
-        "the frozen required WFS capacity is 64")
-    workload["feedback_product_capacity"] == 64 || error(
-        "the frozen required feedback capacity is 64")
+    required_capacity_horizon_ns =
+        contract["required_product_capacity_horizon_ns"]
+    required_primary_capacity = cld(
+        required_capacity_horizon_ns,
+        workload["primary_period_ns"],
+    )
+    required_feedback_capacity = cld(
+        required_capacity_horizon_ns,
+        workload["feedback_period_ns"],
+    )
+    workload["primary_product_capacity"] ==
+        required_primary_capacity || error(
+        "required WFS capacity does not match the frozen time horizon")
+    workload["primary_completion_capacity"] ==
+        required_primary_capacity || error(
+        "required WFS completion capacity does not match the frozen time horizon")
+    workload["feedback_product_capacity"] ==
+        required_feedback_capacity || error(
+        "required feedback capacity does not match the frozen time horizon")
+    workload["feedback_completion_capacity"] ==
+        required_feedback_capacity || error(
+        "required feedback completion capacity does not match the frozen time horizon")
     workload["science_product_capacity"] == 8 || error(
         "the frozen optional science capacity is eight")
     workload["command_payload_pool_capacity"] == 8 || error(
@@ -287,8 +312,8 @@ function validate_gate8_contract(contract)
         contract["target_rate_hz"] * burst_duration_ns,
         1_000_000_000)
     workload["primary_product_capacity"] >=
-        4 * required_stall_capacity || error(
-            "required WFS capacity lacks the predeclared 4x stall margin")
+        8 * required_stall_capacity || error(
+            "required WFS capacity lacks the amended 8x stall margin")
     science_stall_duration_ns =
         contract["science_stall_primary_frames"] *
         workload["primary_period_ns"]
