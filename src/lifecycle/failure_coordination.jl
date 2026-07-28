@@ -115,6 +115,26 @@ struct RunFailureRecord
     component::Symbol
     reason::Symbol
     work_sequence::UInt64
+
+    RunFailureRecord(
+        kind::RunTerminationKind,
+        session::RunSessionID,
+        owner::RunOwnerID,
+        stage::RunFailureStage,
+        observed_execution_ns::Union{Nothing,Int64},
+        component::Symbol,
+        reason::Symbol,
+        work_sequence::UInt64,
+        ::_LifecycleConstructionToken) =
+        new(
+            kind,
+            session,
+            owner,
+            stage,
+            observed_execution_ns,
+            component,
+            reason,
+            work_sequence)
 end
 
 function RunFailureRecord(
@@ -157,7 +177,8 @@ function RunFailureRecord(
             reason,
             :run_failure_record,
             "failure reason"),
-        sequence)
+        sequence,
+        _LIFECYCLE_CONSTRUCTION_TOKEN)
 end
 
 @inline function _checked_failure_work_sequence(

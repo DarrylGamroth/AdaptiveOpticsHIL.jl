@@ -293,6 +293,16 @@ end
         @test run_failure_component(record) == :execution_owner
         @test run_failure_reason(record) == :device_failure
         @test run_failure_work_sequence(record) == 7
+        @test !applicable(
+            RunFailureRecord,
+            RequestedRunStop,
+            session,
+            owners[3],
+            OwnerExecution,
+            Int64(1),
+            :owner,
+            :failure,
+            UInt64(7))
         @test_throws RunLifecycleError RunFailureRecord(
             RequestedRunStop,
             session,
