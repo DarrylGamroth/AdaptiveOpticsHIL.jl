@@ -186,6 +186,21 @@ end
     @test doubled_rate.science_enabled
     @test doubled_rate.science_period_ns ==
         workload.science_period_ns ÷ 2
+    @test doubled_rate.primary_product_capacity ==
+        workload.primary_product_capacity
+
+    doubled_rate_with_time_headroom = workload_at_rate(
+        workload,
+        2 * contract["target_rate_hz"];
+        preserve_capacity_time_headroom=true)
+    @test doubled_rate_with_time_headroom.command_capacity ==
+        2 * workload.command_capacity
+    @test doubled_rate_with_time_headroom.primary_product_capacity ==
+        2 * workload.primary_product_capacity
+    @test doubled_rate_with_time_headroom.feedback_product_capacity ==
+        2 * workload.feedback_product_capacity
+    @test doubled_rate_with_time_headroom.science_product_capacity ==
+        2 * workload.science_product_capacity
 
     @test_throws ErrorException Operational.ProductTraceObserver(0)
     @test_throws ErrorException Operational.OperationalIntervalObserver(

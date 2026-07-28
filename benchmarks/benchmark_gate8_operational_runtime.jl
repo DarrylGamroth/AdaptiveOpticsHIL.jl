@@ -46,6 +46,7 @@ const GATE8_FROZEN_CONTRACT_VALUES = (
     "calibration_runs" => 3,
     "calibration_samples_per_run" => 100_000,
     "minimum_calibrated_rate_hz" => 5_000,
+    "derived_rate_preserve_capacity_time_headroom" => true,
     "near_saturation_fraction" => 0.70,
     "saturation_fraction" => 0.95,
     "overload_fraction" => 1.25,
@@ -302,7 +303,8 @@ end
 
 function workload_at_rate(
     base::Harness.Gate4AWorkloadConfig,
-    requested_rate_hz::Real)
+    requested_rate_hz::Real;
+    preserve_capacity_time_headroom::Bool=false)
     isfinite(requested_rate_hz) && requested_rate_hz > 0 || error(
         "requested fixed-arrival rate must be finite and positive")
     primary_period_ns = max(
@@ -317,6 +319,14 @@ function workload_at_rate(
     feedback_phase_ns = min(
         feedback_period_ns - 1,
         scale(base.feedback_phase_ns))
+    scale_capacity(value) =
+        preserve_capacity_time_headroom ?
+        max(
+            value,
+            cld(
+                value * base.primary_period_ns,
+                primary_period_ns)) :
+        value
     return Harness.Gate4AWorkloadConfig(
         primary_period_ns=primary_period_ns,
         primary_exposure_ns=scale(base.primary_exposure_ns),
@@ -330,10 +340,13 @@ function workload_at_rate(
             scale(base.science_sample_period_ns),
         science_period_ns=scale(base.science_period_ns),
         science_exposure_ns=scale(base.science_exposure_ns),
-        command_capacity=base.command_capacity,
-        primary_product_capacity=base.primary_product_capacity,
-        feedback_product_capacity=base.feedback_product_capacity,
-        science_product_capacity=base.science_product_capacity,
+        command_capacity=scale_capacity(base.command_capacity),
+        primary_product_capacity=
+            scale_capacity(base.primary_product_capacity),
+        feedback_product_capacity=
+            scale_capacity(base.feedback_product_capacity),
+        science_product_capacity=
+            scale_capacity(base.science_product_capacity),
         complete_product_lead_time_ns=
             base.complete_product_lead_time_ns,
         maximum_lease_hold_time_ns=
@@ -344,6 +357,28 @@ end
 
 effective_primary_rate_hz(workload) =
     1.0e9 / workload.primary_period_ns
+
+function workload_capacity_snapshot(workload)
+    return Dict{String,Any}(
+        "command_payload_pool_capacity" =>
+            workload.command_capacity,
+        "command_submission_capacity" =>
+            workload.command_capacity,
+        "command_completion_capacity" =>
+            workload.command_capacity,
+        "primary_product_capacity" =>
+            workload.primary_product_capacity,
+        "primary_completion_capacity" =>
+            workload.primary_product_capacity,
+        "feedback_product_capacity" =>
+            workload.feedback_product_capacity,
+        "feedback_completion_capacity" =>
+            workload.feedback_product_capacity,
+        "science_product_capacity" =>
+            workload.science_product_capacity,
+        "science_completion_capacity" =>
+            workload.science_product_capacity)
+end
 
 function gate8_counter_snapshot(counters)
     return counter_snapshot(counters)
@@ -612,6 +647,8 @@ function recorded_run_report(
             Int(counters.offered_primary) / offered_seconds,
         "completed_rate_hz" =>
             Int(counters.command_responses) / seconds,
+        "prepared_capacities" =>
+            workload_capacity_snapshot(workload),
         "gc_fraction" => gc_fraction,
         "lifecycle" => successful_lifecycle_snapshot(result),
         "counters" => gate8_counter_snapshot(counters),
@@ -691,6 +728,8 @@ function unpaced_run_report(
             effective_primary_rate_hz(workload),
         "useful_completed_rate_hz" =>
             Int(counters.command_responses) / seconds,
+        "prepared_capacities" =>
+            workload_capacity_snapshot(workload),
         "intervals" => intervals,
         "lifecycle" => successful_lifecycle_snapshot(result),
         "counters" => gate8_counter_snapshot(counters),
@@ -901,6 +940,15 @@ function operational_policy_manifest(contract, workload)
                     "execution_owner_maximum_lateness_ns"],
             "batch_observation" =>
                 "per-interval completed path-batch and owner work counters"),
+        "derived_rate_capacity_policy" => Dict{String,Any}(
+            "preserve_time_headroom" =>
+                contract[
+                    "derived_rate_preserve_capacity_time_headroom"],
+            "scaling_basis" =>
+                "ceil(base capacity * base primary period / derived primary period)",
+            "applies_to" =>
+                "command, primary, feedback, and science bounded capacities",
+            "target_phase_capacities_unchanged" => true),
         "compilation_hygiene" => Dict{String,Any}(
             "uniformly_scaled_primary_rate_hz" => 0.25,
             "coverage_primary_products" =>
@@ -1401,6 +1449,8 @@ function overload_report(result, requested_rate_hz, workload)
         "requested_rate_hz" => requested_rate_hz,
         "configured_rate_hz" =>
             effective_primary_rate_hz(workload),
+        "prepared_capacities" =>
+            workload_capacity_snapshot(workload),
         "error_type" => string(typeof(result.error)),
         "start_to_failure_ns" => result.start_to_failure_ns,
         "violation_observation_is_failure_boundary" =>
@@ -1505,7 +1555,7 @@ function bounded_occupancy_and_required_delivery(
     report,
     contract)
     counters = report["counters"]
-    workload = contract["workload"]
+    workload = report["prepared_capacities"]
     counters["maximum_primary_occupancy"] <=
         workload["primary_completion_capacity"] || return false
     counters["maximum_feedback_occupancy"] <=
@@ -2186,7 +2236,11 @@ function gate8_main(arguments=ARGS)
         contract["overload_fraction"],
         contract["rate_rounding_hz"])
 
-    near_workload = workload_at_rate(workload, near_rate_hz)
+    near_workload = workload_at_rate(
+        workload,
+        near_rate_hz;
+        preserve_capacity_time_headroom=contract[
+            "derived_rate_preserve_capacity_time_headroom"])
     near_config = Harness.BoundaryRunConfig(
         samples=contract["near_saturation_samples_per_run"],
         checkpoint_stride=contract["checkpoint_stride"])
@@ -2211,8 +2265,11 @@ function gate8_main(arguments=ARGS)
                 threaded=true))
     end
 
-    saturation_workload =
-        workload_at_rate(workload, saturation_rate_hz)
+    saturation_workload = workload_at_rate(
+        workload,
+        saturation_rate_hz;
+        preserve_capacity_time_headroom=contract[
+            "derived_rate_preserve_capacity_time_headroom"])
     saturation_config = Harness.BoundaryRunConfig(
         samples=contract["saturation_samples_per_run"],
         checkpoint_stride=contract["checkpoint_stride"])
@@ -2241,8 +2298,11 @@ function gate8_main(arguments=ARGS)
         "Gate 8: bounded required overload at " *
         "$(overload_rate_hz) Hz")
     flush(stdout)
-    overload_workload =
-        workload_at_rate(workload, overload_rate_hz)
+    overload_workload = workload_at_rate(
+        workload,
+        overload_rate_hz;
+        preserve_capacity_time_headroom=contract[
+            "derived_rate_preserve_capacity_time_headroom"])
     overload_result = Operational.execute_required_overload(
         contract,
         overload_workload,
