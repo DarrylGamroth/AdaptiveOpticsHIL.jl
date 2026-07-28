@@ -50,6 +50,7 @@ acknowledgement_timeout_ns = 1000000000
 drain_timeout_ns = 2000000000
 deficit_drain_timeout_ns = 10000000
 soak_duration_ns = 300000000000
+soak_schedule_guard_ns = 10000000
 soak_minimum_samples = 500000
 interval_ns = 1000000000
 

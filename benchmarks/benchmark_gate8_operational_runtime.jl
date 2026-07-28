@@ -65,6 +65,7 @@ const GATE8_FROZEN_CONTRACT_VALUES = (
     "drain_timeout_ns" => 2_000_000_000,
     "deficit_drain_timeout_ns" => 10_000_000,
     "soak_duration_ns" => 300_000_000_000,
+    "soak_schedule_guard_ns" => 10_000_000,
     "soak_minimum_samples" => 500_000,
     "interval_ns" => 1_000_000_000,
     "minimum_samples_for_p99" => 10_000,
@@ -233,6 +234,8 @@ function validate_gate8_contract(contract)
         "bounded overload must exceed calibrated capacity")
     contract["soak_duration_ns"] >= 300_000_000_000 || error(
         "the Gate 8 soak must last at least 300 seconds")
+    contract["soak_schedule_guard_ns"] > 0 || error(
+        "the Gate 8 soak schedule guard must be positive")
     contract["soak_minimum_samples"] >=
         contract["minimum_samples_for_p99_9"] || error(
             "the soak is too short for p99.9")
@@ -2102,15 +2105,16 @@ function minimum_soak_sample_count(contract, workload)
     scheduled_samples = cld(
         max(
             0,
-            contract["soak_duration_ns"] -
+            contract["soak_duration_ns"] +
+                contract["soak_schedule_guard_ns"] -
                 workload.primary_exposure_ns),
         workload.primary_period_ns) + 1
     # The execution-clock origin precedes the benchmark loop's wall start.
-    # One additional schedule period keeps that setup skew from shortening
-    # the measured wall interval below the unchanged soak-duration gate.
+    # The frozen schedule guard keeps that setup skew from shortening the
+    # measured wall interval below the unchanged soak-duration gate.
     return max(
         contract["soak_minimum_samples"],
-        scheduled_samples + 1)
+        scheduled_samples)
 end
 
 function gate8_summary_report(

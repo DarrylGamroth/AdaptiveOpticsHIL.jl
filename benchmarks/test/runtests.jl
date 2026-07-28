@@ -374,10 +374,15 @@ end
     soak_horizon_ns =
         workload.primary_exposure_ns +
         (soak_samples - 1) * workload.primary_period_ns
-    @test soak_samples == 600_002
+    @test contract["soak_schedule_guard_ns"] == 10_000_000
+    @test soak_samples == 600_021
     @test soak_horizon_ns >=
         contract["soak_duration_ns"] +
-        workload.primary_period_ns
+        contract["soak_schedule_guard_ns"]
+    @test soak_horizon_ns -
+        workload.primary_period_ns <
+        contract["soak_duration_ns"] +
+        contract["soak_schedule_guard_ns"]
 
     latency_report(run, p99_ns, p99_9_ns) = Dict{String,Any}(
         "run" => run,
