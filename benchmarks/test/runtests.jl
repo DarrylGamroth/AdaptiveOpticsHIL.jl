@@ -250,6 +250,36 @@ end
     @test workload.science_product_capacity ==
         contract["workload"]["science_product_capacity"]
 
+    science_stall_config = Harness.BoundaryRunConfig(
+        samples=128,
+        checkpoint_stride=128,
+        science_stall_start_sequence=32,
+        science_stall_frames=64,
+    )
+    science_stall_driver = Operational.prepare_driver(
+        CachedNanoClock(0),
+        workload,
+        science_stall_config,
+        Operational.histogram_config_from_contract(contract),
+        AdaptiveOpticsHIL.Execution.SerialOpticalExecution(),
+    )
+    science_stall_driver.counters.offered_primary = UInt64(128)
+    science_stall_driver.counters.published_primary = UInt64(31)
+    Harness._update_science_stall_state!(science_stall_driver)
+    @test !science_stall_driver.science_stall_started
+    science_stall_driver.counters.published_primary = UInt64(32)
+    Harness._update_science_stall_state!(science_stall_driver)
+    @test science_stall_driver.science_stall_started
+    @test !science_stall_driver.science_stall_ended
+    science_stall_driver.counters.published_primary = UInt64(96)
+    Harness._update_science_stall_state!(science_stall_driver)
+    @test science_stall_driver.science_stall_ended
+    @test science_stall_driver.counters.
+        science_stall_start_offered == UInt64(128)
+    @test science_stall_driver.counters.
+        science_stall_end_offered == UInt64(128)
+    Harness._stop_instrumentation_driver!(science_stall_driver)
+
     soak_samples = minimum_soak_sample_count(
         contract, workload)
     soak_horizon_ns =

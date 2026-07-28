@@ -613,27 +613,29 @@ end
 function _update_science_stall_state!(driver::BoundaryDriver)
     config = driver.run_config
     config.science_stall_frames == 0 && return nothing
-    offered = driver.counters.offered_primary
+    counters = driver.counters
+    offered = counters.offered_primary
+    published = counters.published_primary
     start_sequence = UInt64(config.science_stall_start_sequence)
     end_sequence = UInt64(
         config.science_stall_start_sequence +
         config.science_stall_frames)
-    if !driver.science_stall_started && offered >= start_sequence
+    if !driver.science_stall_started && published >= start_sequence
         driver.science_stall_started = true
-        driver.counters.science_stall_start_offered = offered
-        driver.counters.science_stall_start_generated =
-            driver.counters.generated_science
-        driver.counters.science_stall_start_observed =
-            driver.counters.observed_science
+        counters.science_stall_start_offered = offered
+        counters.science_stall_start_generated =
+            counters.generated_science
+        counters.science_stall_start_observed =
+            counters.observed_science
     end
     if driver.science_stall_started &&
-            !driver.science_stall_ended && offered >= end_sequence
+            !driver.science_stall_ended && published >= end_sequence
         driver.science_stall_ended = true
-        driver.counters.science_stall_end_offered = offered
-        driver.counters.science_stall_end_generated =
-            driver.counters.generated_science
-        driver.counters.science_stall_end_observed =
-            driver.counters.observed_science
+        counters.science_stall_end_offered = offered
+        counters.science_stall_end_generated =
+            counters.generated_science
+        counters.science_stall_end_observed =
+            counters.observed_science
     end
     return nothing
 end
