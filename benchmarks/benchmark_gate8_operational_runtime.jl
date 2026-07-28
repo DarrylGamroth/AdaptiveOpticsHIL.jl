@@ -1863,6 +1863,62 @@ function required_overload_gate(overload, contract)
         "passed" => passed)
 end
 
+function target_run_gate_report(report, contract)
+    gates = Dict{String,Any}(
+        "target_accounting" => Dict(
+            "passed" => bounded_success_accounting(
+                report, contract)),
+        "target_rate_fidelity" => Dict(
+            "maximum_error_fraction" =>
+                contract["max_target_rate_error_fraction"],
+            "passed" => rate_fidelity_passed(
+                [report],
+                contract["max_target_rate_error_fraction"])),
+        "target_absolute_latency" =>
+            target_latency_gate([report], contract),
+        "agent_owner_identity" => Dict(
+            "passed" => owner_tasks_are_stable(report)),
+        "target_gc_budget" => Dict(
+            "observed_fraction" => report["gc_fraction"],
+            "maximum_fraction" => contract["max_gc_fraction"],
+            "passed" => report["gc_fraction"] <=
+                contract["max_gc_fraction"]),
+    )
+    gates["all_evaluated_gates_passed"] = all(
+        get(gate, "passed", true)
+        for gate in values(gates))
+    return gates
+end
+
+function target_run_failure_diagnostic(report)
+    final_interval = last(report["intervals"])
+    histogram_maxima = Dict{String,Any}(
+        metric => report["histograms"][metric]["maximum_ns"]
+        for metric in (
+            "publication_lateness_ns",
+            "adapter_observation_delay_ns",
+            "closed_loop_response_ns",
+        )
+    )
+    return Dict{String,Any}(
+        "run" => report["run"],
+        "wall_elapsed_ns" => report["wall_elapsed_ns"],
+        "gc_fraction" => report["gc_fraction"],
+        "gc_collections" => final_interval["gc_collections"],
+        "gc_full_sweeps" => final_interval["gc_full_sweeps"],
+        "involuntary_context_switches" =>
+            final_interval["involuntary_context_switches"],
+        "voluntary_context_switches" =>
+            final_interval["voluntary_context_switches"],
+        "migrations" => final_interval["migrations"],
+        "minor_page_faults" =>
+            final_interval["minor_page_faults"],
+        "major_page_faults" =>
+            final_interval["major_page_faults"],
+        "histogram_maximum_ns" => histogram_maxima,
+    )
+end
+
 function gate8_gate_report(
     correctness,
     baseline_reports,
@@ -1885,8 +1941,6 @@ function gate8_gate_report(
         for report in calibration_reports)
     target_latency =
         target_latency_gate(target_reports, contract)
-    soak_latency =
-        target_latency_gate([soak_report], contract)
     relative_latency = relative_latency_gate(
         baseline_reports, target_reports, contract)
     burst_counters = burst_report["counters"]
@@ -1923,7 +1977,9 @@ function gate8_gate_report(
         calibration_reports,
         near_reports,
         saturation_reports,
-        [recovery_report, soak_report])
+        [recovery_report])
+    soak_report === nothing ||
+        push!(agent_success_reports, soak_report)
     gates = Dict{String,Any}(
         "exact_correctness" => Dict(
             "passed" => correctness["passed"]),
@@ -2086,20 +2142,32 @@ function gate8_gate_report(
                 allocation["inclusive_bytes_per_frame"] <=
                 contract[
                     "max_inclusive_alloc_bytes_per_frame"]),
-        "gc_budget" => Dict(
+    )
+    target_gc_passed = all(
+        report -> report["gc_fraction"] <=
+            contract["max_gc_fraction"],
+        target_reports)
+    if soak_report === nothing
+        gates["gc_budget"] = Dict(
+            "scope" => "completed target runs before soak",
+            "maximum_fraction" => contract["max_gc_fraction"],
+            "worst_target_fraction" => maximum(
+                report["gc_fraction"]
+                for report in target_reports),
+            "passed" => target_gc_passed)
+    else
+        soak_latency =
+            target_latency_gate([soak_report], contract)
+        gates["gc_budget"] = Dict(
             "maximum_fraction" => contract["max_gc_fraction"],
             "worst_target_fraction" => maximum(
                 report["gc_fraction"]
                 for report in target_reports),
             "soak_fraction" => soak_report["gc_fraction"],
-            "passed" =>
-                all(
-                    report -> report["gc_fraction"] <=
-                        contract["max_gc_fraction"],
-                    target_reports) &&
+            "passed" => target_gc_passed &&
                 soak_report["gc_fraction"] <=
-                    contract["max_gc_fraction"]),
-        "soak" => Dict(
+                    contract["max_gc_fraction"])
+        gates["soak"] = Dict(
             "wall_elapsed_ns" =>
                 soak_report["wall_elapsed_ns"],
             "minimum_wall_elapsed_ns" =>
@@ -2124,8 +2192,8 @@ function gate8_gate_report(
                 bounded_success_accounting(
                     soak_report, contract) &&
                 owner_tasks_are_stable(soak_report) &&
-                soak_latency["passed"]),
-    )
+                soak_latency["passed"])
+    end
     gates["all_evaluated_gates_passed"] = all(
         get(gate, "passed", true)
         for gate in values(gates))
@@ -2202,6 +2270,21 @@ function report_gate8_failed_gates(gates)
             repr(gates[name]))
     end
     return failures
+end
+
+function require_gate8_gates(
+    gates,
+    stage::AbstractString;
+    diagnostic=nothing)
+    gates["all_evaluated_gates_passed"] && return nothing
+    failed = report_gate8_failed_gates(gates)
+    diagnostic === nothing || println(
+        stderr,
+        "Gate 8 $stage diagnostic: ",
+        repr(diagnostic))
+    error(
+        "predeclared Gate 8 $stage gates failed: " *
+        join(failed, ", "))
 end
 
 function gate8_main(arguments=ARGS)
@@ -2300,18 +2383,21 @@ function gate8_main(arguments=ARGS)
             "Gate 8: target 2 kHz run $run_index/" *
             string(contract["target_runs"]))
         flush(stdout)
-        push!(
-            target_reports,
-            execute_recorded_run(
-                workload,
-                target_config,
-                histogram_config,
-                contract,
-                Operational.agent_execution_configuration(
-                    contract);
-                phase="target",
-                run_index,
-                agent_owned=true))
+        report = execute_recorded_run(
+            workload,
+            target_config,
+            histogram_config,
+            contract,
+            Operational.agent_execution_configuration(
+                contract);
+            phase="target",
+            run_index,
+            agent_owned=true)
+        push!(target_reports, report)
+        require_gate8_gates(
+            target_run_gate_report(report, contract),
+            "target run $run_index";
+            diagnostic=target_run_failure_diagnostic(report))
     end
 
     println("Gate 8: 16-frame consumer-interruption burst")
@@ -2514,6 +2600,25 @@ function gate8_main(arguments=ARGS)
     flush(stdout)
     deficit = named_deficit_report(
         Operational.execute_named_drain_deficit(contract))
+
+    pre_soak_gates = gate8_gate_report(
+        correctness,
+        baseline_reports,
+        target_reports,
+        burst_report,
+        science_report,
+        calibration_reports,
+        near_reports,
+        saturation_reports,
+        overload,
+        recovery_report,
+        injected_reports,
+        deficit,
+        nothing,
+        allocation,
+        instrumentation_bytes,
+        contract)
+    require_gate8_gates(pre_soak_gates, "pre-soak")
 
     soak_samples = minimum_soak_sample_count(
         contract, workload)

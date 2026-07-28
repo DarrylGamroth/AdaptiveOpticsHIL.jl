@@ -110,9 +110,22 @@ jobs:
         run: julia --project=. --startup-file=no test/execution.jl
 
   benchmark-contract:
-    name: Benchmark contracts / Julia 1.12 / ubuntu
+    name: Benchmark contract ${{ matrix.group }} / Julia 1.12 / ubuntu
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: gate4a
+            compile_args: "--compile=min -O0"
+            timeout_seconds: 60
+          - group: gate4a-allocation
+            compile_args: ""
+            timeout_seconds: 120
+          - group: gate8
+            compile_args: "--compile=min -O0"
+            timeout_seconds: 60
     env:
       JULIA_NUM_THREADS: "1"
       OPENBLAS_NUM_THREADS: "1"
@@ -134,12 +147,16 @@ jobs:
         run: julia --project=benchmarks --startup-file=no -e 'using Pkg; Pkg.instantiate()'
 
       - name: Validate benchmark contract and deterministic smoke path
-        run: julia --project=benchmarks --startup-file=no benchmarks/test/runtests.jl
+        run: timeout ${{ matrix.timeout_seconds }}s julia ${{ matrix.compile_args }} --project=benchmarks --startup-file=no benchmarks/test/runtests.jl ${{ matrix.group }}
 
   gate8-runtime-smoke:
-    name: Gate 8.9 operational smoke / Julia 1.12 / ubuntu
+    name: Gate 8.9 ${{ matrix.group }} smoke / Julia 1.12 / ubuntu
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [runtime, failure]
     env:
       JULIA_NUM_THREADS: "4,0"
       OPENBLAS_NUM_THREADS: "1"
@@ -161,4 +178,4 @@ jobs:
         run: julia --project=benchmarks --startup-file=no -e 'using Pkg; Pkg.instantiate()'
 
       - name: Run focused Gate 8.9 operational smoke tests
-        run: julia --project=benchmarks --startup-file=no benchmarks/test/gate8_runtime.jl
+        run: timeout 120s julia --compile=min -O0 --project=benchmarks --startup-file=no benchmarks/test/gate8_runtime.jl ${{ matrix.group }}

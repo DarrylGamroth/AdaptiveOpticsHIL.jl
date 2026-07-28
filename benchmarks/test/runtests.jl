@@ -13,6 +13,28 @@ include(joinpath(
     normpath(joinpath(@__DIR__, "..")),
     "benchmark_gate8_operational_runtime.jl"))
 
+const BENCHMARK_TEST_GROUPS = (
+    "gate4a",
+    "gate4a-allocation",
+    "gate8",
+)
+
+function selected_benchmark_test_groups(arguments)
+    isempty(arguments) && return Set(BENCHMARK_TEST_GROUPS)
+    requested = Set(String(argument) for argument in arguments)
+    unsupported = sort!(collect(
+        setdiff(requested, Set(BENCHMARK_TEST_GROUPS))))
+    isempty(unsupported) || error(
+        "unknown benchmark test group(s): " *
+        "$(join(unsupported, ", ")); choose from " *
+        join(BENCHMARK_TEST_GROUPS, ", "),
+    )
+    return requested
+end
+
+const SELECTED_BENCHMARK_TEST_GROUPS =
+    selected_benchmark_test_groups(ARGS)
+
 function cached_boundary_run(config)
     driver = Harness.prepare_boundary_driver(
         CachedNanoClock(0),
@@ -126,6 +148,7 @@ function Harness.observe_boundary_step!(
     return nothing
 end
 
+if "gate4a" in SELECTED_BENCHMARK_TEST_GROUPS
 @testset "Gate 4A benchmark contract" begin
     contract = TOML.parsefile(DEFAULT_CONTRACT)
     @test validate_contract(contract)
@@ -264,12 +287,19 @@ end
     @test catchup_observer.serviced_during_plant_event
     @test !catchup_observer.idle_with_pending_primary
 
-    @test Harness.measure_instrumentation_allocations(
-        Harness.Gate4AWorkloadConfig(),
-        histogram_config,
-        1_000) == 0
+end
 end
 
+if "gate4a-allocation" in SELECTED_BENCHMARK_TEST_GROUPS
+@testset "Gate 4A optimized allocation contract" begin
+    @test Harness.measure_instrumentation_allocations(
+        Harness.Gate4AWorkloadConfig(),
+        Harness.HistogramConfig(),
+        1_000) == 0
+end
+end
+
+if "gate8" in SELECTED_BENCHMARK_TEST_GROUPS
 @testset "Gate 8 operational benchmark contract" begin
     contract = TOML.parsefile(DEFAULT_GATE8_CONTRACT)
     @test validate_gate8_contract(contract)
@@ -477,4 +507,5 @@ end
         @test getfield(process, field) isa
             Union{Missing,Int64}
     end
+end
 end

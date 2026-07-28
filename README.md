@@ -346,6 +346,44 @@ remain allocation-free. Inclusive serial event and routed-command steps have
 2 KiB allocation ceilings because they include the current core reduced-order
 event and event-loop admission work.
 
+## Fast development test loops
+
+Package tests are split into `timing`, `lifecycle`, `ownership`, `ports`,
+`serial`, and `execution` groups. Run only the groups affected by a change
+during development:
+
+```sh
+julia --startup-file=no --project=. test/runtests.jl execution
+julia --startup-file=no --project=. test/runtests.jl ports serial
+```
+
+`Pkg.test()` remains the complete package and Aqua gate. The benchmark-contract
+tests are deterministic and bounded:
+
+```sh
+julia --compile=min -O0 --startup-file=no --project=benchmarks \
+    benchmarks/test/runtests.jl gate8
+julia --compile=min -O0 --startup-file=no --project=benchmarks \
+    benchmarks/test/runtests.jl gate4a
+julia --startup-file=no --project=benchmarks \
+    benchmarks/test/runtests.jl gate4a-allocation
+```
+
+The four-thread Gate 8 runtime smoke covers the operational topology, burst,
+shedding, overload, failure, and drain paths with small workloads. It is the
+development and CI check; it is not durable latency evidence:
+
+```sh
+JULIA_NUM_THREADS=4,0 OPENBLAS_NUM_THREADS=1 \
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+timeout 120s julia --compile=min -O0 --startup-file=no \
+    --project=benchmarks \
+    benchmarks/test/gate8_runtime.jl runtime
+timeout 120s julia --compile=min -O0 --startup-file=no \
+    --project=benchmarks \
+    benchmarks/test/gate8_runtime.jl failure
+```
+
 ## Qualified benchmark evidence
 
 The dedicated `benchmarks/` environment keeps HdrHistogram.jl and reporting
@@ -385,9 +423,11 @@ and uses `Agent.BusySpinIdleStrategy` for owner and coordinator barrier waits.
 It consumes CPU continuously while idle and carries no OS-affinity, isolation,
 real-time scheduling, or ThreadPinning claim.
 
-CI runs the short benchmark-contract suite plus a focused four-thread Gate 8.9
-runtime smoke. Durable evidence is generated deliberately from a clean
-revision. Gate 4A requires one Julia and BLAS thread:
+CI runs the bounded benchmark-contract suite plus the focused four-thread
+Gate 8.9 runtime smoke. The full Gate 8 campaign is a deliberate qualification
+run, not a development test. It evaluates completed phases before entering the
+300 s soak and generates durable evidence only from a clean revision after
+every frozen gate passes. Gate 4A requires one Julia and BLAS thread:
 
 ```sh
 julia --startup-file=no --project=benchmarks \
