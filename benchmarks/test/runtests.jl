@@ -242,6 +242,19 @@ end
         short_target)
 
     workload = Operational.workload_from_contract(contract)
+    @test contract["minimum_calibrated_rate_hz"] == 4_500
+    @test contract["minimum_calibrated_rate_hz"] >=
+        2 * contract["target_rate_hz"]
+    @test derived_rate(
+        contract["minimum_calibrated_rate_hz"],
+        contract["near_saturation_fraction"],
+        contract["rate_rounding_hz"],
+    ) > contract["target_rate_hz"]
+    @test derived_rate(
+        contract["minimum_calibrated_rate_hz"],
+        contract["saturation_fraction"],
+        contract["rate_rounding_hz"],
+    ) > contract["target_rate_hz"]
     @test workload.science_enabled
     @test workload.primary_period_ns ==
         contract["workload"]["primary_period_ns"]

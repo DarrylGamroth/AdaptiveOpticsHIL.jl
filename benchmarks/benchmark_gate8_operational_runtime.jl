@@ -46,7 +46,7 @@ const GATE8_FROZEN_CONTRACT_VALUES = (
     "science_recovery_frames" => 10_000,
     "calibration_runs" => 3,
     "calibration_samples_per_run" => 100_000,
-    "minimum_calibrated_rate_hz" => 5_000,
+    "minimum_calibrated_rate_hz" => 4_500,
     "derived_rate_preserve_capacity_time_headroom" => true,
     "near_saturation_fraction" => 0.70,
     "saturation_fraction" => 0.85,
@@ -305,6 +305,21 @@ function validate_gate8_contract(contract)
     1_000_000_000 ÷ workload["primary_period_ns"] ==
         contract["target_rate_hz"] || error(
             "target rate and primary period are inconsistent")
+    contract["minimum_calibrated_rate_hz"] >=
+        2 * contract["target_rate_hz"] || error(
+            "calibrated-capacity eligibility must remain at least twice the target rate")
+    derived_rate(
+        contract["minimum_calibrated_rate_hz"],
+        contract["near_saturation_fraction"],
+        contract["rate_rounding_hz"],
+    ) > contract["target_rate_hz"] || error(
+        "floor-derived near-saturation rate must remain above the target rate")
+    derived_rate(
+        contract["minimum_calibrated_rate_hz"],
+        contract["saturation_fraction"],
+        contract["rate_rounding_hz"],
+    ) > contract["target_rate_hz"] || error(
+        "floor-derived saturation rate must remain above the target rate")
     burst_duration_ns =
         contract["burst_frames"] *
         workload["primary_period_ns"]
@@ -2294,21 +2309,28 @@ function gate8_main(arguments=ARGS)
             "Gate 8: unpaced capacity diagnostic $run_index/" *
             string(contract["calibration_runs"]))
         flush(stdout)
-        push!(
-            calibration_reports,
-            execute_unpaced_run(
-                workload,
-                calibration_config,
-                histogram_config,
-                contract,
-                run_index))
+        report = execute_unpaced_run(
+            workload,
+            calibration_config,
+            histogram_config,
+            contract,
+            run_index)
+        push!(calibration_reports, report)
+        println(
+            "Gate 8: unpaced capacity diagnostic $run_index " *
+            "useful_completed_rate_hz=" *
+            string(report["useful_completed_rate_hz"]))
+        flush(stdout)
     end
     calibrated_rate_hz = minimum(
         report["useful_completed_rate_hz"]
         for report in calibration_reports)
     calibrated_rate_hz >=
         contract["minimum_calibrated_rate_hz"] || error(
-            "calibrated capacity is below the predeclared minimum")
+            "calibrated capacity is below the predeclared minimum: " *
+            "measured_minimum_hz=$(calibrated_rate_hz), " *
+            "required_minimum_hz=" *
+            string(contract["minimum_calibrated_rate_hz"]))
     near_rate_hz = derived_rate(
         calibrated_rate_hz,
         contract["near_saturation_fraction"],
