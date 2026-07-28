@@ -1339,27 +1339,31 @@ end
     @test AdaptiveOpticsHIL.Execution._execution_batch_active(
         publication_executor)
 
-    stop_publication_failure = execution_test_fixture()
-    stop_publication_executor = prepare_execution_test_executor(
-        stop_publication_failure,
-        ThreadedExecutionOwners();
-        outer_owner_count=3,
-        session=RunSessionID(0x89e9),
-    )
-    stop_publication_owner = execution_owner(
-        stop_publication_executor, 1)
-    close_ring!(stop_publication_owner.completion)
-    AdaptiveOpticsHIL.Lifecycle._begin_run_shutdown!(
-        stop_publication_executor.failures, 0)
-    AdaptiveOpticsHIL.Execution._begin_optical_execution_shutdown!(
-        stop_publication_executor)
-    stop_publication_record = wait_for_execution_failure_record(
-        stop_publication_executor)
-    @test run_failure_stage(stop_publication_record) ==
-        OwnerCompletionPublication
-    @test run_failure_reason(stop_publication_record) ==
-        :completion_publication
-    finish_execution_failure_shutdown!(stop_publication_executor)
+    if Threads.nthreads() < 4
+        @test_skip "threaded stop-publication fault requires four Julia threads"
+    else
+        stop_publication_failure = execution_test_fixture()
+        stop_publication_executor = prepare_execution_test_executor(
+            stop_publication_failure,
+            ThreadedExecutionOwners();
+            outer_owner_count=3,
+            session=RunSessionID(0x89e9),
+        )
+        stop_publication_owner = execution_owner(
+            stop_publication_executor, 1)
+        close_ring!(stop_publication_owner.completion)
+        AdaptiveOpticsHIL.Lifecycle._begin_run_shutdown!(
+            stop_publication_executor.failures, 0)
+        AdaptiveOpticsHIL.Execution._begin_optical_execution_shutdown!(
+            stop_publication_executor)
+        stop_publication_record = wait_for_execution_failure_record(
+            stop_publication_executor)
+        @test run_failure_stage(stop_publication_record) ==
+            OwnerCompletionPublication
+        @test run_failure_reason(stop_publication_record) ==
+            :completion_publication
+        finish_execution_failure_shutdown!(stop_publication_executor)
+    end
 
     device_failure = execution_test_fixture(
         device_batch_selection=Val(:all),
