@@ -33,7 +33,6 @@ using ..Execution: _arm_optical_execution!
 using ..Execution: _abandon_failed_optical_path_batch!
 using ..Execution: _bind_optical_execution_timing
 using ..Execution: _execution_accounting
-using ..Execution: _execution_accounting_is_drained
 using ..Execution: _execution_accounting_is_quiescent
 using ..Execution: _execution_batch_active
 using ..Execution: _execution_is_armed, _execution_is_quiescent
@@ -932,19 +931,6 @@ function serial_run_is_quiescent(accounting::SerialRunAccounting)
             accounting.execution_owners)
 end
 
-function _serial_run_is_drained(accounting::SerialRunAccounting)
-    return accounting.command_submissions.occupancy == 0 &&
-        accounting.command_completions.occupancy == 0 &&
-        _pool_is_quiescent(accounting.command_credits) &&
-        _pool_is_quiescent(accounting.command_payloads) &&
-        iszero(accounting.command_dispositions) &&
-        iszero(accounting.active_command_correlations) &&
-        _acquisitions_are_quiescent(accounting.acquisitions) &&
-        !accounting.execution_batch_active &&
-        _execution_accounting_is_drained(
-            accounting.execution_owners)
-end
-
 # Direct dispatch tests cover these inlined recursion leaves, but Julia's
 # coverage instrumentation does not retain a source counter for either line.
 @inline _reclaim_serial_command_payload_returns!( # COV_EXCL_LINE
@@ -1205,7 +1191,7 @@ end
 @inline _progress_serial_acquisition_return_paths!(
     ::Tuple{},
     ::SerialShutdownState,
-    ::Int) = true
+    ::Int) = true # COV_EXCL_LINE
 
 function _progress_serial_acquisition_return_paths!(
     publishers::Tuple,
@@ -1230,7 +1216,7 @@ function _progress_serial_acquisition_return_paths!(
 end
 
 @inline _serial_acquisition_ownership_is_drained(
-    ::Tuple{}) = true
+    ::Tuple{}) = true # COV_EXCL_LINE
 
 @inline function _serial_acquisition_ownership_is_drained(
     publishers::Tuple)

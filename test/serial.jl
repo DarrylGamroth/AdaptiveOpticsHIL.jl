@@ -53,6 +53,7 @@ mutable struct SerialTestLifecycleFailureExecutor <:
     configuration::SerialTestLifecycleFailureConfiguration
     armed::Bool
     failed::Bool
+    shutdown_progress_count::Int
 end
 
 function AdaptiveOpticsHIL.Execution._prepare_optical_execution(
@@ -64,7 +65,7 @@ function AdaptiveOpticsHIL.Execution._prepare_optical_execution(
     ::RunShutdownPolicy,
 )
     return SerialTestLifecycleFailureExecutor(
-        configuration, false, false)
+        configuration, false, false, 0)
 end
 
 AdaptiveOpticsHIL.Execution._execution_is_quiescent(
@@ -93,6 +94,12 @@ end
 
 AdaptiveOpticsHIL.Execution._stop_optical_execution!(
     executor::SerialTestLifecycleFailureExecutor) = executor
+
+function AdaptiveOpticsHIL.Execution._progress_optical_execution_shutdown!(
+    executor::SerialTestLifecycleFailureExecutor)
+    executor.shutdown_progress_count += 1
+    return executor.shutdown_progress_count > 1
+end
 
 function AdaptiveOpticsHIL.Execution._mark_optical_execution_failed!(
     executor::SerialTestLifecycleFailureExecutor,
@@ -150,6 +157,17 @@ end
 Clocks.time_nanos(clock::MutableIdentityNanoClock) = clock.value
 AdaptiveOpticsHIL.Timing.execution_clock_identity(
     clock::MutableIdentityNanoClock) = clock.identity
+
+mutable struct ToggleReadingNanoClock <: Clocks.AbstractNanoClock
+    value::Int64
+    invalid::Bool
+end
+
+Clocks.time_nanos(clock::ToggleReadingNanoClock) =
+    clock.invalid ? Int32(0) : clock.value
+AdaptiveOpticsHIL.Timing.execution_clock_identity(
+    ::ToggleReadingNanoClock) =
+    ExecutionClockID(:toggle_reading_test_clock)
 
 struct HILReducedOrderPathModel end
 struct HILReducedOrderOpticModel end
@@ -454,6 +472,7 @@ function serial_test_fixture(;
     ingress_liveness=nothing,
     shutdown_policy=SERIAL_TEST_SHUTDOWN_POLICY,
     reverse_acquisition_ports=false,
+    clock=CachedNanoClock(0),
     arm=true,
     start=true)
     core = serial_test_plant()
@@ -499,7 +518,6 @@ function serial_test_fixture(;
         arm_timeout_ns,
         shutdown_policy)
     run = prepare_serial_run(configuration)
-    clock = CachedNanoClock(0)
     attempt = arm ? begin_serial_arm!(run, clock) : nothing
     readiness = arm ? AdapterReadinessSnapshot(
         session,
@@ -932,6 +950,10 @@ end
         @test run_session(fixture.configuration) ==
             RunSessionID(0x7c00)
         @test run_session(fixture.running) == RunSessionID(0x7c00)
+        @test serial_shutdown_policy(fixture.configuration) ===
+            SERIAL_TEST_SHUTDOWN_POLICY
+        @test serial_shutdown_policy(fixture.run) ===
+            SERIAL_TEST_SHUTDOWN_POLICY
         @test run_arm_window(fixture.configuration) === nothing
         @test run_execution_clock_identity(fixture.configuration) ===
             nothing
@@ -1878,6 +1900,58 @@ end
         @test run_termination_kind(run_termination(busy.run)) ==
             RequestedRunStop
 
+        begin_failure = serial_test_fixture()
+        queue_serial_test_command!(begin_failure)
+        close_ring!(
+            command_completion_port(
+                begin_failure.command_ports).ring)
+        begin_failure_error = captured_serial_error() do
+            begin_serial_stop!(
+                begin_failure.running,
+                RunStopRequest(
+                    run_session(begin_failure.run),
+                    execution_clock_identity(
+                        begin_failure.armed.timing),
+                    Clocks.time_nanos(begin_failure.clock);
+                    reason=:injected_begin_failure))
+        end
+        @test begin_failure_error isa PortError
+        @test begin_failure_error.reason ==
+            :publication_after_close
+        @test serial_shutdown_status(begin_failure.run) ==
+            SerialShutdownDraining
+        Clocks.advance!(
+            begin_failure.clock,
+            drain_timeout_ns(serial_shutdown_policy(
+                begin_failure.run)) + 1)
+        @test progress_serial_shutdown!(begin_failure.running) ==
+            SerialShutdownFinalized
+        @test run_phase(begin_failure.run) == RunFailed
+
+        closure_failure = serial_test_fixture()
+        queue_serial_test_command!(closure_failure)
+        close_ring!(
+            command_completion_port(
+                closure_failure.command_ports).ring)
+        original_closure_failure =
+            ArgumentError("test shutdown closure failure")
+        closure_record = Base.invokelatest(
+            AdaptiveOpticsHIL.Serial._record_serial_failure!,
+            closure_failure.running,
+            original_closure_failure)
+        @test run_failure_reason(closure_record) ==
+            :ArgumentError
+        @test serial_shutdown_status(closure_failure.run) ==
+            SerialShutdownDraining
+        Clocks.advance!(
+            closure_failure.clock,
+            drain_timeout_ns(serial_shutdown_policy(
+                closure_failure.run)) + 1)
+        @test progress_serial_shutdown!(closure_failure.running) ==
+            SerialShutdownFinalized
+        @test run_failure_reason(first_run_failure(
+            closure_failure.run.failures)) == :ArgumentError
+
         exhausted = serial_test_fixture(product_capacity=1)
         exhausted_error =
             drive_until_serial_failure!(exhausted)
@@ -1914,6 +1988,57 @@ end
             :acquisition_publication_rejected
         @test run_phase(closed.run) == RunFailed
 
+        copy_failure = prepare_first_wfs_publication!(
+            serial_test_fixture())
+        publisher = first(copy_failure.run.publishers)
+        bad_source = SERIAL_TEST_PLANT.AcquisitionProducts(
+            nothing,
+            nothing;
+            metadata=(source=:injected_copy_failure,))
+        bad_publisher =
+            AdaptiveOpticsHIL.Serial.PreparedAcquisitionPublisher(
+                publisher.id,
+                publisher.port,
+                bad_source)
+        # Advance the prepared plant directly to the due acquisition product,
+        # leaving the serial publication operation uncalled so this
+        # disposable fixture can inject a copy failure at its ownership
+        # boundary.
+        event_state = plant_event_loop_state(
+            copy_failure.run.state.bridge)
+        event_workspace = plant_event_loop_workspace(
+            copy_failure.run.workspace.bridge)
+        due_timestamp = next_plant_event_timestamp(
+            copy_failure.run.configuration.event_loop,
+            event_state,
+            event_workspace)
+        @test step_plant_events!(
+            copy_failure.run.configuration.event_loop,
+            event_state,
+            event_workspace,
+            copy_failure.run.execution) == due_timestamp
+        products_before =
+            acquisition_product_accounting(publisher.port)
+        copy_failure_error = captured_serial_error() do
+            AdaptiveOpticsHIL.Serial._publish_serial_products!(
+                (bad_publisher,),
+                copy_failure.armed,
+                copy_failure.run.state,
+                copy_failure.run.workspace,
+                Clocks.time_nanos(copy_failure.clock),
+                1)
+        end
+        @test copy_failure_error isa
+            SERIAL_TEST_PLANT.PlantPreparationError
+        products_after =
+            acquisition_product_accounting(publisher.port)
+        @test products_after.free == products_before.free
+        Base.invokelatest(
+            AdaptiveOpticsHIL.Serial._record_serial_failure!,
+            copy_failure.running,
+            copy_failure_error)
+        finish_serial_shutdown!(copy_failure)
+
         generic_failure = serial_test_fixture()
         generic_error = ArgumentError("test generic runtime failure")
         failure_record = Base.invokelatest(
@@ -1929,6 +2054,47 @@ end
             invalid_reading_termination) == :serial_run
         @test run_termination_reason(
             invalid_reading_termination) == :ArgumentError
+        @test AdaptiveOpticsHIL.Serial._serial_failure_kind(
+            SerialRunError(
+                :serial_run,
+                :injected_owner_exception,
+                "test serial owner exception")) ==
+            OwnerExceptionRunFailure
+
+        unavailable_clock = ToggleReadingNanoClock(0, false)
+        unavailable = serial_test_fixture(
+            clock=unavailable_clock)
+        unavailable_stop = RunStopRequest(
+            run_session(unavailable.run),
+            execution_clock_identity(unavailable.armed.timing),
+            Clocks.time_nanos(unavailable.clock);
+            reason=:execution_clock_failure)
+        @test begin_serial_stop!(
+            unavailable.running, unavailable_stop) ==
+            SerialShutdownDraining
+        unavailable_clock.invalid = true
+        @test progress_serial_shutdown!(unavailable.running) ==
+            SerialShutdownFinalized
+        @test unavailable.run.state.shutdown.clock_unavailable
+        @test run_phase(unavailable.run) == RunFailed
+        @test run_termination_component(
+            run_termination(unavailable.run)) == :execution_clock
+        @test run_termination_reason(
+            run_termination(unavailable.run)) == :unavailable
+
+        failure_clock = ToggleReadingNanoClock(0, false)
+        unavailable_failure = serial_test_fixture(
+            clock=failure_clock)
+        failure_clock.invalid = true
+        unavailable_record = Base.invokelatest(
+            AdaptiveOpticsHIL.Serial._record_serial_failure!,
+            unavailable_failure.running,
+            ArgumentError("test unavailable failure clock"))
+        @test run_failure_execution_ns(unavailable_record) ===
+            nothing
+        @test unavailable_failure.run.state.shutdown.clock_unavailable
+        failure_clock.invalid = false
+        finish_serial_shutdown!(unavailable_failure)
 
         armed = serial_test_fixture(start=false)
         armed_request = RunStopRequest(

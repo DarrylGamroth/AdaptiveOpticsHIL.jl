@@ -181,6 +181,8 @@ end
         @test run_session(failure) == session
         @test run_execution_clock_identity(failure) ==
             LIFECYCLE_TEST_CLOCK
+        @test run_failure_kind(failure) ==
+            OwnerExceptionRunFailure
         @test failure_event_execution_ns(failure) == 11
         @test failure_event_component(failure) == :serial_owner
         @test failure_event_reason(failure) == :injected
@@ -250,6 +252,8 @@ end
             owners[2], RunOwnerID(:path_execution_owner, 1))
         @test hash(owners[2]) ==
             hash(RunOwnerID(:path_execution_owner, 1))
+        @test sprint(show, owners[2]) ==
+            "RunOwnerID(:path_execution_owner, 1)"
         @test_throws RunLifecycleError RunOwnerID(Symbol(""), 1)
         @test_throws RunLifecycleError RunOwnerID(:owner, false)
         @test_throws RunLifecycleError RunOwnerID(:owner, 0)
@@ -257,6 +261,8 @@ end
         coordinator =
             HIL_LIFECYCLE._prepare_run_failure_coordinator(
                 session, policy, owners)
+        @test HIL_LIFECYCLE._run_failure_owner_count(
+            coordinator) == 3
         prepared_coordinator_owner = owners[1]
         owners[1] = RunOwnerID(:mutated_input_owner, 1)
         @test HIL_LIFECYCLE._run_failure_owner(
@@ -287,6 +293,7 @@ end
             work_sequence=7)
         @test Base.allocatedinline(RunFailureRecord)
         @test run_failure_kind(record) == DeviceRunFailure
+        @test run_session(record) == session
         @test run_failure_owner(record) == owners[3]
         @test run_failure_stage(record) == OwnerDeviceCompletion
         @test run_failure_execution_ns(record) === nothing

@@ -806,6 +806,14 @@ end
         serial_executor)
     @test AdaptiveOpticsHIL.Execution._execution_is_quiescent(
         serial_executor)
+    @test AdaptiveOpticsHIL.Execution._execution_ownership_is_drained(
+        serial_executor)
+    @test AdaptiveOpticsHIL.Execution.
+        _progress_optical_execution_shutdown!(serial_executor)
+    @test !AdaptiveOpticsHIL.Execution._execution_batch_active(
+        serial_executor)
+    @test AdaptiveOpticsHIL.Execution.
+        _abandon_failed_optical_path_batch!(serial_executor)
     @test AdaptiveOpticsHIL.Execution._execution_accounting_is_quiescent(
         nothing)
     @test_throws ExecutionOwnerError HybridExecutionOwnerIdle(0)
@@ -1121,8 +1129,36 @@ end
     @test try_take!(
         occupied_scratch, capacity_owner.due) ==
         RingTransferSucceeded
+    @test try_submit!(
+        capacity_owner.due, occupied_work) ==
+        RingTransferSucceeded
+    AdaptiveOpticsHIL.Execution._drain_cancelled_owner_work!(
+        capacity_executor, capacity_owner_ordinal)
+    @test execution_owner_accounting(
+        capacity_executor,
+        capacity_owner_ordinal).work_cancelled == 1
+    completion_type =
+        AdaptiveOpticsHIL.Execution._ExecutionOwnerCompletion
+    injected_completion = completion_type(
+        capacity_executor.session,
+        execution_owner_id(capacity_owner),
+        UInt64(1),
+        AdaptiveOpticsHIL.Execution._ExecutionOwnerMaterialization,
+        AdaptiveOpticsHIL.Execution._ExecutionOwnerWorkCompleted,
+    )
+    @test try_submit!(
+        capacity_owner.completion, injected_completion) ==
+        RingTransferSucceeded
+    AdaptiveOpticsHIL.Execution._drain_execution_owner_completions!(
+        capacity_executor, capacity_owner_ordinal)
+    @test capacity_executor.coordinator.completions[
+        capacity_owner_ordinal] == 1
+    capacity_executor.coordinator.completions[
+        capacity_owner_ordinal] = 0
     @test execution_owners_are_quiescent(capacity_executor)
     stop_execution_test_executor!(capacity_executor)
+    @test AdaptiveOpticsHIL.Execution.
+        _execution_owner_stops_are_acknowledged(capacity_executor)
 
     materialization_failure =
         ArgumentError("test owner materialization failure")
@@ -1302,6 +1338,28 @@ end
     @test publication_accounting.failed
     @test AdaptiveOpticsHIL.Execution._execution_batch_active(
         publication_executor)
+
+    stop_publication_failure = execution_test_fixture()
+    stop_publication_executor = prepare_execution_test_executor(
+        stop_publication_failure,
+        ThreadedExecutionOwners();
+        outer_owner_count=3,
+        session=RunSessionID(0x89e9),
+    )
+    stop_publication_owner = execution_owner(
+        stop_publication_executor, 1)
+    close_ring!(stop_publication_owner.completion)
+    AdaptiveOpticsHIL.Lifecycle._begin_run_shutdown!(
+        stop_publication_executor.failures, 0)
+    AdaptiveOpticsHIL.Execution._begin_optical_execution_shutdown!(
+        stop_publication_executor)
+    stop_publication_record = wait_for_execution_failure_record(
+        stop_publication_executor)
+    @test run_failure_stage(stop_publication_record) ==
+        OwnerCompletionPublication
+    @test run_failure_reason(stop_publication_record) ==
+        :completion_publication
+    finish_execution_failure_shutdown!(stop_publication_executor)
 
     device_failure = execution_test_fixture(
         device_batch_selection=Val(:all),

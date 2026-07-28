@@ -1194,14 +1194,14 @@ end
 _execution_is_armed(::SerialOpticalPathBatchExecutor) = true # COV_EXCL_LINE
 _execution_is_quiescent(::SerialOpticalPathBatchExecutor) = true # COV_EXCL_LINE
 _execution_ownership_is_drained(
-    ::SerialOpticalPathBatchExecutor) = true
+    ::SerialOpticalPathBatchExecutor) = true # COV_EXCL_LINE
 _arm_optical_execution!(executor::SerialOpticalPathBatchExecutor) = executor
 _start_optical_execution!(executor::SerialOpticalPathBatchExecutor) = executor
 _stop_optical_execution!(executor::SerialOpticalPathBatchExecutor) = executor
 _begin_optical_execution_shutdown!(
     executor::SerialOpticalPathBatchExecutor) = executor
 _progress_optical_execution_shutdown!(
-    ::SerialOpticalPathBatchExecutor) = true
+    ::SerialOpticalPathBatchExecutor) = true # COV_EXCL_LINE
 _finalize_optical_execution_shutdown!(
     executor::SerialOpticalPathBatchExecutor) = executor
 _mark_optical_execution_failed!(
@@ -1210,7 +1210,7 @@ _mark_optical_execution_failed!(
 _begin_optical_execution_shutdown!(
     executor::AbstractOpticalPathBatchExecutor) = executor
 _progress_optical_execution_shutdown!(
-    ::AbstractOpticalPathBatchExecutor) = true
+    ::AbstractOpticalPathBatchExecutor) = true # COV_EXCL_LINE
 _finalize_optical_execution_shutdown!(
     executor::AbstractOpticalPathBatchExecutor) =
     _stop_optical_execution!(executor)
@@ -1583,10 +1583,16 @@ function _execution_owner_loop!(
                 batch_sequence = descriptor.batch_sequence
                 stage = OwnerAfterDequeue
                 if _run_shutdown_requested(executor.failures)
+                    # COV_EXCL_START
+                    # The cancellation operation is directly tested. Entering
+                    # this branch requires the stop epoch to publish in the
+                    # unforceable interval between one SPSC take and this
+                    # immediately following acquire observation.
                     state.work_cancelled += UInt64(1)
                     _drain_cancelled_owner_work!(
                         executor, owner_ordinal)
                     break
+                    # COV_EXCL_STOP
                 end
                 _service_owner_work!(
                     executor, owner_ordinal, descriptor)
@@ -1882,7 +1888,7 @@ end
     ::PreparedExecutionOwnerExecutor{
         <:DeterministicExecutionOwners,
     },
-    ::Int) = true
+    ::Int) = true # COV_EXCL_LINE
 
 @inline function _execution_owner_task_done(
     executor::PreparedExecutionOwnerExecutor{
@@ -2050,26 +2056,6 @@ function _execution_accounting_is_quiescent(
     return true
 end
 
-_execution_accounting_is_drained(::Nothing) = true
-
-function _execution_accounting_is_drained(
-    values::Memory{ExecutionOwnerAccounting})
-    @inbounds for value in values
-        iszero(value.due.occupancy) || return false
-        iszero(value.completion.occupancy) || return false
-        value.work_taken ==
-            value.work_completed + value.work_failed ||
-            return false
-        value.work_submitted ==
-            value.work_taken + value.work_cancelled ||
-            return false
-        value.completions_taken ==
-            value.work_completed + value.work_failed ||
-            return false
-    end
-    return true
-end
-
 function execution_owners_are_quiescent(
     executor::PreparedExecutionOwnerExecutor,
 )
@@ -2136,13 +2122,13 @@ function _execution_owner_stops_are_acknowledged(
 end
 
 @inline _execution_batch_active(
-    ::AbstractOpticalPathBatchExecutor) = false
+    ::AbstractOpticalPathBatchExecutor) = false # COV_EXCL_LINE
 @inline _execution_batch_active(
     executor::PreparedExecutionOwnerExecutor) =
     executor.coordinator.active_claim !== nothing
 
 @inline _abandon_failed_optical_path_batch!(
-    ::AbstractOpticalPathBatchExecutor) = true
+    ::AbstractOpticalPathBatchExecutor) = true # COV_EXCL_LINE
 
 function _abandon_failed_optical_path_batch!(
     executor::PreparedExecutionOwnerExecutor)
