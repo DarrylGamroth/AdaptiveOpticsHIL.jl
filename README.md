@@ -119,9 +119,15 @@ owned WFS and optional science paths may execute concurrently only after all
 current-epoch inputs are materialized. Nominal stop closes every owner input,
 collects one stop acknowledgement per owner, joins threaded tasks, and verifies
 empty ring/accounting state. `serial_run_accounting` includes a cold snapshot
-of these owners alongside port, pool, and lease accounting. Coordinated
-first-failure publication, recovery, and deadline-bounded failure drain remain
-later Gate 8 work.
+of these owners alongside port, pool, and lease accounting. Each coordinator,
+path owner, and device-submission owner has one preallocated compact
+first-failure slot and stop acknowledgement. Failure never retries or rolls
+back a possibly mutated optical batch; the failed prepared run is discarded.
+Deterministic fault tests exercise every owner-boundary stage and synthetic
+device-owner failure classification. Vendor-specific accelerator
+completion-fault injection is not generalized by this transport-neutral
+package; hardware/backend tests must provide it where the vendor runtime
+supports a controlled fault.
 
 ## RTC-facing ports
 
@@ -180,9 +186,10 @@ backoff policy.
 - immutable lifecycle parameters with a required relative arm timeout;
 - configured, prepared, arming, armed, running, stopped, and failed phases;
 - an inclusive arm window tied to the selected execution-clock identity;
-- same-session adapter readiness observed on that execution clock; and
+- same-session adapter readiness observed on that execution clock;
 - typed stop requests, configured terminal events, failures, and immutable
-  terminal records.
+  terminal records; and
+- required execution-clock acknowledgement and ownership-drain deadlines.
 
 User integration may establish readiness through any transport or local
 mechanism, but the snapshot contains no connection, client/server, or health
@@ -209,6 +216,9 @@ The serial path exposes the complete breaking lifecycle directly:
 configuration = configure_serial_run(
     command_bridge, acquisition_ports;
     arm_timeout_ns=1_000_000_000,
+    shutdown_policy=RunShutdownPolicy(
+        acknowledgement_timeout_ns=100_000_000,
+        drain_timeout_ns=500_000_000),
     ingress_liveness=RTCIngressLivenessPolicy(
         command_endpoint,
         execution_clock_identity(clock);
@@ -222,6 +232,16 @@ readiness = AdapterReadinessSnapshot(
     Clocks.time_nanos(clock))
 armed = arm_serial_run!(attempt, readiness)
 running = start_serial_run!(armed)
+
+request = RunStopRequest(
+    run_session(running),
+    execution_clock_identity(clock),
+    Clocks.time_nanos(clock))
+begin_serial_stop!(running, request)
+# Drain transport-facing completions and release leases between polls.
+while progress_serial_shutdown!(running) != SerialShutdownFinalized
+    yield()
+end
 ```
 
 Configuration derives the exact event loop from the command bridge and freezes
@@ -233,12 +253,23 @@ configured threaded execution policy creates one task per already-prepared,
 stable owner only during arm.
 Runtime handles retain the exact prepared run, so state and workspace from
 different runs cannot be combined. Clean stop requires quiescent current
-resources and records either a typed request or terminal event; runtime errors
-record failed termination. The accepted readiness snapshot is retained once
-in lifecycle state rather than copied into each product descriptor.
-Coordinated port closure, preallocated first-failure publication,
-deadline-bounded failure drain, and ownership-deficit finalization remain later
-Gate 8 work and are not claimed by this phase.
+resources and records either a typed request or terminal event. Runtime errors
+release-publish the first compact owner record, close command and acquisition
+ingress, stop semantic admission, and begin bounded acknowledgement and drain.
+Transferred but unadmitted commands receive `RunNotAccepting`; admitted
+commands receive one correlated failed core disposition without changing the
+held optic. Completion and lease-return paths remain drainable until their
+ordered closure point. The accepted readiness snapshot is retained once in
+lifecycle state rather than copied into each product descriptor.
+
+`serial_failure_accounting` identifies the stable first failure, concurrent
+owner records, missing acknowledgements, and deadline state.
+`serial_run_accounting` is the cold resource snapshot: after finalization, any
+nonzero ring occupancy, nonfree payload state, active command correlation,
+owner work imbalance, or retained optical-batch claim is an explicit deficit
+owned by the named command, acquisition, path, or device owner. A deficit or
+deadline violation produces `RunFailed`, never a clean stop. Recovery requires
+a newly prepared run.
 
 Runtime plant controls use the canonical typed command boundary. A prepared
 core model may expose acquisition enablement, trigger start/stop,
@@ -276,9 +307,10 @@ separately, records exact execution-clock lateness and overload episodes, and
 continues publishing independent required streams when an optional
 drop-newest stream is full. A selected owner deadline is checked against the
 same armed execution-clock mapping. Deadline/capacity policy failure records
-bounded owner evidence and fails the run; coordinated acknowledgement,
-completion drain, and ownership-deficit finalization remain the next Gate 8
-delivery and are not represented as clean recovery here.
+bounded owner evidence and enters the same coordinated acknowledgement,
+completion, outcome, and lease drain as a requested stop. Missing ownership or
+acknowledgement at the configured execution-clock deadline remains visible in
+the final accounting and fails the run.
 
 Sampled actuator/device feedback is simply another independently scheduled
 acquisition-completion stream. It does not share command cadence and never

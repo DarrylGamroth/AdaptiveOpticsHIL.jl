@@ -20,6 +20,7 @@ using AdaptiveOpticsSim.Plant: OpticalPathBatchClaim
 using AdaptiveOpticsSim.Plant: PlantEventLoopState, PlantEventLoopWorkspace
 using AdaptiveOpticsSim.Plant: PlantTimestamp, PreparedPlantEventLoop
 using AdaptiveOpticsSim.Plant: SerialOpticalPathBatchExecutor
+using AdaptiveOpticsSim.Plant: abandon_optical_path_batch!
 using AdaptiveOpticsSim.Plant: begin_optical_path_batch!
 using AdaptiveOpticsSim.Plant: complete_optical_path_batch!
 using AdaptiveOpticsSim.Plant: device_path_batch_backend
@@ -43,7 +44,17 @@ using AdaptiveOpticsSim.Plant: seal_optical_path_batch_materialization!
 using AdaptiveOpticsSim.Plant: validate_cpu_execution_budget
 
 import ..AdaptiveOpticsHIL: AdaptiveOpticsHILError
-using ..Lifecycle: RunSessionID
+using ..Lifecycle: DeviceRunFailure, OwnerExceptionRunFailure
+using ..Lifecycle: OwnerAfterDequeue, OwnerBeforeDequeue
+using ..Lifecycle: OwnerCompletionPublication, OwnerDeviceCompletion
+using ..Lifecycle: OwnerExecution, OwnerMaterialization
+using ..Lifecycle: PreparedRunFailureCoordinator
+using ..Lifecycle: RunOwnerID, RunSessionID, RunShutdownPolicy
+using ..Lifecycle: _acknowledge_run_stop!
+using ..Lifecycle: _begin_run_shutdown!
+using ..Lifecycle: _prepare_run_failure_coordinator
+using ..Lifecycle: _publish_run_failure!, _run_shutdown_requested
+using ..Lifecycle: _run_owner_stop_acknowledged
 using ..Ownership: RingAccounting, RingClosed, RingEmpty, RingFull
 using ..Ownership: RingTransferSucceeded, SPSCDescriptorRing
 using ..Ownership: close_ring!, ring_accounting
@@ -694,6 +705,8 @@ mutable struct _ExecutionOwnerState
     active_batch_sequence::UInt64
     work_taken::UInt64
     work_completed::UInt64
+    work_failed::UInt64
+    work_cancelled::UInt64
     task_id::UInt
     last_thread_id::Int
     failure::Any
@@ -716,6 +729,7 @@ mutable struct _ExecutionCoordinatorState
     phase::ExecutionOwnersPhase
     batch_sequence::UInt64
     batch_count::UInt64
+    active_claim::Union{Nothing,OpticalPathBatchClaim}
     submitted::Memory{UInt64}
     completions::Memory{UInt64}
     startup_acknowledged::Memory{Bool}
@@ -754,6 +768,7 @@ struct PreparedExecutionOwnerExecutor{
     owner_workspaces::Memory{_ExecutionOwnerWorkspace}
     coordinator::_ExecutionCoordinatorState
     coordinator_workspace::_ExecutionCoordinatorWorkspace
+    failures::PreparedRunFailureCoordinator
     tasks::Memory{Task}
     mode::M
     cpu_budget::B
@@ -986,6 +1001,8 @@ function _owner_states(count::Int)
             UInt64(0),
             UInt64(0),
             UInt64(0),
+            UInt64(0),
+            UInt64(0),
             UInt(0),
             0,
             nothing,
@@ -1037,12 +1054,33 @@ _task_storage(::DeterministicExecutionOwners, ::Int) =
 _task_storage(::ThreadedExecutionOwners, count::Int) =
     Memory{Task}(undef, count)
 
+function _execution_failure_owner_ids(
+    owners::Memory{PreparedExecutionOwner})
+    values = Memory{RunOwnerID}(undef, length(owners) + 1)
+    values[1] = RunOwnerID(:serial_coordinator, 1)
+    @inbounds for owner_ordinal in eachindex(owners)
+        owner = owners[owner_ordinal]
+        component = owner.kind == DeviceBatchExecutionOwner ?
+            :device_submission_owner : :path_execution_owner
+        values[owner_ordinal + 1] = RunOwnerID(
+            component, execution_owner_id_value(owner.id))
+    end
+    return values
+end
+
+function _coordinator_only_failure_owner_ids()
+    values = Memory{RunOwnerID}(undef, 1)
+    values[1] = RunOwnerID(:serial_coordinator, 1)
+    return values
+end
+
 function _prepare_optical_execution(
     ::SerialOpticalExecution,
     ::PreparedPlantEventLoop,
     ::PlantEventLoopState,
     ::PlantEventLoopWorkspace,
     ::RunSessionID,
+    ::RunShutdownPolicy,
 )
     return SerialOpticalPathBatchExecutor()
 end
@@ -1053,6 +1091,7 @@ function _prepare_optical_execution(
     ::PlantEventLoopState,
     ::PlantEventLoopWorkspace,
     ::RunSessionID,
+    ::RunShutdownPolicy,
 )
     return _execution_owner_error(
         :unsupported_execution_configuration,
@@ -1066,6 +1105,7 @@ function _prepare_optical_execution(
     state::PlantEventLoopState,
     workspace::PlantEventLoopWorkspace,
     session::RunSessionID,
+    shutdown_policy::RunShutdownPolicy,
 )
     owners, group_owner_ordinals =
         _prepare_execution_owner_topology(configuration, prepared)
@@ -1088,6 +1128,10 @@ function _prepare_optical_execution(
     completion_seen = Memory{Bool}(undef, owner_count)
     fill!(owner_due, false)
     fill!(completion_seen, false)
+    failures = _prepare_run_failure_coordinator(
+        session,
+        shutdown_policy,
+        _execution_failure_owner_ids(owners))
     return PreparedExecutionOwnerExecutor(
         session,
         prepared,
@@ -1102,6 +1146,7 @@ function _prepare_optical_execution(
             ExecutionOwnersPrepared,
             UInt64(0),
             UInt64(0),
+            nothing,
             submitted,
             completions,
             startup,
@@ -1113,6 +1158,7 @@ function _prepare_optical_execution(
             completion_seen,
             _completion_scratch(owner_count),
         ),
+        failures,
         _task_storage(configuration.mode, owner_count),
         configuration.mode,
         configuration.cpu_budget,
@@ -1121,14 +1167,56 @@ function _prepare_optical_execution(
     )
 end
 
+function _execution_failure_coordinator(
+    ::SerialOpticalPathBatchExecutor,
+    session::RunSessionID,
+    policy::RunShutdownPolicy)
+    return _prepare_run_failure_coordinator(
+        session, policy, _coordinator_only_failure_owner_ids())
+end
+
+function _execution_failure_coordinator(
+    executor::PreparedExecutionOwnerExecutor,
+    ::RunSessionID,
+    ::RunShutdownPolicy)
+    return executor.failures
+end
+
+function _execution_failure_coordinator(
+    ::AbstractOpticalPathBatchExecutor,
+    session::RunSessionID,
+    policy::RunShutdownPolicy)
+    return _prepare_run_failure_coordinator(
+        session, policy, _coordinator_only_failure_owner_ids())
+end
+
 # Julia emits no coverage counters for these exercised constant dispatch leaves.
 _execution_is_armed(::SerialOpticalPathBatchExecutor) = true # COV_EXCL_LINE
 _execution_is_quiescent(::SerialOpticalPathBatchExecutor) = true # COV_EXCL_LINE
+_execution_ownership_is_drained(
+    ::SerialOpticalPathBatchExecutor) = true
 _arm_optical_execution!(executor::SerialOpticalPathBatchExecutor) = executor
 _start_optical_execution!(executor::SerialOpticalPathBatchExecutor) = executor
 _stop_optical_execution!(executor::SerialOpticalPathBatchExecutor) = executor
+_begin_optical_execution_shutdown!(
+    executor::SerialOpticalPathBatchExecutor) = executor
+_progress_optical_execution_shutdown!(
+    ::SerialOpticalPathBatchExecutor) = true
+_finalize_optical_execution_shutdown!(
+    executor::SerialOpticalPathBatchExecutor) = executor
 _mark_optical_execution_failed!(
     executor::SerialOpticalPathBatchExecutor) = executor
+
+_begin_optical_execution_shutdown!(
+    executor::AbstractOpticalPathBatchExecutor) = executor
+_progress_optical_execution_shutdown!(
+    ::AbstractOpticalPathBatchExecutor) = true
+_finalize_optical_execution_shutdown!(
+    executor::AbstractOpticalPathBatchExecutor) =
+    _stop_optical_execution!(executor)
+_execution_ownership_is_drained(
+    executor::AbstractOpticalPathBatchExecutor) =
+    _execution_is_quiescent(executor)
 
 @inline _next_idle_poll(
     ::YieldingExecutionOwnerIdle,
@@ -1279,6 +1367,44 @@ function _execute_owner_target!(
     return nothing
 end
 
+@inline function _execution_owner_failure_kind(
+    owner::PreparedExecutionOwner)
+    return _is_cpu_execution_owner(owner.backend) ?
+        OwnerExceptionRunFailure : DeviceRunFailure
+end
+
+@inline function _execution_owner_failure_stage(
+    owner::PreparedExecutionOwner,
+    descriptor::_ExecutionOwnerWorkDescriptor)
+    descriptor.phase == _ExecutionOwnerMaterialization &&
+        return OwnerMaterialization
+    return owner.kind == DeviceBatchExecutionOwner ?
+        OwnerDeviceCompletion : OwnerExecution
+end
+
+@inline _execution_owner_failure_reason(error) =
+    nameof(typeof(error))
+@inline _execution_owner_failure_reason(error::ExecutionOwnerError) =
+    error.reason
+
+@inline function _publish_execution_owner_failure!(
+    executor::PreparedExecutionOwnerExecutor,
+    owner_ordinal::Int,
+    stage,
+    error,
+    work_sequence::UInt64)
+    owner = @inbounds executor.owners[owner_ordinal]
+    return _publish_run_failure!(
+        executor.failures,
+        owner_ordinal + 1,
+        _execution_owner_failure_kind(owner),
+        stage,
+        nothing,
+        :execution_owner,
+        _execution_owner_failure_reason(error);
+        work_sequence)
+end
+
 function _service_owner_work!(
     executor::PreparedExecutionOwnerExecutor,
     owner_ordinal::Int,
@@ -1310,20 +1436,111 @@ function _service_owner_work!(
         status = _ExecutionOwnerWorkCompleted
     else
         state.failure = failure
+        _publish_execution_owner_failure!(
+            executor,
+            owner_ordinal,
+            _execution_owner_failure_stage(owner, descriptor),
+            failure,
+            descriptor.batch_sequence)
+        state.work_failed += UInt64(1)
+        state.active_batch_sequence = UInt64(0)
         state.activity = _ExecutionOwnerFailedActivity
         status = _ExecutionOwnerWorkFailed
     end
-    _submit_completion!(
-        executor,
-        owner,
-        _ExecutionOwnerCompletion(
-            executor.session,
-            owner.id,
-            descriptor.batch_sequence,
-            descriptor.phase,
-            status,
-        ),
-    )
+    try
+        _submit_completion!(
+            executor,
+            owner,
+            _ExecutionOwnerCompletion(
+                executor.session,
+                owner.id,
+                descriptor.batch_sequence,
+                descriptor.phase,
+                status,
+            ),
+        )
+    catch error
+        state.failure = error
+        state.activity = _ExecutionOwnerFailedActivity
+        _publish_execution_owner_failure!(
+            executor,
+            owner_ordinal,
+            OwnerCompletionPublication,
+            error,
+            descriptor.batch_sequence)
+        rethrow()
+    end
+    return nothing
+end
+
+function _drain_cancelled_owner_work!(
+    executor::PreparedExecutionOwnerExecutor,
+    owner_ordinal::Int)
+    owner = @inbounds executor.owners[owner_ordinal]
+    state = @inbounds executor.owner_states[owner_ordinal]
+    workspace = @inbounds executor.owner_workspaces[owner_ordinal]
+    while true
+        status = try_take!(workspace.work, owner.due)
+        status == RingTransferSucceeded || begin
+            status in (RingEmpty, RingClosed) ||
+                _execution_owner_error(
+                    :due_work_consumption,
+                    "execution owner observed an invalid due-work ring result while stopping",
+                )
+            return nothing
+        end
+        state.work_cancelled += UInt64(1)
+    end
+end
+
+function _finish_execution_owner!(
+    executor::PreparedExecutionOwnerExecutor{
+        <:ThreadedExecutionOwners,
+    },
+    owner_ordinal::Int)
+    owner = @inbounds executor.owners[owner_ordinal]
+    state = @inbounds executor.owner_states[owner_ordinal]
+    failed = state.activity == _ExecutionOwnerFailedActivity
+    if !failed
+        state.activity = _ExecutionOwnerStoppedActivity
+        state.active_batch_sequence = UInt64(0)
+    end
+    try
+        _submit_completion!(
+            executor,
+            owner,
+            _ExecutionOwnerCompletion(
+                executor.session,
+                owner.id,
+                UInt64(0),
+                _ExecutionOwnerStop,
+                failed ? _ExecutionOwnerWorkFailed :
+                    _ExecutionOwnerWorkCompleted,
+            ),
+        )
+        close_ring!(owner.completion) == RingTransferSucceeded ||
+            _execution_owner_error(
+                :completion_closure,
+                "execution owner could not close its completion path",
+            )
+    catch error
+        state.failure = error
+        state.activity = _ExecutionOwnerFailedActivity
+        _publish_execution_owner_failure!(
+            executor,
+            owner_ordinal,
+            OwnerCompletionPublication,
+            error,
+            UInt64(0))
+        close_ring!(owner.completion)
+    end
+    if failed || state.activity == _ExecutionOwnerFailedActivity
+        _acknowledge_run_stop!(
+            executor.failures, owner_ordinal + 1, UInt64(1))
+    else
+        _acknowledge_run_stop!(
+            executor.failures, owner_ordinal + 1)
+    end
     return nothing
 end
 
@@ -1331,63 +1548,73 @@ function _execution_owner_loop!(
     executor::PreparedExecutionOwnerExecutor{
         <:ThreadedExecutionOwners,
     },
-    owner_ordinal::Int,
-)
+    owner_ordinal::Int)
     owner = @inbounds executor.owners[owner_ordinal]
     state = @inbounds executor.owner_states[owner_ordinal]
     workspace = @inbounds executor.owner_workspaces[owner_ordinal]
     state.task_id = objectid(current_task())
     state.last_thread_id = Threads.threadid()
-    _submit_completion!(
-        executor,
-        owner,
-        _ExecutionOwnerCompletion(
-            executor.session,
-            owner.id,
-            UInt64(0),
-            _ExecutionOwnerStartup,
-            _ExecutionOwnerWorkCompleted,
-        ),
-    )
-    poll_count = zero(UInt32)
-    while true
-        status = try_take!(workspace.work, owner.due)
-        if status == RingTransferSucceeded
-            poll_count = zero(UInt32)
-            _service_owner_work!(
-                executor, owner_ordinal, workspace.work[])
-            state.activity == _ExecutionOwnerFailedActivity && break
-            continue
-        end
-        status == RingClosed && break
-        status == RingEmpty || _execution_owner_error(
-            :due_work_consumption,
-            "execution owner observed an invalid due-work ring result",
-        )
-        poll_count = _wait_idle(executor.mode, poll_count)
-    end
-    if state.activity != _ExecutionOwnerFailedActivity
-        state.activity = _ExecutionOwnerStoppedActivity
-        state.active_batch_sequence = UInt64(0)
-    end
-    _submit_completion!(
-        executor,
-        owner,
-        _ExecutionOwnerCompletion(
-            executor.session,
-            owner.id,
-            UInt64(0),
-            _ExecutionOwnerStop,
-            state.activity == _ExecutionOwnerFailedActivity ?
-                _ExecutionOwnerWorkFailed :
+    stage = OwnerCompletionPublication
+    batch_sequence = UInt64(0)
+    try
+        _submit_completion!(
+            executor,
+            owner,
+            _ExecutionOwnerCompletion(
+                executor.session,
+                owner.id,
+                UInt64(0),
+                _ExecutionOwnerStartup,
                 _ExecutionOwnerWorkCompleted,
-        ),
-    )
-    close_ring!(owner.completion) == RingTransferSucceeded ||
-        _execution_owner_error(
-            :completion_closure,
-            "execution owner could not close its completion path",
+            ),
         )
+        poll_count = zero(UInt32)
+        stage = OwnerBeforeDequeue
+        while true
+            if _run_shutdown_requested(executor.failures)
+                _drain_cancelled_owner_work!(
+                    executor, owner_ordinal)
+                break
+            end
+            status = try_take!(workspace.work, owner.due)
+            if status == RingTransferSucceeded
+                poll_count = zero(UInt32)
+                descriptor = workspace.work[]
+                batch_sequence = descriptor.batch_sequence
+                stage = OwnerAfterDequeue
+                if _run_shutdown_requested(executor.failures)
+                    state.work_cancelled += UInt64(1)
+                    _drain_cancelled_owner_work!(
+                        executor, owner_ordinal)
+                    break
+                end
+                _service_owner_work!(
+                    executor, owner_ordinal, descriptor)
+                state.activity == _ExecutionOwnerFailedActivity &&
+                    break
+                stage = OwnerBeforeDequeue
+                batch_sequence = UInt64(0)
+                continue
+            end
+            status == RingClosed && break
+            status == RingEmpty || _execution_owner_error(
+                :due_work_consumption,
+                "execution owner observed an invalid due-work ring result",
+            )
+            poll_count = _wait_idle(executor.mode, poll_count)
+        end
+    catch error
+        state.failure = error
+        state.active_batch_sequence = UInt64(0)
+        state.activity = _ExecutionOwnerFailedActivity
+        _publish_execution_owner_failure!(
+            executor,
+            owner_ordinal,
+            stage,
+            error,
+            batch_sequence)
+    end
+    _finish_execution_owner!(executor, owner_ordinal)
     return nothing
 end
 
@@ -1537,20 +1764,33 @@ function _mark_optical_execution_failed!(
     return executor
 end
 
-function _deterministic_stop!(
+function _close_execution_owner_inputs!(
+    executor::PreparedExecutionOwnerExecutor)
+    @inbounds for owner in executor.owners
+        status = close_ring!(owner.due)
+        status in (RingTransferSucceeded, RingClosed) ||
+            _execution_owner_error(
+                :due_work_closure,
+                "execution owner could not close its due-work path",
+            )
+    end
+    return executor
+end
+
+function _begin_deterministic_execution_shutdown!(
     executor::PreparedExecutionOwnerExecutor{
         <:DeterministicExecutionOwners,
     },
 )
     @inbounds for owner_ordinal in eachindex(executor.owners)
         owner = executor.owners[owner_ordinal]
-        close_ring!(owner.due) == RingTransferSucceeded ||
-            _execution_owner_error(
-                :due_work_closure,
-                "deterministic owner due-work path was already closed",
-            )
         state = executor.owner_states[owner_ordinal]
-        state.activity = _ExecutionOwnerStoppedActivity
+        _drain_cancelled_owner_work!(executor, owner_ordinal)
+        failed = state.activity == _ExecutionOwnerFailedActivity
+        if !failed
+            state.activity = _ExecutionOwnerStoppedActivity
+            state.active_batch_sequence = UInt64(0)
+        end
         _submit_completion!(
             executor,
             owner,
@@ -1559,83 +1799,144 @@ function _deterministic_stop!(
                 owner.id,
                 UInt64(0),
                 _ExecutionOwnerStop,
-                _ExecutionOwnerWorkCompleted,
+                failed ? _ExecutionOwnerWorkFailed :
+                    _ExecutionOwnerWorkCompleted,
             ),
         )
-    end
-    _collect_lifecycle_acknowledgements!(
-        executor,
-        _ExecutionOwnerStop,
-        executor.coordinator.stop_acknowledged,
-    )
-    @inbounds for owner in executor.owners
         close_ring!(owner.completion) == RingTransferSucceeded ||
             _execution_owner_error(
                 :completion_closure,
-                "deterministic owner completion path was already closed",
+                "deterministic owner could not close its completion path",
             )
+        _acknowledge_run_stop!(
+            executor.failures, owner_ordinal + 1)
     end
     return executor
 end
 
-function _threaded_stop!(
-    executor::PreparedExecutionOwnerExecutor{
-        <:ThreadedExecutionOwners,
-    },
-)
-    @inbounds for owner in executor.owners
-        close_ring!(owner.due) == RingTransferSucceeded ||
-            _execution_owner_error(
-                :due_work_closure,
-                "threaded owner due-work path was already closed",
-            )
-    end
-    _collect_lifecycle_acknowledgements!(
-        executor,
-        _ExecutionOwnerStop,
-        executor.coordinator.stop_acknowledged,
-    )
-    @inbounds for task in executor.tasks
-        wait(task)
-    end
-    return executor
-end
-
-_stop_owner_mode!(
+_begin_execution_owner_mode_shutdown!(
     executor::PreparedExecutionOwnerExecutor{
         <:DeterministicExecutionOwners,
     },
-) = _deterministic_stop!(executor)
+) = _begin_deterministic_execution_shutdown!(executor)
 
-_stop_owner_mode!(
+_begin_execution_owner_mode_shutdown!(
     executor::PreparedExecutionOwnerExecutor{
         <:ThreadedExecutionOwners,
     },
-) = _threaded_stop!(executor)
+) = executor
 
-function _stop_optical_execution!(
+function _begin_optical_execution_shutdown!(
     executor::PreparedExecutionOwnerExecutor,
 )
     executor.coordinator.phase in (
+        ExecutionOwnersPrepared,
         ExecutionOwnersArmed,
         ExecutionOwnersRunning,
+        ExecutionOwnersFailed,
     ) || _execution_owner_error(
         :invalid_phase,
-        "execution owners can stop only from armed or running",
+        "execution owners can begin shutdown only from prepared, armed, running, or failed",
     )
-    execution_owners_are_quiescent(executor) ||
-        _execution_owner_error(
-            :owners_not_quiescent,
-            "clean execution-owner stop requires empty due and completion paths",
-        )
-    _stop_owner_mode!(executor)
-    executor.coordinator.phase = ExecutionOwnersStopped
-    execution_owners_are_quiescent(executor) ||
-        _execution_owner_error(
-            :stop_accounting,
-            "execution owners did not reach quiescent stopped accounting",
-        )
+    _close_execution_owner_inputs!(executor)
+    _begin_execution_owner_mode_shutdown!(executor)
     return executor
+end
+
+function _drain_execution_owner_completions!(
+    executor::PreparedExecutionOwnerExecutor,
+    owner_ordinal::Int)
+    owner = @inbounds executor.owners[owner_ordinal]
+    scratch = @inbounds executor.coordinator_workspace.completions[
+        owner_ordinal]
+    while true
+        status = try_take!(scratch, owner.completion)
+        status == RingTransferSucceeded || begin
+            status in (RingEmpty, RingClosed) ||
+                _execution_owner_error(
+                    :completion_consumption,
+                    "shutdown observed an invalid owner-completion result",
+                )
+            return nothing
+        end
+        completion = scratch[]
+        completion.session == executor.session ||
+            _execution_owner_error(
+                :stale_completion_session,
+                "shutdown observed an owner completion from another run/session",
+            )
+        completion.owner == owner.id ||
+            _execution_owner_error(
+                :wrong_completion_owner,
+                "shutdown observed a completion from another owner",
+            )
+        if completion.phase == _ExecutionOwnerStop
+            executor.coordinator.stop_acknowledged[owner_ordinal] = true
+        else
+            executor.coordinator.completions[owner_ordinal] += UInt64(1)
+        end
+    end
+end
+
+@inline _execution_owner_task_done(
+    ::PreparedExecutionOwnerExecutor{
+        <:DeterministicExecutionOwners,
+    },
+    ::Int) = true
+
+@inline function _execution_owner_task_done(
+    executor::PreparedExecutionOwnerExecutor{
+        <:ThreadedExecutionOwners,
+    },
+    owner_ordinal::Int)
+    isassigned(executor.tasks, owner_ordinal) || return false
+    return istaskdone(@inbounds executor.tasks[owner_ordinal])
+end
+
+function _progress_optical_execution_shutdown!(
+    executor::PreparedExecutionOwnerExecutor)
+    complete = true
+    @inbounds for owner_ordinal in eachindex(executor.owners)
+        _drain_execution_owner_completions!(
+            executor, owner_ordinal)
+        owner = executor.owners[owner_ordinal]
+        due = ring_accounting(owner.due)
+        completion = ring_accounting(owner.completion)
+        complete &= iszero(due.occupancy)
+        complete &= iszero(completion.occupancy)
+        complete &= _run_owner_stop_acknowledged(
+            executor.failures, owner_ordinal + 1)
+        complete &= _execution_owner_task_done(
+            executor, owner_ordinal)
+    end
+    return complete
+end
+
+function _finalize_optical_execution_shutdown!(
+    executor::PreparedExecutionOwnerExecutor)
+    _progress_optical_execution_shutdown!(executor) ||
+        _execution_owner_error(
+            :shutdown_not_drained,
+            "execution-owner shutdown cannot finalize before every acknowledgement and handoff drains",
+        )
+    failed = false
+    @inbounds for state in executor.owner_states
+        failed |= state.activity == _ExecutionOwnerFailedActivity
+    end
+    executor.coordinator.phase = failed ||
+        executor.coordinator.phase == ExecutionOwnersFailed ?
+        ExecutionOwnersFailed : ExecutionOwnersStopped
+    return executor
+end
+
+function _stop_optical_execution!(
+    executor::PreparedExecutionOwnerExecutor)
+    _begin_run_shutdown!(executor.failures, Int64(0))
+    _begin_optical_execution_shutdown!(executor)
+    while !_progress_optical_execution_shutdown!(executor)
+        yield()
+    end
+    return _finalize_optical_execution_shutdown!(executor)
 end
 
 function _execution_is_quiescent(
@@ -1652,7 +1953,10 @@ struct ExecutionOwnerAccounting
     completion::RingAccounting
     work_submitted::UInt64
     work_taken::UInt64
+    active_batch_sequence::UInt64
     work_completed::UInt64
+    work_failed::UInt64
+    work_cancelled::UInt64
     completions_taken::UInt64
     startup_acknowledged::Bool
     stop_acknowledged::Bool
@@ -1691,7 +1995,10 @@ function execution_owner_accounting(
         completion,
         @inbounds(coordinator.submitted[index]),
         state.work_taken,
+        state.active_batch_sequence,
         state.work_completed,
+        state.work_failed,
+        state.work_cancelled,
         @inbounds(coordinator.completions[index]),
         @inbounds(coordinator.startup_acknowledged[index]),
         @inbounds(coordinator.stop_acknowledged[index]),
@@ -1743,6 +2050,26 @@ function _execution_accounting_is_quiescent(
     return true
 end
 
+_execution_accounting_is_drained(::Nothing) = true
+
+function _execution_accounting_is_drained(
+    values::Memory{ExecutionOwnerAccounting})
+    @inbounds for value in values
+        iszero(value.due.occupancy) || return false
+        iszero(value.completion.occupancy) || return false
+        value.work_taken ==
+            value.work_completed + value.work_failed ||
+            return false
+        value.work_submitted ==
+            value.work_taken + value.work_cancelled ||
+            return false
+        value.completions_taken ==
+            value.work_completed + value.work_failed ||
+            return false
+    end
+    return true
+end
+
 function execution_owners_are_quiescent(
     executor::PreparedExecutionOwnerExecutor,
 )
@@ -1762,6 +2089,77 @@ function execution_owners_are_quiescent(
         executor.coordinator.submitted[index] ==
             executor.coordinator.completions[index] || return false
     end
+    return true
+end
+
+function _execution_ownership_is_drained(
+    executor::PreparedExecutionOwnerExecutor)
+    @inbounds for index in eachindex(executor.owners)
+        owner = executor.owners[index]
+        due = ring_accounting(owner.due)
+        completion = ring_accounting(owner.completion)
+        iszero(due.occupancy) || return false
+        iszero(completion.occupancy) || return false
+        state = executor.owner_states[index]
+        iszero(state.active_batch_sequence) || return false
+        state.work_taken ==
+            state.work_completed + state.work_failed ||
+            return false
+        executor.coordinator.submitted[index] ==
+            state.work_taken + state.work_cancelled ||
+            return false
+        executor.coordinator.completions[index] ==
+            state.work_completed + state.work_failed ||
+            return false
+    end
+    return true
+end
+
+function _execution_completions_are_observed(
+    executor::PreparedExecutionOwnerExecutor)
+    @inbounds for index in eachindex(executor.owners)
+        executor.coordinator.submitted[index] ==
+            executor.coordinator.completions[index] ||
+            return false
+    end
+    return true
+end
+
+function _execution_owner_stops_are_acknowledged(
+    executor::PreparedExecutionOwnerExecutor)
+    @inbounds for owner_ordinal in eachindex(executor.owners)
+        _run_owner_stop_acknowledged(
+            executor.failures, owner_ordinal + 1) ||
+            return false
+    end
+    return true
+end
+
+@inline _execution_batch_active(
+    ::AbstractOpticalPathBatchExecutor) = false
+@inline _execution_batch_active(
+    executor::PreparedExecutionOwnerExecutor) =
+    executor.coordinator.active_claim !== nothing
+
+@inline _abandon_failed_optical_path_batch!(
+    ::AbstractOpticalPathBatchExecutor) = true
+
+function _abandon_failed_optical_path_batch!(
+    executor::PreparedExecutionOwnerExecutor)
+    claim = executor.coordinator.active_claim
+    claim === nothing && return true
+    (
+        _execution_completions_are_observed(executor) ||
+        _execution_owner_stops_are_acknowledged(executor)
+    ) || return false
+    _execution_ownership_is_drained(executor) || return false
+    abandon_optical_path_batch!(
+        executor.prepared,
+        executor.state,
+        executor.workspace,
+        claim,
+    )
+    executor.coordinator.active_claim = nothing
     return true
 end
 
@@ -2141,42 +2539,49 @@ function _execute_owned_optical_path_batch!(
     _require_executor_binding(executor, prepared, state, workspace)
     claim = begin_optical_path_batch!(
         prepared, state, workspace, timestamp)
-    owner_count = _collect_due_execution_owners!(executor, claim)
-    batch_sequence = _next_batch_sequence!(executor)
-    _submit_owner_phase!(
-        executor,
-        claim,
-        batch_sequence,
-        owner_count,
-        _ExecutionOwnerMaterialization,
-    )
-    _collect_owner_phase!(
-        executor,
-        batch_sequence,
-        owner_count,
-        _ExecutionOwnerMaterialization,
-        timing,
-        timestamp,
-    )
-    seal_optical_path_batch_materialization!(
-        prepared, state, workspace, claim)
-    _submit_owner_phase!(
-        executor,
-        claim,
-        batch_sequence,
-        owner_count,
-        _ExecutionOwnerExecution,
-    )
-    _collect_owner_phase!(
-        executor,
-        batch_sequence,
-        owner_count,
-        _ExecutionOwnerExecution,
-        timing,
-        timestamp,
-    )
+    executor.coordinator.active_claim = claim
+    try
+        owner_count = _collect_due_execution_owners!(executor, claim)
+        batch_sequence = _next_batch_sequence!(executor)
+        _submit_owner_phase!(
+            executor,
+            claim,
+            batch_sequence,
+            owner_count,
+            _ExecutionOwnerMaterialization,
+        )
+        _collect_owner_phase!(
+            executor,
+            batch_sequence,
+            owner_count,
+            _ExecutionOwnerMaterialization,
+            timing,
+            timestamp,
+        )
+        seal_optical_path_batch_materialization!(
+            prepared, state, workspace, claim)
+        _submit_owner_phase!(
+            executor,
+            claim,
+            batch_sequence,
+            owner_count,
+            _ExecutionOwnerExecution,
+        )
+        _collect_owner_phase!(
+            executor,
+            batch_sequence,
+            owner_count,
+            _ExecutionOwnerExecution,
+            timing,
+            timestamp,
+        )
+    catch
+        _abandon_failed_optical_path_batch!(executor)
+        rethrow()
+    end
     completed = complete_optical_path_batch!(
         prepared, state, workspace, claim)
+    executor.coordinator.active_claim = nothing
     executor.coordinator.batch_count += UInt64(1)
     return completed
 end

@@ -1081,6 +1081,7 @@ end
         return :command_timestamp_mismatch
     reason == CoreAdmissionUnavailable &&
         return :core_admission_unavailable
+    reason == RunNotAccepting && return :run_not_accepting
     return :boundary_rejected # COV_EXCL_LINE
 end
 
@@ -1416,4 +1417,41 @@ function fail_pending_bridge_commands!(
     publish_command_dispositions!(
         bridge, state, workspace, publication_execution_ns)
     return count
+end
+
+"""
+Boundedly drain every transferred but not semantically admitted command after
+run shutdown has closed ingress. Each descriptor receives one correlated
+boundary outcome using the credit reserved by its successful submission.
+"""
+function reject_pending_bridge_commands!(
+    bridge::PreparedCommandBridge,
+    state::CommandBridgeState,
+    workspace::CommandBridgeWorkspace,
+    publication_execution_ns::Int64)
+    ring_is_closed(bridge.submission.ring) || throw(PortError(
+        :command_bridge,
+        :ingress_still_accepting,
+        "command ingress must close before shutdown rejects pending submissions"))
+    count = 0
+    while true
+        result = try_take!(
+            workspace.descriptor_scratch, bridge.submission)
+        result.status == PortTransferSucceeded || begin
+            result.status in (PortEmpty, PortClosed) ||
+                throw(PortError(
+                    :command_bridge,
+                    :shutdown_submission_drain,
+                    "shutdown observed an invalid command-ingress result"))
+            return count
+        end
+        descriptor = workspace.descriptor_scratch[]
+        outcome = _boundary_command_outcome(
+            descriptor,
+            bridge.submission.endpoint,
+            RunNotAccepting,
+            publication_execution_ns)
+        _publish_command_outcome!(bridge.completion, outcome)
+        count += 1
+    end
 end

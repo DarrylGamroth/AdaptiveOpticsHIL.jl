@@ -862,6 +862,22 @@ struct BoundaryRunResult{
     wall_end_ns::UInt64
 end
 
+function _finish_boundary_stop!(
+    driver::BoundaryDriver,
+    request::RunStopRequest)
+    begin_serial_stop!(driver.fixture.running, request) ==
+        SerialShutdownDraining || error(
+        "boundary run did not enter the shutdown drain")
+    for _ in 1:10_000
+        reclaim_serial_returns!(driver.fixture.run)
+        progress_serial_shutdown!(driver.fixture.running) ==
+            SerialShutdownFinalized &&
+            return serial_run_accounting(driver.fixture.run)
+        yield()
+    end
+    error("boundary run did not finish shutdown within the iteration bound")
+end
+
 function execute_boundary_run!(driver::BoundaryDriver)
     wall_start = time_ns()
     while true
@@ -906,9 +922,7 @@ function execute_boundary_run!(driver::BoundaryDriver)
         execution_clock_identity(driver.fixture.armed.timing),
         Clocks.time_nanos(driver.fixture.clock);
         reason=:benchmark_complete)
-    accounting = stop_serial_run!(
-        driver.fixture.running,
-        request)
+    accounting = _finish_boundary_stop!(driver, request)
     return BoundaryRunResult(
         driver.histograms,
         driver.counters,
@@ -1005,9 +1019,7 @@ function _stop_instrumentation_driver!(driver::BoundaryDriver)
         execution_clock_identity(driver.fixture.armed.timing),
         Clocks.time_nanos(driver.fixture.clock);
         reason=:instrumentation_complete)
-    stop_serial_run!(
-        driver.fixture.running,
-        request)
+    _finish_boundary_stop!(driver, request)
     return nothing
 end
 

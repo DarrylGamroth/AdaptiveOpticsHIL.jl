@@ -38,6 +38,9 @@ const SERIAL_TESTS_WITH_COVERAGE =
 const SERIAL_IDENTITY_2X2 = [1.0 0.0; 0.0 1.0]
 const SERIAL_DUE_STEP_ALLOCATION_BUDGET = 2_048
 const SERIAL_COMMAND_STEP_ALLOCATION_BUDGET = 2_048
+const SERIAL_TEST_SHUTDOWN_POLICY = RunShutdownPolicy(
+    acknowledgement_timeout_ns=1_000_000_000,
+    drain_timeout_ns=2_000_000_000)
 
 struct SerialTestLifecycleFailureConfiguration <:
     AbstractOpticalExecutionConfiguration
@@ -58,6 +61,7 @@ function AdaptiveOpticsHIL.Execution._prepare_optical_execution(
     ::AdaptiveOpticsSim.Plant.PlantEventLoopState,
     ::AdaptiveOpticsSim.Plant.PlantEventLoopWorkspace,
     ::RunSessionID,
+    ::RunShutdownPolicy,
 )
     return SerialTestLifecycleFailureExecutor(
         configuration, false, false)
@@ -448,6 +452,7 @@ function serial_test_fixture(;
         maximum_lateness_ns=nothing,
         recovery_occupancy=0),
     ingress_liveness=nothing,
+    shutdown_policy=SERIAL_TEST_SHUTDOWN_POLICY,
     reverse_acquisition_ports=false,
     arm=true,
     start=true)
@@ -491,7 +496,8 @@ function serial_test_fixture(;
         acquisition_ports;
         optical_execution,
         ingress_liveness,
-        arm_timeout_ns)
+        arm_timeout_ns,
+        shutdown_policy)
     run = prepare_serial_run(configuration)
     clock = CachedNanoClock(0)
     attempt = arm ? begin_serial_arm!(run, clock) : nothing
@@ -513,7 +519,8 @@ function take_all_command_outcomes!(fixture, trace)
     output = Ref{CommandOutcome{LeasedCommandPayload}}()
     while true
         result = try_take!(output, port)
-        port_status(result) == PortEmpty && return nothing
+        port_status(result) in (PortEmpty, PortClosed) &&
+            return nothing
         @assert port_status(result) == PortTransferSucceeded
         outcome = output[]
         push!(trace.outcome_stream_sequences,
@@ -582,7 +589,8 @@ function take_all_wfs_products!(
     output = Ref{AcquisitionCompletion}()
     while true
         result = try_take!(output, fixture.wfs_port)
-        port_status(result) == PortEmpty && return nothing
+        port_status(result) in (PortEmpty, PortClosed) &&
+            return nothing
         @assert port_status(result) == PortTransferSucceeded
         completion = output[]
         product = completed_product(fixture.wfs_port, completion)
@@ -618,7 +626,8 @@ function take_all_feedback_products!(fixture, trace)
     output = Ref{AcquisitionCompletion}()
     while true
         result = try_take!(output, fixture.feedback_port)
-        port_status(result) == PortEmpty && return nothing
+        port_status(result) in (PortEmpty, PortClosed) &&
+            return nothing
         @assert port_status(result) == PortTransferSucceeded
         completion = output[]
         product = completed_product(fixture.feedback_port, completion)
@@ -632,6 +641,58 @@ function take_all_feedback_products!(fixture, trace)
             fixture.feedback_port, completion).status ==
             PortTransferSucceeded
     end
+end
+
+function release_all_serial_command_outcomes!(fixture)
+    port = command_completion_port(fixture.command_ports)
+    output = Ref{CommandOutcome{LeasedCommandPayload}}()
+    count = 0
+    while true
+        result = try_take!(output, port)
+        port_status(result) in (PortEmpty, PortClosed) &&
+            return count
+        @assert port_status(result) == PortTransferSucceeded
+        @assert release_outcome!(port, output[]).status ==
+            PortTransferSucceeded
+        count += 1
+    end
+end
+
+function release_all_serial_products!(port)
+    output = Ref{AcquisitionCompletion}()
+    count = 0
+    while true
+        result = try_take!(output, port)
+        port_status(result) in (PortEmpty, PortClosed) &&
+            return count
+        @assert port_status(result) == PortTransferSucceeded
+        @assert release_product!(port, output[]).status ==
+            PortTransferSucceeded
+        count += 1
+    end
+end
+
+function finish_serial_shutdown!(fixture, handle=fixture.running)
+    for _ in 1:10_000
+        release_all_serial_command_outcomes!(fixture)
+        release_all_serial_products!(fixture.wfs_port)
+        release_all_serial_products!(fixture.feedback_port)
+        reclaim_serial_returns!(fixture.run)
+        status = progress_serial_shutdown!(handle)
+        status == SerialShutdownFinalized &&
+            return serial_run_accounting(fixture.run)
+        yield()
+    end
+    error("serial shutdown did not finish within the test iteration bound")
+end
+
+function finish_serial_stop!(
+    fixture,
+    event,
+    handle=fixture.running)
+    @assert begin_serial_stop!(handle, event) ==
+        SerialShutdownDraining
+    return finish_serial_shutdown!(fixture, handle)
 end
 
 function fake_rtc_trace()
@@ -718,8 +779,8 @@ function run_fake_rtc(;
         run_session(fixture.run),
         execution_clock_identity(fixture.armed.timing),
         Clocks.time_nanos(fixture.clock))
-    accounting = stop_serial_run!(
-        fixture.running, stop_request)
+    accounting = finish_serial_stop!(
+        fixture, stop_request)
     return (; fixture, trace, accounting)
 end
 
@@ -796,6 +857,9 @@ end
         _handle_serial_capacity_overload!(policy, publication)
 end
 
+@inline serial_shutdown_progress_allocations!(handle) =
+    @allocated progress_serial_shutdown!(handle)
+
 function take_serial_acquisition_sequences!(port, sequences)
     output = Ref{AcquisitionCompletion}()
     while true
@@ -828,6 +892,7 @@ function drive_until_serial_failure!(fixture; maximum_steps=128)
         result = try
             step_serial_run!(fixture.running)
         catch error
+            finish_serial_shutdown!(fixture)
             return error
         end
         serial_step_status(result) == SerialDeadlinePending &&
@@ -1140,12 +1205,6 @@ end
         @test expiry isa SerialRunError
         @test expiry.component == :rtc_ingress_liveness
         @test expiry.reason == :deadline_expired
-        @test run_phase(fixture.run) == RunFailed
-        termination = run_termination(fixture.run)
-        @test run_termination_component(termination) ==
-            :rtc_ingress_liveness
-        @test run_termination_reason(termination) ==
-            :deadline_expired
         expired_liveness =
             serial_rtc_ingress_liveness_accounting(fixture.run)
         @test expired_liveness.status ==
@@ -1171,6 +1230,13 @@ end
         @test port_status(release_outcome!(
             command_completion_port(fixture.command_ports),
             outcome_ref[])) == PortTransferSucceeded
+        finish_serial_shutdown!(fixture)
+        @test run_phase(fixture.run) == RunFailed
+        termination = run_termination(fixture.run)
+        @test run_termination_component(termination) ==
+            :rtc_ingress_liveness
+        @test run_termination_reason(termination) ==
+            :deadline_expired
     end
 
     @testset "Prepared acquisition overload decisions" begin
@@ -1292,6 +1358,7 @@ end
         @test deadline_error isa SerialRunError
         @test deadline_error.reason ==
             :acquisition_publication_deadline
+        finish_serial_shutdown!(deadline)
         @test run_phase(deadline.run) == RunFailed
         deadline_accounting =
             serial_acquisition_overload_accounting(
@@ -1392,7 +1459,7 @@ end
             execution_clock_identity(fixture.armed.timing),
             Clocks.time_nanos(fixture.clock))
         stopped_run_accounting =
-            stop_serial_run!(fixture.running, request)
+            finish_serial_stop!(fixture, request)
         @test execution_owners_phase(executor) ==
             ExecutionOwnersStopped
         stopped = execution_owner_accounting(executor, 1)
@@ -1427,6 +1494,7 @@ end
         @test owner_deadline_error isa ExecutionOwnerError
         @test owner_deadline_error.reason ==
             :owner_deadline_exceeded
+        finish_serial_shutdown!(owner_deadline)
         @test run_phase(owner_deadline.run) == RunFailed
         @test execution_owners_phase(
             serial_optical_execution(owner_deadline.run)) ==
@@ -1439,6 +1507,8 @@ end
         @test owner_deadline_accounting.maximum_lateness_ns == 1
         @test owner_deadline_accounting.overload_decision ==
             ExecutionOwnerFailedForDeadline
+        @test !serial_run_accounting(
+            owner_deadline.run).execution_batch_active
 
         invalid_execution = captured_serial_error() do
             serial_test_fixture(
@@ -1499,6 +1569,9 @@ end
             start_serial_run!(start_failure_fixture.armed)
         end
         @test observed_start_failure === start_failure
+        finish_serial_shutdown!(
+            start_failure_fixture,
+            start_failure_fixture.armed)
         @test run_phase(start_failure_fixture.run) == RunFailed
         @test run_termination_component(
             run_termination(
@@ -1545,8 +1618,8 @@ end
             run_session(threaded_fixture.run),
             execution_clock_identity(threaded_fixture.armed.timing),
             Clocks.time_nanos(threaded_fixture.clock))
-        threaded_stopped_accounting = stop_serial_run!(
-            threaded_fixture.running, threaded_request)
+        threaded_stopped_accounting = finish_serial_stop!(
+            threaded_fixture, threaded_request)
         @test execution_owners_phase(threaded_executor) ==
             ExecutionOwnersStopped
         @test execution_owner_accounting(
@@ -1573,7 +1646,8 @@ end
             configure_serial_run(
                 fixture.bridge,
                 ();
-                arm_timeout_ns=10)
+                arm_timeout_ns=10,
+                shutdown_policy=SERIAL_TEST_SHUTDOWN_POLICY)
         end
         @test empty_error isa SerialRunError
         @test empty_error.reason == :empty_acquisition_ports
@@ -1582,7 +1656,8 @@ end
             configure_serial_run(
                 direct_bridge,
                 (fixture.wfs_port,);
-                arm_timeout_ns=10)
+                arm_timeout_ns=10,
+                shutdown_policy=SERIAL_TEST_SHUTDOWN_POLICY)
         end
         @test target_error isa SerialRunError
         @test target_error.reason ==
@@ -1592,7 +1667,8 @@ end
             configure_serial_run(
                 fixture.bridge,
                 (fixture.wfs_port, fixture.wfs_port);
-                arm_timeout_ns=10)
+                arm_timeout_ns=10,
+                shutdown_policy=SERIAL_TEST_SHUTDOWN_POLICY)
         end
         @test duplicate_error isa SerialRunError
         @test duplicate_error.reason == :duplicate_acquisition
@@ -1617,7 +1693,8 @@ end
             configure_serial_run(
                 fixture.bridge,
                 (fixture.wfs_port, other_acquisition_port);
-                arm_timeout_ns=10)
+                arm_timeout_ns=10,
+                shutdown_policy=SERIAL_TEST_SHUTDOWN_POLICY)
         end
         @test session_error isa SerialRunError
         @test session_error.reason == :session_mismatch
@@ -1634,7 +1711,8 @@ end
             configure_serial_run(
                 other_command_bridge,
                 (fixture.wfs_port,);
-                arm_timeout_ns=10)
+                arm_timeout_ns=10,
+                shutdown_policy=SERIAL_TEST_SHUTDOWN_POLICY)
         end
         @test command_session_error isa SerialRunError
         @test command_session_error.reason == :session_mismatch
@@ -1643,7 +1721,8 @@ end
             configure_serial_run(
                 fixture.bridge,
                 (fixture.wfs_port, :not_a_port);
-                arm_timeout_ns=10)
+                arm_timeout_ns=10,
+                shutdown_policy=SERIAL_TEST_SHUTDOWN_POLICY)
         end
         @test invalid_port isa SerialRunError
         @test invalid_port.reason == :invalid_acquisition_port
@@ -1680,6 +1759,9 @@ end
         @test liveness_clock_error isa RunLifecycleError
         @test liveness_clock_error.reason ==
             :clock_identity_mismatch
+        finish_serial_shutdown!(
+            wrong_liveness_clock,
+            wrong_liveness_clock.armed)
         @test run_phase(wrong_liveness_clock.run) == RunFailed
 
         start_error = captured_serial_error() do
@@ -1696,7 +1778,7 @@ end
         @test arm_error.reason == :invalid_phase
 
         stale_stop = captured_serial_error() do
-            stop_serial_run!(
+            begin_serial_stop!(
                 fixture.running,
                 RunStopRequest(
                     RunSessionID(0x7c01),
@@ -1755,6 +1837,7 @@ end
             accounting.command_dispositions,
             accounting.active_command_correlations,
             accounting.acquisitions,
+            accounting.execution_batch_active,
             accounting.execution_owners)
         @test serial_run_is_quiescent(inline_accounting)
     end
@@ -1769,14 +1852,8 @@ end
             run_session(busy.run),
             execution_clock_identity(busy.armed.timing),
             Clocks.time_nanos(busy.clock))
-        busy_error = captured_serial_error() do
-            stop_serial_run!(
-                busy.running, busy_request)
-        end
-        @test busy_error isa SerialRunError
-        @test busy_error.reason == :ownership_not_quiescent
         stale_busy_error = captured_serial_error() do
-            stop_serial_run!(
+            begin_serial_stop!(
                 busy.running,
                 RunStopRequest(
                     RunSessionID(0x7c01),
@@ -1786,17 +1863,17 @@ end
         @test stale_busy_error isa RunLifecycleError
         @test stale_busy_error.reason == :stale_session
         @test run_phase(busy.run) == RunRunning
-        completion_ref = Ref{AcquisitionCompletion}()
-        @test port_status(try_take!(
-            completion_ref, busy.wfs_port)) ==
-            PortTransferSucceeded
-        @test port_status(release_product!(
-            busy.wfs_port, completion_ref[])) ==
-            PortTransferSucceeded
-        @test reclaim_serial_returns!(busy.run) == 1
-        @test serial_run_is_quiescent(
-            stop_serial_run!(
-                busy.running, busy_request))
+        @test begin_serial_stop!(
+            busy.running, busy_request) == SerialShutdownDraining
+        @test serial_shutdown_status(busy.run) ==
+            SerialShutdownDraining
+        closed_claim = Ref(PayloadLeaseRef(0, 0, 0, 0))
+        @test try_claim_command_payload!(
+            closed_claim,
+            command_submission_port(busy.command_ports)) ==
+            PayloadPoolClosed
+        stopped_accounting = finish_serial_shutdown!(busy)
+        @test serial_run_is_quiescent(stopped_accounting)
         @test run_phase(busy.run) == RunStopped
         @test run_termination_kind(run_termination(busy.run)) ==
             RequestedRunStop
@@ -1809,18 +1886,15 @@ end
             :acquisition_product_capacity
         @test run_phase(exhausted.run) == RunFailed
         @test run_termination_kind(run_termination(exhausted.run)) ==
-            RuntimeRunFailure
+            ResourcePolicyRunFailure
         exhausted_termination = run_termination(exhausted.run)
-        failed_stop = captured_serial_error() do
-            stop_serial_run!(
-                exhausted.running,
-                RunStopRequest(
-                    run_session(exhausted.run),
-                    execution_clock_identity(exhausted.armed.timing),
-                    Clocks.time_nanos(exhausted.clock)))
-        end
-        @test failed_stop isa RunLifecycleError
-        @test failed_stop.reason == :invalid_phase
+        @test begin_serial_stop!(
+            exhausted.running,
+            RunStopRequest(
+                run_session(exhausted.run),
+                execution_clock_identity(exhausted.armed.timing),
+                Clocks.time_nanos(exhausted.clock))) ==
+            SerialShutdownFinalized
         @test run_termination(exhausted.run) ===
             exhausted_termination
 
@@ -1842,13 +1916,15 @@ end
 
         generic_failure = serial_test_fixture()
         generic_error = ArgumentError("test generic runtime failure")
-        invalid_reading_termination = Base.invokelatest(
+        failure_record = Base.invokelatest(
             AdaptiveOpticsHIL.Serial._record_serial_failure!,
             generic_failure.running,
             generic_error)
+        @test failure_record isa RunFailureRecord
+        finish_serial_shutdown!(generic_failure)
         @test run_phase(generic_failure.run) == RunFailed
-        @test run_termination(generic_failure.run) ===
-            invalid_reading_termination
+        invalid_reading_termination =
+            run_termination(generic_failure.run)
         @test run_termination_component(
             invalid_reading_termination) == :serial_run
         @test run_termination_reason(
@@ -1861,7 +1937,8 @@ end
             Clocks.time_nanos(armed.clock);
             reason=:stop_before_run)
         @test serial_run_is_quiescent(
-            stop_serial_run!(armed.armed, armed_request))
+            finish_serial_stop!(
+                armed, armed_request, armed.armed))
         @test run_phase(armed.run) == RunStopped
 
         terminal = serial_test_fixture()
@@ -1872,7 +1949,7 @@ end
             Clocks.time_nanos(terminal.clock);
             reason=:configured_terminal)
         @test serial_run_is_quiescent(
-            stop_serial_run!(terminal.running, terminal_event))
+            finish_serial_stop!(terminal, terminal_event))
         @test run_phase(terminal.run) == RunStopped
         @test run_termination_kind(run_termination(terminal.run)) ==
             ConfiguredTerminalStop
@@ -1881,6 +1958,271 @@ end
             session=RunSessionID(0x7c03))
         @test run_session(fresh.run) != run_session(terminal.run)
         @test run_phase(fresh.run) == RunRunning
+    end
+
+    @testset "Bounded failure coordination and deficit evidence" begin
+        commands = serial_test_fixture(
+            session=RunSessionID(0x7c40))
+        @test serial_step_status(
+            step_serial_run!(commands.running)) ==
+            SerialPlantEventProcessed
+        queue_serial_test_command!(
+            commands;
+            stream_sequence=1,
+            command_sequence=1,
+            receive_ns=1,
+            effective_ns=2_000_000,
+            advance_ns=1)
+        admitted = false
+        for _ in 1:8
+            result = step_serial_run!(commands.running)
+            if serial_step_status(result) == SerialCommandProcessed
+                admitted = true
+                break
+            end
+            serial_step_status(result) == SerialDeadlinePending &&
+                Clocks.advance!(
+                    commands.clock,
+                    serial_step_time_until_ns(result))
+        end
+        @test admitted
+        queue_serial_test_command!(
+            commands;
+            stream_sequence=2,
+            command_sequence=2,
+            receive_ns=2,
+            effective_ns=3_000_000,
+            advance_ns=1)
+        command_stop = RunStopRequest(
+            run_session(commands.run),
+            execution_clock_identity(commands.armed.timing),
+            Clocks.time_nanos(commands.clock);
+            reason=:command_drain_test)
+        @test begin_serial_stop!(
+            commands.running, command_stop) ==
+            SerialShutdownDraining
+        @test progress_serial_shutdown!(commands.running) ==
+            SerialShutdownDraining
+        if SERIAL_TESTS_WITH_COVERAGE
+            @test_skip "shutdown-drain allocation gate disabled under coverage"
+        else
+            serial_shutdown_progress_allocations!(commands.running)
+            @test serial_shutdown_progress_allocations!(
+                commands.running) == 0
+        end
+
+        outcomes = Dict{UInt64,CommandOutcome{LeasedCommandPayload}}()
+        outcome_ref =
+            Ref{CommandOutcome{LeasedCommandPayload}}()
+        completion =
+            command_completion_port(commands.command_ports)
+        while true
+            result = try_take!(outcome_ref, completion)
+            port_status(result) in (PortEmpty, PortClosed) &&
+                break
+            @test port_status(result) == PortTransferSucceeded
+            outcome = outcome_ref[]
+            sequence = stream_sequence_value(
+                outcome_stream_sequence(outcome))
+            @test !haskey(outcomes, sequence)
+            outcomes[sequence] = outcome
+        end
+        @test sort!(collect(keys(outcomes))) == UInt64[1, 2]
+        admitted_outcome = outcomes[1]
+        @test outcome_stage(admitted_outcome) ==
+            CoreCommandOutcome
+        @test outcome_terminal_kind(admitted_outcome) ==
+            SERIAL_TEST_PLANT.FailedCommand
+        @test outcome_reason(admitted_outcome) ==
+            :hil_run_shutdown
+        transferred_outcome = outcomes[2]
+        @test outcome_stage(transferred_outcome) ==
+            BoundaryCommandOutcome
+        @test outcome_boundary_reason(transferred_outcome) ==
+            RunNotAccepting
+        for outcome in values(outcomes)
+            @test port_status(release_outcome!(
+                completion, outcome)) ==
+                PortTransferSucceeded
+        end
+        command_accounting =
+            finish_serial_shutdown!(commands)
+        @test serial_run_is_quiescent(command_accounting)
+        @test run_phase(commands.run) == RunStopped
+        @test SERIAL_TEST_PLANT.effective_command(
+            commands.event_loop,
+            plant_event_loop_state(commands.run.state.bridge),
+            CommandEndpointID(:hil_dm)) == zeros(Float64, 2)
+
+        timeout_policy = RunShutdownPolicy(
+            acknowledgement_timeout_ns=10,
+            drain_timeout_ns=20)
+        lease_deficit = prepare_first_wfs_publication!(
+            serial_test_fixture(
+                session=RunSessionID(0x7c41),
+                shutdown_policy=timeout_policy))
+        @test serial_step_status(
+            step_serial_run!(lease_deficit.running)) ==
+            SerialPlantEventProcessed
+        held_product = Ref{AcquisitionCompletion}()
+        @test port_status(try_take!(
+            held_product, lease_deficit.wfs_port)) ==
+            PortTransferSucceeded
+        release_all_serial_products!(
+            lease_deficit.feedback_port)
+        lease_stop = RunStopRequest(
+            run_session(lease_deficit.run),
+            execution_clock_identity(lease_deficit.armed.timing),
+            Clocks.time_nanos(lease_deficit.clock);
+            reason=:lease_deficit_test)
+        @test begin_serial_stop!(
+            lease_deficit.running, lease_stop) ==
+            SerialShutdownDraining
+        @test progress_serial_shutdown!(
+            lease_deficit.running) ==
+            SerialShutdownDraining
+        Clocks.advance!(lease_deficit.clock, 21)
+        @test progress_serial_shutdown!(
+            lease_deficit.running) ==
+            SerialShutdownFinalized
+        @test run_phase(lease_deficit.run) == RunFailed
+        @test run_termination_kind(
+            run_termination(lease_deficit.run)) ==
+            DrainTimeoutRunFailure
+        lease_failure =
+            serial_failure_accounting(lease_deficit.run)
+        @test lease_failure.drain_timed_out
+        @test run_failure_kind(lease_failure.first_failure) ==
+            DrainTimeoutRunFailure
+        lease_accounting =
+            serial_run_accounting(lease_deficit.run)
+        wfs_deficit = only(
+            acquisition for acquisition in
+                lease_accounting.acquisitions
+            if acquisition.acquisition ==
+                AcquisitionID(:hil_wfs))
+        @test wfs_deficit.products.consumer_leased == 1
+        @test wfs_deficit.products.free ==
+            wfs_deficit.products.capacity - 1
+        @test port_status(release_product!(
+            lease_deficit.wfs_port,
+            held_product[])) ==
+            PortTransferSucceeded
+        reclaim_serial_returns!(lease_deficit.run)
+        reclaimed_wfs = only(
+            acquisition for acquisition in
+                serial_run_accounting(
+                    lease_deficit.run).acquisitions
+            if acquisition.acquisition ==
+                AcquisitionID(:hil_wfs))
+        @test reclaimed_wfs.products.free ==
+            reclaimed_wfs.products.capacity
+
+        exact_drain = serial_test_fixture(
+            session=RunSessionID(0x7c43),
+            shutdown_policy=timeout_policy)
+        queue_serial_test_command!(
+            exact_drain;
+            stream_sequence=1,
+            command_sequence=1,
+            receive_ns=1,
+            advance_ns=1)
+        exact_stop = RunStopRequest(
+            run_session(exact_drain.run),
+            execution_clock_identity(exact_drain.armed.timing),
+            Clocks.time_nanos(exact_drain.clock);
+            reason=:exact_drain_deadline_test)
+        @test begin_serial_stop!(
+            exact_drain.running, exact_stop) ==
+            SerialShutdownDraining
+        @test progress_serial_shutdown!(
+            exact_drain.running) ==
+            SerialShutdownDraining
+        @test release_all_serial_command_outcomes!(
+            exact_drain) == 1
+        reclaim_serial_returns!(exact_drain.run)
+        Clocks.advance!(exact_drain.clock, 20)
+        @test progress_serial_shutdown!(exact_drain.running) ==
+            SerialShutdownFinalized
+        @test run_phase(exact_drain.run) == RunStopped
+
+        late_drain = serial_test_fixture(
+            session=RunSessionID(0x7c44),
+            shutdown_policy=timeout_policy)
+        queue_serial_test_command!(
+            late_drain;
+            stream_sequence=1,
+            command_sequence=1,
+            receive_ns=1,
+            advance_ns=1)
+        late_stop = RunStopRequest(
+            run_session(late_drain.run),
+            execution_clock_identity(late_drain.armed.timing),
+            Clocks.time_nanos(late_drain.clock);
+            reason=:late_drain_observation_test)
+        @test begin_serial_stop!(
+            late_drain.running, late_stop) ==
+            SerialShutdownDraining
+        @test progress_serial_shutdown!(late_drain.running) ==
+            SerialShutdownDraining
+        @test release_all_serial_command_outcomes!(
+            late_drain) == 1
+        reclaim_serial_returns!(late_drain.run)
+        Clocks.advance!(late_drain.clock, 21)
+        @test progress_serial_shutdown!(late_drain.running) ==
+            SerialShutdownFinalized
+        @test run_phase(late_drain.run) == RunFailed
+        @test run_termination_kind(
+            run_termination(late_drain.run)) ==
+            DrainTimeoutRunFailure
+
+        missing_ack_configuration =
+            serial_test_execution_owner_configuration(
+                DeterministicExecutionOwners())
+        missing_ack = serial_test_fixture(
+            session=RunSessionID(0x7c42),
+            optical_execution=missing_ack_configuration,
+            shutdown_policy=timeout_policy)
+        acknowledgement_stop = RunStopRequest(
+            run_session(missing_ack.run),
+            execution_clock_identity(missing_ack.armed.timing),
+            Clocks.time_nanos(missing_ack.clock);
+            reason=:acknowledgement_deficit_test)
+        @test begin_serial_stop!(
+            missing_ack.running, acknowledgement_stop) ==
+            SerialShutdownDraining
+        owner_signal = missing_ack.run.failures.signals[2]
+        @atomic :release owner_signal.acknowledged_stop_epoch =
+            UInt64(0)
+        Clocks.advance!(missing_ack.clock, 11)
+        @test progress_serial_shutdown!(missing_ack.running) ==
+            SerialShutdownDraining
+        acknowledgement_failure =
+            serial_failure_accounting(missing_ack.run)
+        @test run_failure_kind(
+            acknowledgement_failure.first_failure) ==
+            AcknowledgementTimeoutRunFailure
+        acknowledgement_owner =
+            acknowledgement_failure.owners[2]
+        @test !acknowledgement_owner.acknowledged
+        @test acknowledgement_owner.acknowledgement_timed_out
+        @test run_owner_component(
+            acknowledgement_owner.owner) ==
+            :path_execution_owner
+        @test run_owner_ordinal(
+            acknowledgement_owner.owner) == 1
+        Clocks.advance!(missing_ack.clock, 10)
+        @test progress_serial_shutdown!(missing_ack.running) ==
+            SerialShutdownFinalized
+        @test run_phase(missing_ack.run) == RunFailed
+        @test run_termination_kind(
+            run_termination(missing_ack.run)) ==
+            AcknowledgementTimeoutRunFailure
+        final_ack_accounting =
+            serial_failure_accounting(missing_ack.run)
+        @test final_ack_accounting.drain_timed_out
+        final_ack_owner = final_ack_accounting.owners[2]
+        @test final_ack_owner.acknowledgement_timed_out
     end
 
     @testset "Deterministic fake RTC closes the reduced-order loop" begin

@@ -3,6 +3,7 @@ import AdaptiveOpticsHIL
 using AdaptiveOpticsHIL.Execution
 using AdaptiveOpticsHIL.Lifecycle
 using AdaptiveOpticsHIL.Ownership: RingTransferSucceeded
+using AdaptiveOpticsHIL.Ownership: close_ring!
 using AdaptiveOpticsHIL.Ownership: try_submit!, try_take!
 using AdaptiveOpticsHIL.Ports: OptionalResource, RequiredResource
 using AdaptiveOpticsHIL.Timing
@@ -19,6 +20,9 @@ const EXECUTION_TEST_PLANT = AdaptiveOpticsSim.Plant
 const EXECUTION_TESTS_WITH_COVERAGE =
     Base.JLOptions().code_coverage != 0
 const EXECUTION_TEST_BATCH_ALLOCATION_BUDGET = 2_048
+const EXECUTION_TEST_SHUTDOWN_POLICY = RunShutdownPolicy(
+    acknowledgement_timeout_ns=1_000_000_000,
+    drain_timeout_ns=2_000_000_000)
 
 struct ExecutionTestUnsupportedMode <: AbstractExecutionOwnerMode end
 struct ExecutionTestUnsupportedIdle <: AbstractExecutionOwnerIdlePolicy end
@@ -26,6 +30,27 @@ struct ExecutionTestUnsupportedOverloadAction <:
     AbstractExecutionOwnerOverloadAction end
 struct ExecutionTestUnsupportedConfiguration <:
     AbstractOpticalExecutionConfiguration
+end
+
+struct ExecutionBeforeDequeueFailureIdle{E} <:
+    AbstractExecutionOwnerIdlePolicy
+    error::E
+    coordinator_task_id::UInt
+end
+
+ExecutionBeforeDequeueFailureIdle(error) =
+    ExecutionBeforeDequeueFailureIdle(
+        error, objectid(current_task()))
+
+AdaptiveOpticsHIL.Execution._validate_execution_owner_idle_policy(
+    ::ExecutionBeforeDequeueFailureIdle) = nothing
+
+function AdaptiveOpticsHIL.Execution._next_idle_poll(
+    policy::ExecutionBeforeDequeueFailureIdle,
+    ::UInt32)
+    objectid(current_task()) == policy.coordinator_task_id &&
+        return (yield(); zero(UInt32))
+    throw(policy.error)
 end
 
 function execution_test_owner_configuration(
@@ -152,6 +177,57 @@ struct ExecutionFailureProbe{E}
     error::E
 end
 
+struct ExecutionMaterializationFailureProbe{E}
+    error::E
+end
+
+struct ExecutionFailingMaterialization{M,E}
+    implementation::M
+    error::E
+end
+
+function EXECUTION_TEST_PLANT.validate_path_materialization_binding(
+    materialization::ExecutionFailingMaterialization,
+    input,
+    atmosphere,
+    source)
+    return EXECUTION_TEST_PLANT.validate_path_materialization_binding(
+        materialization.implementation,
+        input,
+        atmosphere,
+        source)
+end
+
+function EXECUTION_TEST_PLANT.validate_path_materialization(
+    materialization::ExecutionFailingMaterialization,
+    input,
+    atmosphere,
+    epoch)
+    return EXECUTION_TEST_PLANT.validate_path_materialization(
+        materialization.implementation,
+        input,
+        atmosphere,
+        epoch)
+end
+
+function EXECUTION_TEST_PLANT.materialize_path_input!(
+    materialization::ExecutionFailingMaterialization,
+    input,
+    atmosphere,
+    epoch)
+    throw(materialization.error)
+end
+
+@inline execution_test_materialization(::Any, implementation) =
+    implementation
+
+@inline function execution_test_materialization(
+    probe::ExecutionMaterializationFailureProbe,
+    implementation)
+    return ExecutionFailingMaterialization(
+        implementation, probe.error)
+end
+
 function wait_for_execution_test_flag(
     flag::Threads.Atomic{Bool},
     timeout_ns::UInt64,
@@ -219,6 +295,8 @@ end
 
 execution_probe_before!(probe::ExecutionFailureProbe) =
     throw(probe.error)
+execution_probe_before!(
+    ::ExecutionMaterializationFailureProbe) = nothing
 
 struct ExecutionTestPathModel{P}
     probe::P
@@ -280,6 +358,10 @@ function EXECUTION_TEST_PLANT.prepare_path_executor(
     T = eltype(pupil_reflectivity(telescope))
     pupil = PupilFunction(telescope; T, backend=backend(telescope))
     imaging = prepare_direct_imaging(pupil, source; zero_padding=1)
+    materialization = execution_test_materialization(
+        model.probe,
+        prepare_pupil_opd_materialization(
+            atmosphere, telescope, source, pupil))
     return PreparedPathExecutor(
         definition,
         source,
@@ -288,8 +370,7 @@ function EXECUTION_TEST_PLANT.prepare_path_executor(
         pupil,
         direct_imaging_output(imaging),
         ExecutionTestPathExecution(imaging, model.probe, Ref(0));
-        materialization=prepare_pupil_opd_materialization(
-            atmosphere, telescope, source, pupil),
+        materialization,
         optical_model=:execution_owner_direct_imaging,
         propagation_model=:fraunhofer_fft,
         model_revisions=UInt(1),
@@ -521,6 +602,7 @@ function prepare_execution_test_executor(
         fixture.state,
         fixture.workspace,
         session,
+        EXECUTION_TEST_SHUTDOWN_POLICY,
     )
     AdaptiveOpticsHIL.Execution._arm_optical_execution!(executor)
     AdaptiveOpticsHIL.Execution._start_optical_execution!(executor)
@@ -647,6 +729,34 @@ function captured_execution_test_error(f)
         return error
     end
     return nothing
+end
+
+function wait_for_execution_failure_record(executor)
+    deadline_ns = time_ns() + UInt64(5_000_000_000)
+    while true
+        record = first_run_failure(executor.failures)
+        record === nothing || return record
+        time_ns() <= deadline_ns || error(
+            "execution owner did not publish its injected failure")
+        yield()
+    end
+end
+
+function finish_execution_failure_shutdown!(executor)
+    AdaptiveOpticsHIL.Lifecycle._begin_run_shutdown!(
+        executor.failures, 0)
+    AdaptiveOpticsHIL.Execution.
+        _begin_optical_execution_shutdown!(executor)
+    deadline_ns = time_ns() + UInt64(5_000_000_000)
+    while !AdaptiveOpticsHIL.Execution.
+            _progress_optical_execution_shutdown!(executor)
+        time_ns() <= deadline_ns || error(
+            "failed execution owners did not stop inside the test bound")
+        yield()
+    end
+    AdaptiveOpticsHIL.Execution.
+        _finalize_optical_execution_shutdown!(executor)
+    return executor
 end
 
 @noinline function execute_execution_test_batch!(fixture, executor)
@@ -818,6 +928,7 @@ end
             unsupported.state,
             unsupported.workspace,
             RunSessionID(0x89df),
+            EXECUTION_TEST_SHUTDOWN_POLICY,
         )
     end
     @test unsupported_error isa ExecutionOwnerError
@@ -840,6 +951,7 @@ end
             unsupported.state,
             unsupported.workspace,
             RunSessionID(0x89df),
+            EXECUTION_TEST_SHUTDOWN_POLICY,
         )
     end
     @test unknown_policy_error isa ExecutionOwnerError
@@ -862,6 +974,7 @@ end
             unsupported.state,
             unsupported.workspace,
             RunSessionID(0x89df),
+            EXECUTION_TEST_SHUTDOWN_POLICY,
         )
     end
     @test invalid_recovery_error isa ExecutionOwnerError
@@ -918,6 +1031,7 @@ end
             undersized.state,
             undersized.workspace,
             RunSessionID(0x89e1),
+            EXECUTION_TEST_SHUTDOWN_POLICY,
         )
     end
     @test undersized_error isa ExecutionOwnerError
@@ -932,6 +1046,7 @@ end
             missing.state,
             missing.workspace,
             RunSessionID(0x89e2),
+            EXECUTION_TEST_SHUTDOWN_POLICY,
         )
     missing_error = captured_execution_test_error() do
         AdaptiveOpticsHIL.Execution._take_expected_completion!(
@@ -1009,6 +1124,42 @@ end
     @test execution_owners_are_quiescent(capacity_executor)
     stop_execution_test_executor!(capacity_executor)
 
+    materialization_failure =
+        ArgumentError("test owner materialization failure")
+    failing_materialization = execution_test_fixture(
+        path_probes=(
+            ExecutionMaterializationFailureProbe(
+                materialization_failure),
+            nothing,
+            nothing,
+        ),
+    )
+    materialization_executor = prepare_execution_test_executor(
+        failing_materialization,
+        DeterministicExecutionOwners();
+        outer_owner_count=1,
+        session=RunSessionID(0x89e3),
+    )
+    observed_materialization_failure =
+        captured_execution_test_error() do
+            execute_execution_test_batch!(
+                failing_materialization,
+                materialization_executor)
+        end
+    @test observed_materialization_failure ===
+        materialization_failure
+    materialization_record = first_run_failure(
+        materialization_executor.failures)
+    @test run_failure_stage(materialization_record) ==
+        OwnerMaterialization
+    @test run_failure_kind(materialization_record) ==
+        OwnerExceptionRunFailure
+    @test !AdaptiveOpticsHIL.Execution._execution_batch_active(
+        materialization_executor)
+    finish_execution_failure_shutdown!(materialization_executor)
+    @test AdaptiveOpticsHIL.Execution.
+        _execution_ownership_is_drained(materialization_executor)
+
     owner_failure = ArgumentError("test execution-owner model failure")
     failing = execution_test_fixture(
         path_probes=(
@@ -1021,7 +1172,7 @@ end
         failing,
         DeterministicExecutionOwners();
         outer_owner_count=1,
-        session=RunSessionID(0x89e3),
+        session=RunSessionID(0x89e4),
     )
     observed_failure = captured_execution_test_error() do
         execute_execution_test_batch!(failing, failing_executor)
@@ -1033,10 +1184,203 @@ end
         1:execution_owner_count(failing_executor),
     ) == 1
     @test !execution_owners_are_quiescent(failing_executor)
+    @test !AdaptiveOpticsHIL.Execution._execution_batch_active(
+        failing_executor)
+    failing_record = first_run_failure(
+        failing_executor.failures)
+    @test run_failure_kind(failing_record) ==
+        OwnerExceptionRunFailure
+    @test run_failure_stage(failing_record) == OwnerExecution
+    @test run_owner_component(
+        run_failure_owner(failing_record)) ==
+        :path_execution_owner
     AdaptiveOpticsHIL.Execution._mark_optical_execution_failed!(
         failing_executor)
     @test execution_owners_phase(failing_executor) ==
         ExecutionOwnersFailed
+    AdaptiveOpticsHIL.Lifecycle._begin_run_shutdown!(
+        failing_executor.failures, 0)
+    AdaptiveOpticsHIL.Execution.
+        _begin_optical_execution_shutdown!(failing_executor)
+    @test AdaptiveOpticsHIL.Execution.
+        _progress_optical_execution_shutdown!(failing_executor)
+    AdaptiveOpticsHIL.Execution.
+        _finalize_optical_execution_shutdown!(failing_executor)
+    @test execution_owners_phase(failing_executor) ==
+        ExecutionOwnersFailed
+    @test AdaptiveOpticsHIL.Execution.
+        _execution_ownership_is_drained(failing_executor)
+
+    if Threads.nthreads() < 4
+        @test_skip "before-dequeue owner fault requires four Julia threads"
+        @test_skip "after-dequeue owner fault requires four Julia threads"
+    else
+        before_dequeue_failure =
+            ErrorException("test failure before owner dequeue")
+        before_dequeue = execution_test_fixture()
+        before_dequeue_executor = prepare_execution_test_executor(
+            before_dequeue,
+            ThreadedExecutionOwners(
+                ExecutionBeforeDequeueFailureIdle(
+                    before_dequeue_failure));
+            outer_owner_count=3,
+            session=RunSessionID(0x89e5),
+        )
+        before_dequeue_record = wait_for_execution_failure_record(
+            before_dequeue_executor)
+        @test run_failure_stage(before_dequeue_record) ==
+            OwnerBeforeDequeue
+        @test run_failure_kind(before_dequeue_record) ==
+            OwnerExceptionRunFailure
+        @test run_owner_component(
+            run_failure_owner(before_dequeue_record)) ==
+            :path_execution_owner
+        finish_execution_failure_shutdown!(before_dequeue_executor)
+        @test AdaptiveOpticsHIL.Execution.
+            _execution_ownership_is_drained(before_dequeue_executor)
+
+        after_dequeue = execution_test_fixture()
+        after_dequeue_executor = prepare_execution_test_executor(
+            after_dequeue,
+            ThreadedExecutionOwners();
+            outer_owner_count=3,
+            session=RunSessionID(0x89e6),
+        )
+        after_dequeue_executor.owner_states[1].activity =
+            AdaptiveOpticsHIL.Execution._ExecutionOwnerStoppedActivity
+        after_dequeue_error = captured_execution_test_error() do
+            execute_execution_test_batch!(
+                after_dequeue, after_dequeue_executor)
+        end
+        @test after_dequeue_error isa ExecutionOwnerError
+        after_dequeue_record = wait_for_execution_failure_record(
+            after_dequeue_executor)
+        @test run_failure_stage(after_dequeue_record) ==
+            OwnerAfterDequeue
+        @test run_owner_ordinal(
+            run_failure_owner(after_dequeue_record)) == 1
+        after_dequeue_accounting = execution_owner_accounting(
+            after_dequeue_executor, 1)
+        @test after_dequeue_accounting.work_submitted == 1
+        @test after_dequeue_accounting.work_taken == 0
+        @test after_dequeue_accounting.work_cancelled == 0
+        @test AdaptiveOpticsHIL.Execution._execution_batch_active(
+            after_dequeue_executor)
+        finish_execution_failure_shutdown!(after_dequeue_executor)
+        @test !AdaptiveOpticsHIL.Execution.
+            _execution_ownership_is_drained(after_dequeue_executor)
+        @test AdaptiveOpticsHIL.Execution._execution_batch_active(
+            after_dequeue_executor)
+    end
+
+    publication_failure = execution_test_fixture()
+    publication_executor = prepare_execution_test_executor(
+        publication_failure,
+        DeterministicExecutionOwners();
+        outer_owner_count=1,
+        session=RunSessionID(0x89e7),
+    )
+    publication_owner = execution_owner(
+        publication_executor, 1)
+    close_ring!(publication_owner.completion)
+    publication_error = captured_execution_test_error() do
+        execute_execution_test_batch!(
+            publication_failure, publication_executor)
+    end
+    @test publication_error isa ExecutionOwnerError
+    @test publication_error.reason == :completion_publication
+    publication_record = first_run_failure(
+        publication_executor.failures)
+    @test run_failure_stage(publication_record) ==
+        OwnerCompletionPublication
+    @test run_failure_reason(publication_record) ==
+        :completion_publication
+    publication_accounting =
+        execution_owner_accounting(publication_executor, 1)
+    @test publication_accounting.work_completed == 1
+    @test publication_accounting.completions_taken == 0
+    @test publication_accounting.failed
+    @test AdaptiveOpticsHIL.Execution._execution_batch_active(
+        publication_executor)
+
+    device_failure = execution_test_fixture(
+        device_batch_selection=Val(:all),
+        batchable=true)
+    device_failure_executor = prepare_execution_test_executor(
+        device_failure,
+        DeterministicExecutionOwners();
+        outer_owner_count=1,
+        session=RunSessionID(0x89e8),
+    )
+    device_claim = EXECUTION_TEST_PLANT.begin_optical_path_batch!(
+        device_failure.prepared,
+        device_failure.state,
+        device_failure.workspace,
+        PlantTimestamp(0))
+    device_failure_executor.coordinator.active_claim = device_claim
+    device_owner_count = AdaptiveOpticsHIL.Execution.
+        _collect_due_execution_owners!(
+            device_failure_executor, device_claim)
+    device_batch_sequence = AdaptiveOpticsHIL.Execution.
+        _next_batch_sequence!(device_failure_executor)
+    AdaptiveOpticsHIL.Execution._submit_owner_phase!(
+        device_failure_executor,
+        device_claim,
+        device_batch_sequence,
+        device_owner_count,
+        AdaptiveOpticsHIL.Execution._ExecutionOwnerMaterialization)
+    AdaptiveOpticsHIL.Execution._collect_owner_phase!(
+        device_failure_executor,
+        device_batch_sequence,
+        device_owner_count,
+        AdaptiveOpticsHIL.Execution._ExecutionOwnerMaterialization,
+        nothing,
+        PlantTimestamp(0))
+    EXECUTION_TEST_PLANT.seal_optical_path_batch_materialization!(
+        device_failure.prepared,
+        device_failure.state,
+        device_failure.workspace,
+        device_claim)
+    original_device_owner = execution_owner(
+        device_failure_executor, 1)
+    device_failure_executor.owners[1] = PreparedExecutionOwner(
+        original_device_owner.id,
+        original_device_owner.kind,
+        typemax(UInt32),
+        original_device_owner.group_ordinals,
+        AdaptiveOpticsSim.CUDABackend(),
+        original_device_owner.compute_device,
+        original_device_owner.overload_policy,
+        original_device_owner.due,
+        original_device_owner.completion)
+    AdaptiveOpticsHIL.Execution._submit_owner_phase!(
+        device_failure_executor,
+        device_claim,
+        device_batch_sequence,
+        device_owner_count,
+        AdaptiveOpticsHIL.Execution._ExecutionOwnerExecution)
+    observed_device_failure = captured_execution_test_error() do
+        AdaptiveOpticsHIL.Execution._collect_owner_phase!(
+            device_failure_executor,
+            device_batch_sequence,
+            device_owner_count,
+            AdaptiveOpticsHIL.Execution._ExecutionOwnerExecution,
+            nothing,
+            PlantTimestamp(0))
+    end
+    @test observed_device_failure isa BoundsError
+    device_record = first_run_failure(
+        device_failure_executor.failures)
+    @test run_failure_kind(device_record) == DeviceRunFailure
+    @test run_failure_stage(device_record) ==
+        OwnerDeviceCompletion
+    @test run_owner_component(
+        run_failure_owner(device_record)) ==
+        :device_submission_owner
+    @test AdaptiveOpticsHIL.Execution.
+        _abandon_failed_optical_path_batch!(
+            device_failure_executor)
+    finish_execution_failure_shutdown!(device_failure_executor)
 
     if EXECUTION_TESTS_WITH_COVERAGE
         @test_skip "execution-owner allocation gate disabled under coverage instrumentation"
@@ -1205,6 +1549,7 @@ end
                 backpressure.state,
                 backpressure.workspace,
                 RunSessionID(0x8a01),
+                EXECUTION_TEST_SHUTDOWN_POLICY,
             )
         backpressure_owner =
             execution_owner(backpressure_executor, 1)

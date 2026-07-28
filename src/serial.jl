@@ -13,6 +13,7 @@ import ..Lifecycle
 
 using AdaptiveOpticsSim.Plant: AcquisitionID, AcquisitionProducts
 using AdaptiveOpticsSim.Plant: AbstractOpticalPathBatchExecutor
+using AdaptiveOpticsSim.Plant: CommandDispositionReason
 using AdaptiveOpticsSim.Plant: PlantTimestamp
 using AdaptiveOpticsSim.Plant: PreparedPlantEventLoop
 using AdaptiveOpticsSim.Plant: acquisition_product_sequence
@@ -26,28 +27,52 @@ using AdaptiveOpticsSim.Plant: validate_acquisition_product_contract
 
 import ..AdaptiveOpticsHIL: AdaptiveOpticsHILError
 using ..Execution: AbstractOpticalExecutionConfiguration
+using ..Execution: ExecutionOwnerError
 using ..Execution: SerialOpticalExecution
 using ..Execution: _arm_optical_execution!
+using ..Execution: _abandon_failed_optical_path_batch!
 using ..Execution: _bind_optical_execution_timing
 using ..Execution: _execution_accounting
+using ..Execution: _execution_accounting_is_drained
 using ..Execution: _execution_accounting_is_quiescent
+using ..Execution: _execution_batch_active
 using ..Execution: _execution_is_armed, _execution_is_quiescent
+using ..Execution: _execution_ownership_is_drained
+using ..Execution: _execution_failure_coordinator
+using ..Execution: _begin_optical_execution_shutdown!
+using ..Execution: _finalize_optical_execution_shutdown!
 using ..Execution: _mark_optical_execution_failed!
 using ..Execution: _prepare_optical_execution
+using ..Execution: _progress_optical_execution_shutdown!
 using ..Execution: _start_optical_execution!, _stop_optical_execution!
+using ..Lifecycle: AcknowledgementTimeoutRunFailure
 using ..Lifecycle: AdapterReadinessSnapshot
+using ..Lifecycle: CoordinatorFailureBoundary
+using ..Lifecycle: DeviceRunFailure, DrainTimeoutRunFailure
+using ..Lifecycle: IngressWatchdogRunFailure
 using ..Lifecycle: NoRTCIngressLiveness
+using ..Lifecycle: OwnerExceptionRunFailure
+using ..Lifecycle: PreparedRunFailureCoordinator
+using ..Lifecycle: ResourcePolicyRunFailure
 using ..Lifecycle: RTCIngressLivenessExpired
 using ..Lifecycle: RTCIngressLivenessPolicy
 using ..Lifecycle: RTCIngressLivenessState
 using ..Lifecycle: RunFailureEvent
 using ..Lifecycle: RunLifecycleParameters, RunLifecycleState
 using ..Lifecycle: RunPrepared, RunRunning
+using ..Lifecycle: RunShutdownPolicy, ShutdownAcknowledgement
+using ..Lifecycle: ShutdownDrain
 using ..Lifecycle: RunStopRequest, RunTerminalEvent
+using ..Lifecycle: _acknowledge_run_stop!, _begin_run_shutdown!
 using ..Lifecycle: _begin_arm!, _complete_arm!, _fail_run!
 using ..Lifecycle: _admit_rtc_ingress_liveness!
+using ..Lifecycle: _finalize_run_shutdown!
 using ..Lifecycle: _observe_rtc_ingress_liveness!
+using ..Lifecycle: _publish_run_failure!
+using ..Lifecycle: _record_acknowledgement_timeouts!
 using ..Lifecycle: _record_stop!, _require_phase
+using ..Lifecycle: _run_shutdown_acknowledged
+using ..Lifecycle: _run_shutdown_drain_expired!
 using ..Lifecycle: _start_rtc_ingress_liveness!
 using ..Lifecycle: _start_run!
 using ..Lifecycle: _validate_stop_event
@@ -78,6 +103,11 @@ using ..Ports: outcome_credit_accounting, plant_event_loop_state
 using ..Ports: plant_event_loop_workspace
 using ..Ports: port_status, process_next_command!
 using ..Ports: fail_pending_bridge_commands!
+using ..Ports: reject_pending_bridge_commands!
+using ..Ports: close_acquisition_completion!
+using ..Ports: close_acquisition_return_path!
+using ..Ports: close_command_completion!, close_command_ingress!
+using ..Ports: close_command_return_paths!
 using ..Ports: producer_product, publish_command_dispositions!
 using ..Ports: reclaim_command_payload_returns!
 using ..Ports: reclaim_outcome_credit_returns!, reclaim_product_returns!
@@ -93,7 +123,11 @@ export SerialRunError
 export ConfiguredSerialRun, PreparedSerialRun
 export ArmingSerialRun, ArmedSerialRun, RunningSerialRun
 export configure_serial_run, prepare_serial_run
-export begin_serial_arm!, arm_serial_run!, start_serial_run!, stop_serial_run!
+export begin_serial_arm!, arm_serial_run!, start_serial_run!
+export begin_serial_stop!, progress_serial_shutdown!
+export SerialShutdownStatus, SerialShutdownInactive
+export SerialShutdownDraining, SerialShutdownFinalized
+export serial_shutdown_status, serial_failure_accounting
 export SerialStepStatus, SerialCommandProcessed, SerialPlantEventProcessed
 export SerialDeadlinePending, SerialEventLoopComplete
 export SerialStepResult, serial_step_status, serial_step_timestamp
@@ -111,6 +145,7 @@ export AcquisitionOverloadAccounting
 export serial_acquisition_overload_accounting
 export serial_rtc_ingress_liveness_accounting
 export serial_rtc_ingress_liveness_policy
+export serial_shutdown_policy
 
 """Invalid serial-run preparation, lifecycle, pacing, or accounting."""
 struct SerialRunError <: AdaptiveOpticsHILError
@@ -218,6 +253,7 @@ struct ConfiguredSerialRun{
     optical_execution::E
     lifecycle::RunLifecycleParameters
     ingress_liveness::I
+    shutdown_policy::RunShutdownPolicy
 
     ConfiguredSerialRun(
         event_loop::L,
@@ -226,6 +262,7 @@ struct ConfiguredSerialRun{
         optical_execution::E,
         lifecycle::RunLifecycleParameters,
         ingress_liveness::I,
+        shutdown_policy::RunShutdownPolicy,
         ::_SerialConstructionToken) where {
         L<:PreparedPlantEventLoop,
         B<:PreparedCommandBridge,
@@ -238,7 +275,46 @@ struct ConfiguredSerialRun{
         acquisition_ports,
         optical_execution,
         lifecycle,
-        ingress_liveness)
+        ingress_liveness,
+        shutdown_policy)
+end
+
+"""Prepared serial shutdown coordination phase."""
+@enum SerialShutdownStatus::UInt8 begin
+    SerialShutdownInactive = 0x01
+    SerialShutdownDraining = 0x02
+    SerialShutdownFinalized = 0x03
+end
+
+mutable struct SerialShutdownState
+    status::SerialShutdownStatus
+    stop_event::Union{Nothing,RunStopRequest,RunTerminalEvent}
+    command_ingress_closed::Bool
+    command_completion_closed::Bool
+    acquisition_completion_closed::Memory{Bool}
+    command_returns_closed::Bool
+    acquisition_returns_closed::Memory{Bool}
+    execution_shutdown_begun::Bool
+    clock_unavailable::Bool
+end
+
+function SerialShutdownState(acquisition_count::Int)
+    acquisition_completion_closed =
+        Memory{Bool}(undef, acquisition_count)
+    acquisition_returns_closed =
+        Memory{Bool}(undef, acquisition_count)
+    fill!(acquisition_completion_closed, false)
+    fill!(acquisition_returns_closed, false)
+    return SerialShutdownState(
+        SerialShutdownInactive,
+        nothing,
+        false,
+        false,
+        acquisition_completion_closed,
+        false,
+        acquisition_returns_closed,
+        false,
+        false)
 end
 
 """
@@ -254,6 +330,7 @@ mutable struct SerialRunState{
     const publications::Memory{AcquisitionPublicationState}
     const ingress_liveness::I
     const lifecycle::RunLifecycleState
+    const shutdown::SerialShutdownState
     plant_event_steps::UInt64
     products_published::UInt64
 
@@ -262,6 +339,7 @@ mutable struct SerialRunState{
         publications::Memory{AcquisitionPublicationState},
         ingress_liveness::I,
         lifecycle::RunLifecycleState,
+        shutdown::SerialShutdownState,
         plant_event_steps::UInt64,
         products_published::UInt64,
         ::_SerialConstructionToken) where {
@@ -273,6 +351,7 @@ mutable struct SerialRunState{
             publications,
             ingress_liveness,
             lifecycle,
+            shutdown,
             plant_event_steps,
             products_published)
 end
@@ -309,6 +388,7 @@ struct PreparedSerialRun{
     state::S
     workspace::W
     execution::E
+    failures::PreparedRunFailureCoordinator
 
     PreparedSerialRun(
         configuration::C,
@@ -316,6 +396,7 @@ struct PreparedSerialRun{
         state::S,
         workspace::W,
         execution::E,
+        failures::PreparedRunFailureCoordinator,
         ::_SerialConstructionToken) where {
         C<:ConfiguredSerialRun,
         P<:Tuple,
@@ -326,8 +407,9 @@ struct PreparedSerialRun{
         configuration,
         publishers,
         state,
-        workspace,
-        execution)
+            workspace,
+            execution,
+            failures)
 end
 
 """One active, inclusive-deadline arm attempt."""
@@ -474,6 +556,30 @@ serial_rtc_ingress_liveness_policy(run::Union{
     ArmedSerialRun,
     RunningSerialRun,
 }) = _prepared_serial_run(run).configuration.ingress_liveness
+
+serial_shutdown_policy(run::ConfiguredSerialRun) =
+    run.shutdown_policy
+serial_shutdown_policy(run::Union{
+    PreparedSerialRun,
+    ArmingSerialRun,
+    ArmedSerialRun,
+    RunningSerialRun,
+}) = _prepared_serial_run(run).configuration.shutdown_policy
+
+serial_shutdown_status(run::Union{
+    PreparedSerialRun,
+    ArmingSerialRun,
+    ArmedSerialRun,
+    RunningSerialRun,
+}) = _prepared_serial_run(run).state.shutdown.status
+
+serial_failure_accounting(run::Union{
+    PreparedSerialRun,
+    ArmingSerialRun,
+    ArmedSerialRun,
+    RunningSerialRun,
+}) = Lifecycle.run_failure_accounting(
+    _prepared_serial_run(run).failures)
 
 serial_rtc_ingress_liveness_accounting(run::Union{
     PreparedSerialRun,
@@ -634,7 +740,7 @@ end
 """
     configure_serial_run(command_bridge, acquisition_ports;
         arm_timeout_ns, optical_execution=SerialOpticalExecution(),
-        ingress_liveness=nothing)
+        ingress_liveness=nothing, shutdown_policy)
 
 Validate and freeze the exact event-loop command route, acquisition-completion
 ports, and relative arm deadline for one serial HIL topology. Runtime plant
@@ -646,7 +752,8 @@ function configure_serial_run(
     acquisition_ports::Tuple;
     arm_timeout_ns::Integer,
     optical_execution=SerialOpticalExecution(),
-    ingress_liveness=nothing)
+    ingress_liveness=nothing,
+    shutdown_policy::RunShutdownPolicy)
     execution = _validate_optical_execution(optical_execution)
     liveness = _validate_rtc_ingress_liveness(
         command_bridge, ingress_liveness)
@@ -667,6 +774,7 @@ function configure_serial_run(
         execution,
         lifecycle,
         liveness,
+        shutdown_policy,
         _SERIAL_CONSTRUCTION_TOKEN)
 end
 
@@ -691,6 +799,7 @@ function prepare_serial_run(configuration::ConfiguredSerialRun)
         publications,
         RTCIngressLivenessState(configuration.ingress_liveness),
         RunLifecycleState(configuration.lifecycle),
+        SerialShutdownState(length(publishers)),
         UInt64(0),
         UInt64(0),
         _SERIAL_CONSTRUCTION_TOKEN)
@@ -711,17 +820,24 @@ function prepare_serial_run(configuration::ConfiguredSerialRun)
         plant_event_loop_state(state.bridge),
         plant_event_loop_workspace(workspace.bridge),
         configuration.lifecycle.session,
+        configuration.shutdown_policy,
     )
+    failures = _execution_failure_coordinator(
+        execution,
+        configuration.lifecycle.session,
+        configuration.shutdown_policy)
     return PreparedSerialRun(
         configuration,
         publishers,
         state,
         workspace,
         execution,
+        failures,
         _SERIAL_CONSTRUCTION_TOKEN)
 end
 
 struct AcquisitionPortAccounting
+    acquisition::AcquisitionID
     descriptors::RingAccounting
     products::PayloadPoolAccounting
 end
@@ -731,6 +847,10 @@ Cold ownership snapshot for one serial run.
 
 `execution_owners` is `nothing` for the core serial oracle and a fixed
 `Memory{ExecutionOwnerAccounting}` snapshot for prepared HIL owners.
+After shutdown finalizes, every nonzero occupancy or nonfree ownership field
+identifies an explicit resource deficit. `execution_batch_active` reports a
+coordinator-held materialized optical batch that could not be safely
+abandoned before the drain deadline.
 """
 struct SerialRunAccounting{C,A<:Tuple,E}
     command_submissions::RingAccounting
@@ -740,6 +860,7 @@ struct SerialRunAccounting{C,A<:Tuple,E}
     command_dispositions::Int
     active_command_correlations::Int
     acquisitions::A
+    execution_batch_active::Bool
     execution_owners::E
 end
 
@@ -755,6 +876,7 @@ end
 @inline function _serial_acquisition_accounting(publishers::Tuple)
     publisher = first(publishers)
     accounting = AcquisitionPortAccounting(
+        publisher.id,
         ring_accounting(publisher.port.ring),
         acquisition_product_accounting(publisher.port))
     return (
@@ -779,6 +901,7 @@ function serial_run_accounting(run::PreparedSerialRun)
             command_disposition_workspace(workspace.bridge)),
         active_command_correlations(state.bridge),
         _serial_acquisition_accounting(run.publishers),
+        _execution_batch_active(run.execution),
         _execution_accounting(run.execution))
 end
 
@@ -804,7 +927,21 @@ function serial_run_is_quiescent(accounting::SerialRunAccounting)
         iszero(accounting.command_dispositions) &&
         iszero(accounting.active_command_correlations) &&
         _acquisitions_are_quiescent(accounting.acquisitions) &&
+        !accounting.execution_batch_active &&
         _execution_accounting_is_quiescent(
+            accounting.execution_owners)
+end
+
+function _serial_run_is_drained(accounting::SerialRunAccounting)
+    return accounting.command_submissions.occupancy == 0 &&
+        accounting.command_completions.occupancy == 0 &&
+        _pool_is_quiescent(accounting.command_credits) &&
+        _pool_is_quiescent(accounting.command_payloads) &&
+        iszero(accounting.command_dispositions) &&
+        iszero(accounting.active_command_correlations) &&
+        _acquisitions_are_quiescent(accounting.acquisitions) &&
+        !accounting.execution_batch_active &&
+        _execution_accounting_is_drained(
             accounting.execution_owners)
 end
 
@@ -923,6 +1060,10 @@ function arm_serial_run!(
                 attempt.prepared.execution, mapping),
             _SERIAL_CONSTRUCTION_TOKEN)
         _record_serial_failure!(failed, error)
+        while _progress_serial_shutdown!(failed) !=
+                SerialShutdownFinalized
+            yield()
+        end
         rethrow()
     end
     return ArmedSerialRun(
@@ -955,38 +1096,346 @@ function start_serial_run!(armed::ArmedSerialRun)
     return RunningSerialRun(armed, _SERIAL_CONSTRUCTION_TOKEN)
 end
 
-@inline function _stop_serial_run!(
+function _all_serial_shutdown_paths_closed(values::Memory{Bool})
+    @inbounds for value in values
+        value || return false
+    end
+    return true
+end
+
+@inline _close_serial_acquisition_completions!(
+    ::Tuple{},
+    ::SerialShutdownState,
+    ::Int) = nothing
+
+function _close_serial_acquisition_completions!(
+    publishers::Tuple,
+    shutdown::SerialShutdownState,
+    index::Int)
+    if !(@inbounds shutdown.acquisition_completion_closed[index])
+        close_acquisition_completion!(first(publishers).port)
+        @inbounds shutdown.acquisition_completion_closed[index] = true
+    end
+    _close_serial_acquisition_completions!(
+        Base.tail(publishers), shutdown, index + 1)
+    return nothing
+end
+
+function _begin_serial_shutdown_resources!(
+    armed::ArmedSerialRun,
+    stop_event::Union{Nothing,RunStopRequest,RunTerminalEvent},
+    observed_execution_ns::Int64)
+    run = armed.prepared
+    state = run.state
+    shutdown = state.shutdown
+    if shutdown.status == SerialShutdownInactive
+        shutdown.stop_event = stop_event
+        shutdown.status = SerialShutdownDraining
+        _begin_run_shutdown!(run.failures, observed_execution_ns)
+    end
+
+    if !shutdown.command_ingress_closed
+        close_command_ingress!(
+            command_submission_port(run.configuration.command_bridge))
+        shutdown.command_ingress_closed = true
+    end
+    _close_serial_acquisition_completions!(
+        run.publishers, shutdown, 1)
+    reject_pending_bridge_commands!(
+        run.configuration.command_bridge,
+        state.bridge,
+        run.workspace.bridge,
+        observed_execution_ns)
+
+    if !shutdown.execution_shutdown_begun
+        _begin_optical_execution_shutdown!(run.execution)
+        shutdown.execution_shutdown_begun = true
+    end
+    if shutdown.command_ingress_closed &&
+            _all_serial_shutdown_paths_closed(
+                shutdown.acquisition_completion_closed) &&
+            shutdown.execution_shutdown_begun
+        _acknowledge_run_stop!(run.failures, 1)
+    end
+    return shutdown.status
+end
+
+function _begin_serial_stop!(
     armed::ArmedSerialRun,
     event::Union{RunStopRequest,RunTerminalEvent})
+    state = armed.prepared.state
+    state.shutdown.status == SerialShutdownInactive ||
+        return state.shutdown.status
     current_execution_ns =
         _read_execution_clock(execution_clock(armed.timing))
     _validate_stop_event(
-        armed.prepared.state.lifecycle,
+        state.lifecycle,
         event,
         current_execution_ns)
-    accounting = serial_run_accounting(armed.prepared)
-    serial_run_is_quiescent(accounting) || throw(SerialRunError(
-        :serial_run, :ownership_not_quiescent,
-        "clean stop requires every descriptor, outcome, and payload lease to be accounted for"))
-    _execution_is_quiescent(armed.prepared.execution) ||
-        throw(SerialRunError(
-            :serial_run,
-            :execution_ownership_not_quiescent,
-            "clean stop requires every execution-owner handoff to be accounted for"))
-    _stop_optical_execution!(armed.prepared.execution)
-    _record_stop!(armed.prepared.state.lifecycle, event)
-    return serial_run_accounting(armed.prepared)
+    try
+        return _begin_serial_shutdown_resources!(
+            armed, event, current_execution_ns)
+    catch error
+        _record_serial_failure!(armed, error)
+        rethrow()
+    end
 end
 
-stop_serial_run!(
+begin_serial_stop!(
     armed::ArmedSerialRun,
     event::Union{RunStopRequest,RunTerminalEvent}) =
-    _stop_serial_run!(armed, event)
+    _begin_serial_stop!(armed, event)
 
-stop_serial_run!(
+begin_serial_stop!(
     running::RunningSerialRun,
     event::Union{RunStopRequest,RunTerminalEvent}) =
-    _stop_serial_run!(running.armed, event)
+    _begin_serial_stop!(running.armed, event)
+
+@inline function _command_return_paths_are_ready(
+    run::PreparedSerialRun)
+    bridge = run.configuration.command_bridge
+    submission = command_submission_port(bridge)
+    completion = command_completion_port(bridge)
+    return iszero(ring_accounting(completion.ring).occupancy) &&
+        _pool_is_quiescent(
+            _serial_command_payload_accounting(submission)) &&
+        _pool_is_quiescent(outcome_credit_accounting(submission))
+end
+
+@inline _progress_serial_acquisition_return_paths!(
+    ::Tuple{},
+    ::SerialShutdownState,
+    ::Int) = true
+
+function _progress_serial_acquisition_return_paths!(
+    publishers::Tuple,
+    shutdown::SerialShutdownState,
+    index::Int)
+    publisher = first(publishers)
+    if !(@inbounds shutdown.acquisition_returns_closed[index]) &&
+            iszero(ring_accounting(
+                publisher.port.ring).occupancy) &&
+            _pool_is_quiescent(
+                acquisition_product_accounting(publisher.port))
+        close_acquisition_return_path!(publisher.port)
+        @inbounds shutdown.acquisition_returns_closed[index] = true
+    end
+    return (
+        @inbounds(shutdown.acquisition_returns_closed[index]) &&
+        _progress_serial_acquisition_return_paths!(
+            Base.tail(publishers),
+            shutdown,
+            index + 1)
+    )
+end
+
+@inline _serial_acquisition_ownership_is_drained(
+    ::Tuple{}) = true
+
+@inline function _serial_acquisition_ownership_is_drained(
+    publishers::Tuple)
+    port = first(publishers).port
+    return iszero(ring_accounting(port.ring).occupancy) &&
+        _pool_is_quiescent(acquisition_product_accounting(port)) &&
+        _serial_acquisition_ownership_is_drained(
+            Base.tail(publishers))
+end
+
+function _serial_shutdown_ownership_is_drained(
+    run::PreparedSerialRun)
+    bridge = run.configuration.command_bridge
+    submission = command_submission_port(bridge)
+    completion = command_completion_port(bridge)
+    return (
+        iszero(ring_accounting(submission.ring).occupancy) &&
+        iszero(ring_accounting(completion.ring).occupancy) &&
+        _pool_is_quiescent(outcome_credit_accounting(submission)) &&
+        _pool_is_quiescent(
+            _serial_command_payload_accounting(submission)) &&
+        iszero(command_disposition_count(
+            command_disposition_workspace(run.workspace.bridge))) &&
+        iszero(active_command_correlations(run.state.bridge)) &&
+        _serial_acquisition_ownership_is_drained(run.publishers) &&
+        !_execution_batch_active(run.execution) &&
+        _execution_ownership_is_drained(run.execution)
+    )
+end
+
+function _progress_serial_shutdown_resources!(
+    armed::ArmedSerialRun,
+    observed_execution_ns::Int64)
+    run = armed.prepared
+    shutdown = run.state.shutdown
+    _begin_serial_shutdown_resources!(
+        armed, shutdown.stop_event, observed_execution_ns)
+    reclaim_serial_returns!(run)
+    execution_complete =
+        _progress_optical_execution_shutdown!(run.execution)
+    if execution_complete &&
+            _abandon_failed_optical_path_batch!(run.execution) &&
+            !shutdown.command_completion_closed
+        fail_pending_bridge_commands!(
+            run.configuration.command_bridge,
+            run.state.bridge,
+            run.workspace.bridge,
+            observed_execution_ns;
+            reason=CommandDispositionReason(:hil_run_shutdown))
+        reject_pending_bridge_commands!(
+            run.configuration.command_bridge,
+            run.state.bridge,
+            run.workspace.bridge,
+            observed_execution_ns)
+        close_command_completion!(
+            command_completion_port(
+                run.configuration.command_bridge))
+        shutdown.command_completion_closed = true
+    end
+    if shutdown.command_completion_closed &&
+            !shutdown.command_returns_closed &&
+            _command_return_paths_are_ready(run)
+        close_command_return_paths!(
+            command_completion_port(
+                run.configuration.command_bridge))
+        shutdown.command_returns_closed = true
+    end
+    acquisition_returns_closed =
+        _progress_serial_acquisition_return_paths!(
+            run.publishers,
+            shutdown,
+            1)
+    resources_closed =
+        shutdown.command_ingress_closed &&
+        shutdown.command_completion_closed &&
+        _all_serial_shutdown_paths_closed(
+            shutdown.acquisition_completion_closed) &&
+        shutdown.command_returns_closed &&
+        acquisition_returns_closed
+    return (
+        execution_complete &&
+        resources_closed &&
+        _run_shutdown_acknowledged(run.failures) &&
+        _serial_shutdown_ownership_is_drained(run)
+    )
+end
+
+function _finalize_serial_shutdown!(
+    armed::ArmedSerialRun,
+    drained::Bool)
+    run = armed.prepared
+    shutdown = run.state.shutdown
+    if drained
+        _finalize_optical_execution_shutdown!(run.execution)
+    else
+        _mark_optical_execution_failed!(run.execution)
+    end
+    _finalize_run_shutdown!(run.failures)
+    failure = Lifecycle.first_run_failure(run.failures)
+    if failure === nothing
+        event = shutdown.stop_event
+        event === nothing && throw(SerialRunError(
+            :serial_shutdown,
+            :missing_terminal_cause,
+            "a clean serial shutdown has no stop or terminal event"))
+        _record_stop!(run.state.lifecycle, event)
+    else
+        _fail_run!(
+            run.state.lifecycle,
+            RunFailureEvent(
+                Lifecycle.run_failure_kind(failure),
+                run_session(armed),
+                execution_clock_identity(armed.timing),
+                Lifecycle.run_failure_execution_ns(failure),
+                Lifecycle.run_failure_component(failure),
+                Lifecycle.run_failure_reason(failure)))
+    end
+    shutdown.status = SerialShutdownFinalized
+    return shutdown.status
+end
+
+function _publish_serial_shutdown_timeout!(
+    armed::ArmedSerialRun,
+    kind,
+    stage,
+    observed_execution_ns::Int64,
+    reason::Symbol)
+    return _publish_run_failure!(
+        armed.prepared.failures,
+        1,
+        kind,
+        stage,
+        observed_execution_ns,
+        :serial_shutdown,
+        reason)
+end
+
+function _progress_serial_shutdown!(
+    armed::ArmedSerialRun)
+    run = armed.prepared
+    shutdown = run.state.shutdown
+    shutdown.status == SerialShutdownFinalized &&
+        return SerialShutdownFinalized
+    shutdown.status == SerialShutdownDraining ||
+        throw(SerialRunError(
+            :serial_shutdown,
+            :shutdown_not_started,
+            "serial shutdown must begin before it can progress"))
+
+    local current_execution_ns::Int64
+    try
+        current_execution_ns =
+            _read_execution_clock(execution_clock(armed.timing))
+    catch error
+        shutdown.clock_unavailable = true
+        _publish_run_failure!(
+            run.failures,
+            1,
+            OwnerExceptionRunFailure,
+            CoordinatorFailureBoundary,
+            nothing,
+            :execution_clock,
+            :unavailable)
+        return _finalize_serial_shutdown!(armed, false)
+    end
+
+    drained = false
+    try
+        drained = _progress_serial_shutdown_resources!(
+            armed, current_execution_ns)
+    catch error
+        _publish_serial_coordinator_failure!(
+            armed, error, current_execution_ns)
+        _mark_optical_execution_failed!(run.execution)
+    end
+
+    timed_out = _record_acknowledgement_timeouts!(
+        run.failures, current_execution_ns)
+    if timed_out > 0
+        _publish_serial_shutdown_timeout!(
+            armed,
+            AcknowledgementTimeoutRunFailure,
+            ShutdownAcknowledgement,
+            current_execution_ns,
+            :acknowledgement_timeout)
+    end
+
+    if _run_shutdown_drain_expired!(
+        run.failures, current_execution_ns)
+        _publish_serial_shutdown_timeout!(
+            armed,
+            DrainTimeoutRunFailure,
+            ShutdownDrain,
+            current_execution_ns,
+            :drain_timeout)
+        return _finalize_serial_shutdown!(armed, false)
+    end
+    drained && return _finalize_serial_shutdown!(armed, true)
+    return SerialShutdownDraining
+end
+
+progress_serial_shutdown!(armed::ArmedSerialRun) =
+    _progress_serial_shutdown!(armed)
+progress_serial_shutdown!(running::RunningSerialRun) =
+    _progress_serial_shutdown!(running.armed)
 
 @noinline function _serial_publication_error(
     reason::Symbol,
@@ -1222,8 +1671,13 @@ function _publish_serial_products!(
         end
         lease = lease_ref[]
         destination = producer_product(publisher.port, lease)
-        _copy_serial_acquisition_products!(
-            destination, publisher.source)
+        try
+            _copy_serial_acquisition_products!(
+                destination, publisher.source)
+        catch
+            _abort_serial_product!(publisher.port, lease)
+            rethrow()
+        end
         completion = matching_acquisition_completion(
             publisher.port,
             StreamSequence(sequence),
@@ -1389,6 +1843,49 @@ returning.
 @inline _serial_failure_reason(error::SerialRunError) =
     error.reason
 
+@inline _serial_failure_kind(::Any) =
+    OwnerExceptionRunFailure
+
+@inline function _serial_failure_kind(error::SerialRunError)
+    error.component == :rtc_ingress_liveness &&
+        return IngressWatchdogRunFailure
+    error.reason in (
+        :acquisition_product_capacity,
+        :acquisition_publication_deadline,
+        :acquisition_publication_rejected,
+    ) && return ResourcePolicyRunFailure
+    return OwnerExceptionRunFailure
+end
+
+@inline function _serial_failure_kind(error::ExecutionOwnerError)
+    error.reason in (
+        :due_work_publication,
+        :owner_deadline_exceeded,
+    ) && return ResourcePolicyRunFailure
+    return OwnerExceptionRunFailure
+end
+
+function _publish_serial_coordinator_failure!(
+    armed::ArmedSerialRun,
+    error,
+    observed_execution_ns::Union{Nothing,Int64})
+    failures = armed.prepared.failures
+    if Lifecycle.first_run_failure(failures) === nothing
+        _publish_run_failure!(
+            failures,
+            1,
+            _serial_failure_kind(error),
+            CoordinatorFailureBoundary,
+            observed_execution_ns,
+            _serial_failure_component(error),
+            _serial_failure_reason(error))
+    end
+    # Freeze the first coordinator-observed record before a later timeout can
+    # publish into an earlier-numbered free slot.
+    Lifecycle.first_run_failure(failures)
+    return nothing
+end
+
 @noinline function _record_serial_failure!(
     armed::ArmedSerialRun,
     error)
@@ -1397,14 +1894,25 @@ returning.
     catch
         nothing
     end
-    event = RunFailureEvent(
-        run_session(armed),
-        execution_clock_identity(armed.timing),
-        observed_execution_ns,
-        _serial_failure_component(error),
-        _serial_failure_reason(error))
+    _publish_serial_coordinator_failure!(
+        armed, error, observed_execution_ns)
     _mark_optical_execution_failed!(armed.prepared.execution)
-    return _fail_run!(armed.prepared.state.lifecycle, event)
+    shutdown = armed.prepared.state.shutdown
+    if shutdown.status == SerialShutdownInactive
+        if observed_execution_ns === nothing
+            shutdown.clock_unavailable = true
+            observed_execution_ns =
+                execution_clock_origin_ns(armed.timing)
+        end
+        try
+            _begin_serial_shutdown_resources!(
+                armed, nothing, observed_execution_ns)
+        catch
+            # Preserve the original first-failure record. Partially completed
+            # closure remains visible to bounded progress/deficit accounting.
+        end
+    end
+    return Lifecycle.first_run_failure(armed.prepared.failures)
 end
 
 _record_serial_failure!(
@@ -1416,6 +1924,11 @@ function step_serial_run!(running::RunningSerialRun)
     run = running.armed.prepared
     state = run.state
     workspace = run.workspace
+    state.shutdown.status == SerialShutdownInactive ||
+        throw(SerialRunError(
+            :serial_shutdown,
+            :shutdown_in_progress,
+            "serial event processing cannot continue after the stop epoch"))
     _require_phase(state.lifecycle, RunRunning, :serial_step)
     try
         return _step_serial_run!(

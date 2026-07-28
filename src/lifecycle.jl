@@ -31,10 +31,26 @@ export terminal_event_plant_timestamp
 export terminal_event_execution_ns, terminal_event_reason
 export RunTerminationKind, RequestedRunStop
 export ConfiguredTerminalStop, ArmDeadlineExpired, AdapterReadinessFailed
-export RuntimeRunFailure
+export IngressWatchdogRunFailure, ResourcePolicyRunFailure
+export OwnerExceptionRunFailure, DeviceRunFailure
+export AcknowledgementTimeoutRunFailure, DrainTimeoutRunFailure
 export RunTermination, run_termination_kind
 export run_termination_execution_ns, run_termination_plant_timestamp
 export run_termination_component, run_termination_reason
+export RunShutdownPolicy
+export acknowledgement_timeout_ns, drain_timeout_ns
+export RunOwnerID, run_owner_component, run_owner_ordinal
+export RunFailureStage, CoordinatorFailureBoundary
+export OwnerBeforeDequeue, OwnerAfterDequeue
+export OwnerMaterialization, OwnerExecution, OwnerDeviceCompletion
+export OwnerCompletionPublication, ShutdownAcknowledgement
+export ShutdownDrain
+export RunFailureRecord, run_failure_kind, run_failure_stage
+export run_failure_owner, run_failure_execution_ns
+export run_failure_component, run_failure_reason
+export run_failure_work_sequence
+export RunOwnerFailureAccounting, RunFailureAccounting
+export run_failure_accounting, first_run_failure
 export RTCIngressLivenessPolicy
 export RTCIngressLivenessStatus, RTCIngressLivenessDisabled
 export RTCIngressLivenessDisarmed, RTCIngressLivenessActive
@@ -388,8 +404,23 @@ terminal_event_execution_ns(event::RunTerminalEvent) =
     event.observed_execution_ns
 terminal_event_reason(event::RunTerminalEvent) = event.reason
 
+"""Terminal category retained after a clean or failed run transition."""
+@enum RunTerminationKind::UInt8 begin
+    RequestedRunStop = 0x01
+    ConfiguredTerminalStop = 0x02
+    ArmDeadlineExpired = 0x03
+    AdapterReadinessFailed = 0x04
+    IngressWatchdogRunFailure = 0x05
+    ResourcePolicyRunFailure = 0x06
+    OwnerExceptionRunFailure = 0x07
+    DeviceRunFailure = 0x08
+    AcknowledgementTimeoutRunFailure = 0x09
+    DrainTimeoutRunFailure = 0x0a
+end
+
 """Compact runtime failure observed at an owner boundary."""
 struct RunFailureEvent
+    kind::RunTerminationKind
     session::RunSessionID
     execution_clock::ExecutionClockID
     observed_execution_ns::Union{Nothing,Int64}
@@ -397,6 +428,7 @@ struct RunFailureEvent
     reason::Symbol
 
     RunFailureEvent(
+        kind::RunTerminationKind,
         session::RunSessionID,
         execution_clock::ExecutionClockID,
         observed_execution_ns::Union{Nothing,Int64},
@@ -404,6 +436,7 @@ struct RunFailureEvent
         reason::Symbol,
         ::_LifecycleConstructionToken) =
         new(
+            kind,
             session,
             execution_clock,
             observed_execution_ns,
@@ -412,6 +445,7 @@ struct RunFailureEvent
 end
 
 function RunFailureEvent(
+    kind::RunTerminationKind,
     session::RunSessionID,
     execution_clock::ExecutionClockID,
     observed_execution_ns::Union{Nothing,Integer},
@@ -422,7 +456,19 @@ function RunFailureEvent(
             observed_execution_ns,
             :run_failure,
             "failure execution timestamp")
+    kind in (
+        IngressWatchdogRunFailure,
+        ResourcePolicyRunFailure,
+        OwnerExceptionRunFailure,
+        DeviceRunFailure,
+        AcknowledgementTimeoutRunFailure,
+        DrainTimeoutRunFailure,
+    ) || throw(RunLifecycleError(
+        :run_failure,
+        :invalid_failure_kind,
+        "run failure event requires a failure termination kind"))
     return RunFailureEvent(
+        kind,
         session,
         execution_clock,
         observed,
@@ -434,19 +480,11 @@ end
 run_session(event::RunFailureEvent) = event.session
 run_execution_clock_identity(event::RunFailureEvent) =
     event.execution_clock
+run_failure_kind(event::RunFailureEvent) = event.kind
 failure_event_execution_ns(event::RunFailureEvent) =
     event.observed_execution_ns
 failure_event_component(event::RunFailureEvent) = event.component
 failure_event_reason(event::RunFailureEvent) = event.reason
-
-"""Terminal category retained after a clean or failed run transition."""
-@enum RunTerminationKind::UInt8 begin
-    RequestedRunStop = 0x01
-    ConfiguredTerminalStop = 0x02
-    ArmDeadlineExpired = 0x03
-    AdapterReadinessFailed = 0x04
-    RuntimeRunFailure = 0x05
-end
 
 """Immutable cold-path terminal record for one run."""
 struct RunTermination
@@ -614,6 +652,7 @@ end
 end
 
 include("lifecycle/ingress_liveness.jl")
+include("lifecycle/failure_coordination.jl")
 
 function _begin_arm!(
     state::RunLifecycleState,
@@ -860,7 +899,7 @@ function _fail_run!(
             :event_before_arm,
             "failure observation predates arm completion or is separated from it by at least 2^63 nanoseconds")
     termination = RunTermination(
-        RuntimeRunFailure,
+        event.kind,
         state.session,
         event.execution_clock,
         event.observed_execution_ns,
@@ -880,5 +919,13 @@ public failure_event_execution_ns, failure_event_component
 public failure_event_reason
 public AbstractRTCIngressLivenessPolicy, NoRTCIngressLiveness
 public RTCIngressLivenessState
+public PreparedRunFailureCoordinator
+public _prepare_run_failure_coordinator
+public _begin_run_shutdown!, _publish_run_failure!
+public _observe_run_failures!, _acknowledge_run_stop!
+public _run_shutdown_requested, _run_shutdown_stop_epoch
+public _run_shutdown_acknowledged
+public _record_acknowledgement_timeouts!
+public _run_shutdown_drain_expired!, _finalize_run_shutdown!
 
 end

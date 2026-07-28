@@ -267,6 +267,7 @@ export OutcomeCreditUnavailable, AcquisitionMismatch
 export CoreAdmissionUnavailable
 export CommandEndpointMismatch
 export LeaseReturnUnavailable
+export RunNotAccepting
 export PortResult, port_status, port_rejection_reason, port_payload_status
 export AbstractPortFullPolicy, RetainProducerOnFull, DropNewestOnFull
 export ReservedFullIsInvariant, PortResourcePolicy
@@ -330,6 +331,7 @@ export command_processing_presentation
 export command_disposition_workspace, process_next_command!
 export publish_command_dispositions!, active_command_correlations
 export fail_pending_bridge_commands!
+export reject_pending_bridge_commands!
 export plant_event_loop_state, plant_event_loop_workspace
 export command_submission_port, command_completion_port
 export descriptor_accounting
