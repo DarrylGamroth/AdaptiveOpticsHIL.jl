@@ -1478,6 +1478,34 @@ function execute_gate8_warmup!(
     return nothing
 end
 
+function warm_required_overload_specialization!(
+    workload,
+    histogram_config,
+    contract)
+    warm_contract = deepcopy(contract)
+    warm_contract["overload_maximum_offered"] = 4_096
+    warm_contract["execution_owner_maximum_lateness_ns"] =
+        1_000_000
+    warm_contract["interval_ns"] = 1_000_000
+    warm_workload = workload_at_rate(
+        workload,
+        100_000;
+        preserve_capacity_time_headroom=true)
+    result = Operational.execute_required_overload(
+        warm_contract,
+        warm_workload,
+        histogram_config)
+    AdaptiveOpticsHIL.Lifecycle.run_failure_kind(
+        result.failure) ==
+        AdaptiveOpticsHIL.Lifecycle.ResourcePolicyRunFailure ||
+        error(
+            "required-overload warmup did not retain its resource-policy failure")
+    serial_ownership_is_drained(result.accounting) || error(
+        "required-overload warmup retained ownership")
+    GC.gc()
+    return nothing
+end
+
 function injected_failure_report(result, run_index)
     return Dict{String,Any}(
         "run" => run_index,
@@ -2222,6 +2250,12 @@ function gate8_main(arguments=ARGS)
     println("Gate 8: warming Agent-owner SystemNanoClock runtime")
     flush(stdout)
     execute_gate8_warmup!(
+        workload, histogram_config, contract)
+
+    println(
+        "Gate 8: warming required-overload failure/drain runtime")
+    flush(stdout)
+    warm_required_overload_specialization!(
         workload, histogram_config, contract)
 
     instrumentation_bytes =

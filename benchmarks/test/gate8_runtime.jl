@@ -166,6 +166,10 @@ end
 end
 
 @testset "Gate 8 bounded required overload" begin
+    warm_required_overload_specialization!(
+        GATE8_TEST_WORKLOAD,
+        GATE8_TEST_HISTOGRAM,
+        GATE8_TEST_CONTRACT)
     contract = deepcopy(GATE8_TEST_CONTRACT)
     contract["overload_maximum_offered"] = 4_096
     contract["execution_owner_maximum_lateness_ns"] = 1_000_000
@@ -184,6 +188,7 @@ end
         "ResourcePolicyRunFailure"
     @test report["ingress_closed"]
     @test report["accounting"]["ownership_drained"]
+    @test required_overload_gate(report, contract)["passed"]
 end
 
 @testset "Gate 8 injected execution-owner failure" begin

@@ -385,7 +385,6 @@ function finish_failed_run!(driver)
     wall_deadline_ns = time_ns() + UInt64(60_000_000_000)
     acknowledgement_wall_ns = UInt64(0)
     while true
-        drain_failure_adapter_products!(driver)
         status = progress_serial_shutdown!(driver.fixture.running)
         if iszero(acknowledgement_wall_ns)
             failure = serial_failure_accounting(
@@ -394,6 +393,7 @@ function finish_failed_run!(driver)
                 (acknowledgement_wall_ns = time_ns())
         end
         status == SerialShutdownFinalized && break
+        drain_failure_adapter_products!(driver)
         time_ns() <= wall_deadline_ns || error(
             "injected failure did not finish bounded shutdown")
         yield()
