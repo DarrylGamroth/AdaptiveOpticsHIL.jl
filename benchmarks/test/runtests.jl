@@ -94,6 +94,38 @@ function Harness.observe_boundary_step!(
     return nothing
 end
 
+mutable struct CatchupProgressObserver <:
+        Harness.AbstractBoundaryObserver
+    serviced_during_plant_event::Bool
+    idle_with_pending_primary::Bool
+end
+
+CatchupProgressObserver() =
+    CatchupProgressObserver(false, false)
+
+function Harness.observe_boundary_step!(
+    observer::CatchupProgressObserver,
+    driver,
+    result,
+    ::Int64,
+)
+    AdaptiveOpticsHIL.Serial.serial_step_status(result) ==
+        AdaptiveOpticsHIL.Serial.SerialPlantEventProcessed ||
+        return nothing
+    primary_occupancy =
+        AdaptiveOpticsHIL.Ports.descriptor_accounting(
+            driver.fixture.wfs_port).occupancy
+    if driver.phase == Harness.ControllerIdle &&
+            primary_occupancy > 0
+        observer.idle_with_pending_primary = true
+    end
+    if driver.phase == Harness.ControllerCommandSubmitted &&
+            driver.counters.commands_enqueued > 0
+        observer.serviced_during_plant_event = true
+    end
+    return nothing
+end
+
 @testset "Gate 4A benchmark contract" begin
     contract = TOML.parsefile(DEFAULT_CONTRACT)
     @test validate_contract(contract)
@@ -201,6 +233,36 @@ end
         crossing_result, crossing_config)
     @test crossing_observer.phase_after_crossing ==
         Harness.ControllerCommandSubmitted
+
+    catchup_clock = CachedNanoClock(0)
+    catchup_workload = Harness.Gate4AWorkloadConfig(
+        primary_product_capacity=4,
+        feedback_product_capacity=4,
+    )
+    catchup_config = Harness.BoundaryRunConfig(
+        samples=32,
+        checkpoint_stride=32,
+    )
+    catchup_observer = CatchupProgressObserver()
+    catchup_driver = Harness.prepare_boundary_driver(
+        catchup_clock,
+        catchup_workload,
+        catchup_config;
+        observer=catchup_observer,
+    )
+    Clocks.advance!(
+        catchup_clock,
+        catchup_workload.primary_product_capacity *
+            catchup_workload.primary_period_ns,
+    )
+    catchup_result =
+        Harness.execute_boundary_run!(catchup_driver)
+    @test Harness.validate_boundary_result(
+        catchup_result, catchup_config)
+    @test catchup_result.counters.command_responses ==
+        catchup_config.samples
+    @test catchup_observer.serviced_during_plant_event
+    @test !catchup_observer.idle_with_pending_primary
 
     @test Harness.measure_instrumentation_allocations(
         Harness.Gate4AWorkloadConfig(),

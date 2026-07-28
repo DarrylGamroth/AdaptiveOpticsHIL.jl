@@ -1151,13 +1151,11 @@ function execute_boundary_run!(driver::BoundaryDriver)
             _observe_feedback_products!(driver)
             !_science_consumer_is_stalled(driver) &&
                 _observe_science_products!(driver)
-            if status == SerialDeadlinePending
-                if driver.phase == ControllerIdle
-                    _observe_primary_product!(driver)
-                end
-                driver.phase == ControllerCommandPrepared &&
-                    _submit_prepared_command!(driver)
+            if driver.phase == ControllerIdle
+                _observe_primary_product!(driver)
             end
+            driver.phase == ControllerCommandPrepared &&
+                _submit_prepared_command!(driver)
         end
         reclaim_serial_returns!(driver.fixture.run)
         _update_maximum_occupancy!(driver)
