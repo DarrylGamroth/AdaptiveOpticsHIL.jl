@@ -2,6 +2,7 @@ import AdaptiveOpticsHIL
 using AdaptiveOpticsHIL.Lifecycle
 using AdaptiveOpticsHIL.Ownership
 using AdaptiveOpticsHIL.Ports
+using AdaptiveOpticsHIL.Ports: pending_command_receive_timestamp
 using AdaptiveOpticsHIL.Timing
 import AdaptiveOpticsSim
 
@@ -1135,8 +1136,16 @@ end
         bridge = prepare_command_bridge(ports, endpoint)
         state = CommandBridgeState(bridge)
         bridge_workspace = CommandBridgeWorkspace(bridge)
+        queued_before = descriptor_accounting(submission_port)
+        pending_timestamp = pending_command_receive_timestamp(
+            bridge, bridge_workspace)
+        @test pending_timestamp ==
+            PORT_TEST_PLANT.PlantTimestamp(1)
+        @test descriptor_accounting(submission_port) == queued_before
         process_next_command!(
             bridge, state, bridge_workspace, Int64(3))
+        @test pending_command_receive_timestamp(
+            bridge, bridge_workspace) === nothing
         @test PORT_TEST_PLANT.pending_command_count(
             command_endpoint_state(state)) == 1
         @test active_command_correlations(state) == 1

@@ -956,6 +956,29 @@ function _command_bridge_workspace(
         disposition_workspace, Ref{D}())
 end
 
+"""
+Return the canonical receive timestamp of the next transferred command without
+changing descriptor or payload ownership. `nothing` means that the submission
+path is empty or closed and drained.
+"""
+function pending_command_receive_timestamp(
+    bridge::PreparedCommandBridge,
+    workspace::CommandBridgeWorkspace,
+)
+    status = try_peek!(
+        workspace.descriptor_scratch,
+        bridge.submission.ring,
+    )
+    status == RingTransferSucceeded &&
+        return submission_timing(
+            workspace.descriptor_scratch[]).receive_timestamp
+    status in (RingEmpty, RingClosed) && return nothing
+    throw(PortError(
+        :command_bridge,
+        :invalid_submission_state,
+        "command submission peek returned an invalid ring status"))
+end
+
 function CommandBridgeState(
     bridge::PreparedCommandBridge{
         <:Any,<:Any,<:Any,<:_DirectCommandBridgeRoute};

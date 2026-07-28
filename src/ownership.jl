@@ -18,7 +18,7 @@ export RingStatus, RingTransferSucceeded, RingFull, RingEmpty, RingClosed
 export RingBatchResult, RingAccounting
 export SPSCLayoutContract, SPSCDescriptorRing
 export close_ring!, ring_accounting, ring_capacity, ring_is_closed
-export try_submit!, try_take!, try_take_batch!
+export try_submit!, try_peek!, try_take!, try_take_batch!
 export PayloadStatus
 export PayloadTransitionSucceeded, PayloadPoolExhausted
 export PayloadPoolClosed
@@ -207,7 +207,7 @@ Prepare fixed storage for `capacity` compact descriptors of concrete immutable
 type `T`. The type must use Julia's inline array representation; it may contain
 immutable references such as stable `Symbol`-backed identities. Exactly one
 logical producer may call `try_submit!` and `close_ring!`; exactly one logical
-consumer may call `try_take!` or `try_take_batch!`.
+consumer may call `try_peek!`, `try_take!`, or `try_take_batch!`.
 
 The owner restriction is stronger than task or thread identity: callers must
 not concurrently invoke one side from several tasks even if those tasks happen
@@ -396,6 +396,28 @@ function try_take!(
         _next_ring_slot(consumer_slot, ring.capacity)
     @atomic :release cursors.consumer_sequence =
         consumer_sequence + one(UInt64)
+    return RingTransferSucceeded
+end
+
+"""
+    try_peek!(output, ring)
+
+Copy the next descriptor into caller-owned `output` without transferring
+ownership or advancing the consumer sequence. Empty and closed results do not
+mutate `output`. Only the ring's single logical consumer may call this
+operation, and a successful peek may be followed by `try_take!` to transfer
+the same descriptor.
+"""
+function try_peek!(
+    output::Base.RefValue{T},
+    ring::SPSCDescriptorRing{T}) where {T}
+    cursors = ring.cursors
+    consumer_sequence = @atomic :monotonic cursors.consumer_sequence
+    _, status = _consumer_availability(cursors, consumer_sequence)
+    status == RingTransferSucceeded || return status
+
+    slot = _ring_slot_index(cursors.consumer_slot)
+    @inbounds output[] = ring.slots[slot]
     return RingTransferSucceeded
 end
 

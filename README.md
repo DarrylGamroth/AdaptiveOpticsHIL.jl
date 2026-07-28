@@ -45,6 +45,8 @@ foundation for command and acquisition ports:
 - a fixed-capacity SPSC ring for compact, concrete, immutable descriptors
 - explicit success, full, empty, and closed results with close-and-drain
   behavior
+- consumer-owned non-transferring inspection of the next descriptor when a
+  scheduler must choose work before taking ownership
 - release/acquire sequence publication with producer, consumer, and closure
   state isolated under a prepared 64- or 128-byte cache-line upper-bound
   contract
@@ -289,10 +291,19 @@ wall-clock state to AdaptiveOpticsSim.
 
 Each `step_serial_run!` call makes one bounded scheduling decision:
 
-- process at most one already-transferred command;
+- process at most one already-transferred command whose receive timestamp does
+  not follow the next plant event;
 - report the time remaining until the next plant event; or
 - process one complete plant timestamp, publish terminal command outcomes, and
   copy each newly complete acquisition into its prepared product pool.
+
+The coordinator non-consumingly compares the next command receive timestamp
+with the next plant event. A later command remains queue-owned while earlier
+optical events are processed, then transfers exactly once when it is
+chronologically next. An RTC adapter may therefore submit while the simulator
+is catching up without forcing the command to overtake already scheduled
+optical work or requiring the adapter to wait for a transient future-deadline
+gap.
 
 The step call never sleeps for a pending deadline, invokes callbacks, creates
 tasks, or chooses transport. The default serial executor starts no workers.

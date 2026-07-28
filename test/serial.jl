@@ -945,6 +945,8 @@ end
         AdaptiveOpticsHIL.Serial.SerialRunState, :lifecycle)
     @test Base.ispublic(AdaptiveOpticsHIL.Ports,
         :command_bridge_event_loop)
+    @test Base.ispublic(AdaptiveOpticsHIL.Ports,
+        :pending_command_receive_timestamp)
 
     @testset "Preparation, readiness, and nonblocking pacing" begin
         fixture = serial_test_fixture()
@@ -987,6 +989,41 @@ end
             SerialDeadlinePending
         @test serial_step_timestamp(pending) == PlantTimestamp(500_000)
         @test serial_step_time_until_ns(pending) == 500_000
+
+        chronological = serial_test_fixture(
+            session=RunSessionID(0x7c45))
+        @test serial_step_status(
+            step_serial_run!(chronological.running)) ==
+            SerialPlantEventProcessed
+        Clocks.advance!(chronological.clock, 1_000_000)
+        queue_serial_test_command!(
+            chronological;
+            receive_ns=1_000_000,
+            effective_ns=2_000_000,
+            advance_ns=0,
+        )
+        earlier_event =
+            step_serial_run!(chronological.running)
+        @test serial_step_status(earlier_event) ==
+            SerialPlantEventProcessed
+        @test serial_step_timestamp(earlier_event) ==
+            PlantTimestamp(500_000)
+        ordered_command =
+            step_serial_run!(chronological.running)
+        @test serial_step_status(ordered_command) ==
+            SerialCommandProcessed
+        @test serial_step_timestamp(ordered_command) ==
+            PlantTimestamp(1_000_000)
+        finish_serial_stop!(
+            chronological,
+            RunStopRequest(
+                run_session(chronological.run),
+                execution_clock_identity(
+                    chronological.armed.timing),
+                Clocks.time_nanos(chronological.clock);
+                reason=:chronological_command_test,
+            ),
+        )
 
         if SERIAL_TESTS_WITH_COVERAGE
             @test_skip "allocation assertions are disabled under coverage"

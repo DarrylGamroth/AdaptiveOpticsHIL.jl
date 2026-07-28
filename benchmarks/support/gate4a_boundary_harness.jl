@@ -412,14 +412,6 @@ end
     return elapsed
 end
 
-@inline function _signed_execution_delta_ns(
-    start_ns::Int64,
-    end_ns::Int64)
-    delta_bits =
-        reinterpret(UInt64, end_ns) - reinterpret(UInt64, start_ns)
-    return reinterpret(Int64, delta_bits)
-end
-
 @inline function _execution_elapsed_ns(driver::BoundaryDriver)
     mapping = driver.fixture.armed.timing
     return _elapsed_ns(
@@ -871,20 +863,17 @@ end
     return nothing
 end
 
-function _submit_prepared_command!(
-    driver::BoundaryDriver,
-    next_event_timestamp::PlantTimestamp)
+function _submit_prepared_command!(driver::BoundaryDriver)
     driver.phase == ControllerCommandPrepared || return false
     # A receive-time command must be strictly newer than the most recently
     # processed plant event. A real monotonic clock advances while the fake RTC
     # computes; deterministic replay represents that interval by one nanosecond.
     _advance_deterministic_controller_clock!(driver.fixture.clock)
     now = Clocks.time_nanos(driver.fixture.clock)
-    next_execution_ns =
-        _target_execution_ns(driver, next_event_timestamp)
-    _signed_execution_delta_ns(now, next_execution_ns) > 0 ||
-        return false
     receive = _plant_timestamp_at_execution(driver, now)
+    plant_nanoseconds(receive) >
+        driver.prepared_completion_timestamp_ns || error(
+            "command receive time did not follow its source product")
     submission_port =
         command_submission_port(driver.fixture.command_ports)
     claim_status =
@@ -1165,8 +1154,7 @@ function execute_boundary_run!(driver::BoundaryDriver)
                     _observe_primary_product!(driver)
                 end
                 driver.phase == ControllerCommandPrepared &&
-                    _submit_prepared_command!(
-                        driver, serial_step_timestamp(result))
+                    _submit_prepared_command!(driver)
             end
         end
         reclaim_serial_returns!(driver.fixture.run)

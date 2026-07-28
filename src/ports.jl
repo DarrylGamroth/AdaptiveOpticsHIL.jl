@@ -93,7 +93,7 @@ using ..Ownership: try_claim_payload!
 import ..Ownership: _lease_state_status, _payload_return_status
 import ..Ownership: _producer_submission_status, _publish_payload_return!
 import ..Ownership: _PAYLOAD_PRODUCER_OWNED
-import ..Ownership: try_submit!, try_take!
+import ..Ownership: try_peek!, try_submit!, try_take!
 
 include("ports/contracts.jl")
 include("ports/command.jl")
@@ -351,5 +351,6 @@ export acquisition_overload_policy
 
 public CommandSubmissionDescriptor
 public command_bridge_event_loop
+public pending_command_receive_timestamp
 
 end

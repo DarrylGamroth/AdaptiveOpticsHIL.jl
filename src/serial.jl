@@ -98,6 +98,7 @@ using ..Ports: command_processing_endpoint
 using ..Ports: command_processing_port_result, command_processing_stage
 using ..Ports: command_disposition_workspace, command_payload_accounting
 using ..Ports: command_submission_port, matching_acquisition_completion
+using ..Ports: pending_command_receive_timestamp
 using ..Ports: outcome_credit_accounting, plant_event_loop_state
 using ..Ports: plant_event_loop_workspace
 using ..Ports: port_status, process_next_command!
@@ -1780,6 +1781,21 @@ end
         "RTC-ingress-liveness observation exceeded its inclusive execution-clock deadline"))
 end
 
+@inline _command_precedes_plant_event(
+    ::Nothing,
+    ::Union{Nothing,PlantTimestamp},
+) = false
+
+@inline _command_precedes_plant_event(
+    ::PlantTimestamp,
+    ::Nothing,
+) = true
+
+@inline _command_precedes_plant_event(
+    command::PlantTimestamp,
+    event::PlantTimestamp,
+) = command <= event
+
 function _step_serial_run!(
     armed::ArmedSerialRun,
     state::SerialRunState,
@@ -1796,14 +1812,26 @@ function _step_serial_run!(
     liveness_status == RTCIngressLivenessExpired &&
         _fail_serial_ingress_liveness!(
             armed, state, workspace, publication_execution_ns)
-    command_result = process_next_command!(
-        configuration.command_bridge,
-        state.bridge,
-        workspace.bridge,
-        publication_execution_ns)
-    command_status = port_status(
-        command_processing_port_result(command_result))
-    if command_status == PortTransferSucceeded
+
+    event_state = plant_event_loop_state(state.bridge)
+    event_workspace = plant_event_loop_workspace(workspace.bridge)
+    timestamp = next_plant_event_timestamp(
+        configuration.event_loop, event_state, event_workspace)
+    command_timestamp = pending_command_receive_timestamp(
+        configuration.command_bridge, workspace.bridge)
+    if _command_precedes_plant_event(
+            command_timestamp, timestamp)
+        command_result = process_next_command!(
+            configuration.command_bridge,
+            state.bridge,
+            workspace.bridge,
+            publication_execution_ns)
+        command_status = port_status(
+            command_processing_port_result(command_result))
+        command_status == PortTransferSucceeded ||
+            _serial_publication_error(
+                :command_processing,
+                "the command selected by the serial scheduler was not transferred")
         admission_execution_ns =
             _read_execution_clock(execution_clock(armed.timing))
         if command_processing_stage(command_result) ==
@@ -1827,15 +1855,7 @@ function _step_serial_run!(
         return SerialStepResult(
             SerialCommandProcessed, timestamp, Int64(0))
     end
-    command_status in (PortEmpty, PortClosed) ||
-        _serial_publication_error(
-            :command_processing,
-            "the command bridge returned an invalid processing status")
 
-    event_state = plant_event_loop_state(state.bridge)
-    event_workspace = plant_event_loop_workspace(workspace.bridge)
-    timestamp = next_plant_event_timestamp(
-        configuration.event_loop, event_state, event_workspace)
     timestamp === nothing && return SerialStepResult(
         SerialEventLoopComplete, nothing, Int64(0))
     time_until_ns = execution_time_until_ns(armed.timing, timestamp)

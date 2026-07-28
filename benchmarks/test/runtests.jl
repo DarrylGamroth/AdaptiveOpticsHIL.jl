@@ -46,6 +46,54 @@ function deterministic_histogram_signature(result)
     )
 end
 
+mutable struct DeadlineCrossingObserver{
+    C<:Clocks.CachedNanoClock,
+} <: Harness.AbstractBoundaryObserver
+    clock::C
+    delay_ns::Int64
+    crossed::Bool
+    phase_after_crossing::Union{
+        Nothing,
+        Harness.ControllerPhase,
+    }
+end
+
+DeadlineCrossingObserver(
+    clock::Clocks.CachedNanoClock,
+    delay_ns::Integer,
+) = DeadlineCrossingObserver(
+    clock,
+    Int64(delay_ns),
+    false,
+    nothing,
+)
+
+function Harness.observe_primary_product!(
+    observer::DeadlineCrossingObserver,
+    ::UInt64,
+    ::Int64,
+    ::Int64,
+    ::Int64,
+    ::Any,
+)
+    observer.crossed && return nothing
+    Clocks.advance!(observer.clock, observer.delay_ns)
+    observer.crossed = true
+    return nothing
+end
+
+function Harness.observe_boundary_step!(
+    observer::DeadlineCrossingObserver,
+    driver,
+    ::Any,
+    ::Int64,
+)
+    observer.crossed || return nothing
+    observer.phase_after_crossing === nothing || return nothing
+    observer.phase_after_crossing = driver.phase
+    return nothing
+end
+
 @testset "Gate 4A benchmark contract" begin
     contract = TOML.parsefile(DEFAULT_CONTRACT)
     @test validate_contract(contract)
@@ -130,6 +178,29 @@ end
         unpaced_result.accounting)
     @test serial_ownership_is_drained(
         unpaced_result.accounting)
+
+    crossing_clock = CachedNanoClock(0)
+    crossing_workload = Harness.Gate4AWorkloadConfig()
+    crossing_observer = DeadlineCrossingObserver(
+        crossing_clock,
+        2 * crossing_workload.primary_period_ns,
+    )
+    crossing_config = Harness.BoundaryRunConfig(
+        samples=32,
+        checkpoint_stride=32,
+    )
+    crossing_driver = Harness.prepare_boundary_driver(
+        crossing_clock,
+        crossing_workload,
+        crossing_config;
+        observer=crossing_observer,
+    )
+    crossing_result =
+        Harness.execute_boundary_run!(crossing_driver)
+    @test Harness.validate_boundary_result(
+        crossing_result, crossing_config)
+    @test crossing_observer.phase_after_crossing ==
+        Harness.ControllerCommandSubmitted
 
     @test Harness.measure_instrumentation_allocations(
         Harness.Gate4AWorkloadConfig(),
