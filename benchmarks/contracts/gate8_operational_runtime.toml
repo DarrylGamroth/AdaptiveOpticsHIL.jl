@@ -14,6 +14,7 @@ execution_owner_maximum_lateness_ns = 5000000
 arm_timeout_ns = 5000000000
 
 correctness_frames = 1024
+compilation_coverage_frames = 2
 warmup_frames = 5000
 baseline_runs = 3
 baseline_samples_per_run = 20000

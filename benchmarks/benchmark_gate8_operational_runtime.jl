@@ -29,6 +29,7 @@ const GATE8_FROZEN_CONTRACT_VALUES = (
     "execution_owner_maximum_lateness_ns" => 5_000_000,
     "arm_timeout_ns" => 5_000_000_000,
     "correctness_frames" => 1_024,
+    "compilation_coverage_frames" => 2,
     "warmup_frames" => 5_000,
     "baseline_runs" => 3,
     "baseline_samples_per_run" => 20_000,
@@ -250,6 +251,15 @@ function validate_gate8_contract(contract)
         "the frozen science-path optical sample rate is 1 kHz")
     workload["science_period_ns"] == 2_000_000 || error(
         "the frozen science product rate is 500 Hz")
+    compilation_coverage_horizon_ns =
+        workload["primary_exposure_ns"] +
+        (contract["compilation_coverage_frames"] - 1) *
+            workload["primary_period_ns"]
+    compilation_coverage_horizon_ns >= max(
+        workload["feedback_phase_ns"] +
+            workload["feedback_exposure_ns"],
+        workload["science_exposure_ns"]) || error(
+            "the compilation fixture does not reach every acquisition stream")
     workload["command_payload_pool_capacity"] ==
         workload["command_submission_capacity"] ==
         workload["command_completion_capacity"] || error(
@@ -891,6 +901,15 @@ function operational_policy_manifest(contract, workload)
                     "execution_owner_maximum_lateness_ns"],
             "batch_observation" =>
                 "per-interval completed path-batch and owner work counters"),
+        "compilation_hygiene" => Dict{String,Any}(
+            "uniformly_scaled_primary_rate_hz" => 0.25,
+            "coverage_primary_products" =>
+                contract["compilation_coverage_frames"],
+            "coverage_goal" =>
+                "exercise every slower acquisition stream before the production-deadline warmup",
+            "maximum_lateness_ns" => 600_000_000_000,
+            "explicit_gc_before_production_warmup" => true,
+            "recorded_as_evidence" => false),
         "cpu_admission" => Dict{String,Any}(
             "cpu_context_count" => configured_contexts,
             "julia_thread_count" =>
@@ -1237,6 +1256,11 @@ function execute_gate8_warmup!(
     one_frame_config = Harness.BoundaryRunConfig(
         samples=1,
         checkpoint_stride=1)
+    compilation_coverage_frames =
+        contract["compilation_coverage_frames"]
+    compilation_coverage_config = Harness.BoundaryRunConfig(
+        samples=compilation_coverage_frames,
+        checkpoint_stride=compilation_coverage_frames)
     deterministic_execution =
         Operational.deterministic_execution_configuration(
             contract)
@@ -1268,7 +1292,7 @@ function execute_gate8_warmup!(
         driver = Operational.prepare_driver(
             Clocks.SystemNanoClock(),
             compilation_workload,
-            one_frame_config,
+            compilation_coverage_config,
             compilation_histogram_config,
             compilation_execution;
             observer)
@@ -1276,7 +1300,7 @@ function execute_gate8_warmup!(
         Operational.execute_run(
             Clocks.SystemNanoClock(),
             compilation_workload,
-            one_frame_config,
+            compilation_coverage_config,
             compilation_histogram_config,
             compilation_execution;
             observer=Operational.OperationalIntervalObserver(
@@ -1290,6 +1314,7 @@ function execute_gate8_warmup!(
             observer=Operational.OperationalIntervalObserver(
                 4, contract["interval_ns"]))
     end
+    GC.gc()
     run_config = Harness.BoundaryRunConfig(
         samples=contract["warmup_frames"],
         checkpoint_stride=contract["warmup_frames"])

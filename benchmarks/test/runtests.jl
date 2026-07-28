@@ -158,6 +158,12 @@ end
     @test_throws ErrorException validate_gate8_contract(
         invalid_science_capacity)
 
+    incomplete_compilation_coverage = deepcopy(contract)
+    incomplete_compilation_coverage[
+        "compilation_coverage_frames"] = 1
+    @test_throws ErrorException validate_gate8_contract(
+        incomplete_compilation_coverage)
+
     short_target = deepcopy(contract)
     short_target["target_samples_per_run"] =
         contract["minimum_samples_for_p99_9"] - 1
