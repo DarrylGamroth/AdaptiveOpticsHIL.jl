@@ -380,6 +380,10 @@ RTC-process latency, accelerator execution, full optical propagation, and
 instrument-scale capacity are explicitly excluded. The frozen protocol and
 claim limits are maintained in
 [Gate 8.9 issue #25](https://github.com/DarrylGamroth/AdaptiveOpticsHIL.jl/issues/25).
+The selected low-tail candidate assigns each owner to a distinct Julia thread
+and uses `Agent.BusySpinIdleStrategy` for owner and coordinator barrier waits.
+It consumes CPU continuously while idle and carries no OS-affinity, isolation,
+real-time scheduling, or ThreadPinning claim.
 
 CI runs the short benchmark-contract suite plus a focused four-thread Gate 8.9
 runtime smoke. Durable evidence is generated deliberately from a clean

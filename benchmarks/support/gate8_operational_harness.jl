@@ -68,7 +68,7 @@ Gate8FailureControl() = Gate8FailureControl(
 struct Gate8FailureIdleStrategy <: Agent.IdleStrategy
     control::Gate8FailureControl
     coordinator_task_id::UInt
-    yielding::Agent.YieldingIdleStrategy
+    busy_spin::Agent.BusySpinIdleStrategy
 end
 
 struct Gate8FailureIdleStrategyFactory
@@ -89,7 +89,7 @@ function (factory::Gate8FailureIdleStrategyFactory)()
     return Gate8FailureIdleStrategy(
         factory.control,
         factory.coordinator_task_id,
-        Agent.YieldingIdleStrategy(),
+        Agent.BusySpinIdleStrategy(),
     )
 end
 
@@ -104,11 +104,11 @@ function Agent.idle(strategy::Gate8FailureIdleStrategy)
         throw(Gate8InjectedOwnerFailure(
             strategy.control.trigger_batch_sequence[]))
     end
-    return Agent.idle(strategy.yielding)
+    return Agent.idle(strategy.busy_spin)
 end
 
 Agent.reset(strategy::Gate8FailureIdleStrategy) =
-    Agent.reset(strategy.yielding)
+    Agent.reset(strategy.busy_spin)
 
 struct Gate8FailureTriggerObserver <:
     Boundary.AbstractBoundaryObserver
@@ -230,7 +230,7 @@ function gate8_owner_thread_ids(contract)
 end
 
 gate8_owner_idle_strategy_factory(::Any) =
-    Agent.YieldingIdleStrategy
+    Agent.BusySpinIdleStrategy
 
 agent_execution_configuration(contract) =
     execution_owner_configuration(

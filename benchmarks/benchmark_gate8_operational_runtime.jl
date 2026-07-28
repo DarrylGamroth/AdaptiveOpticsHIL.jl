@@ -26,7 +26,7 @@ const GATE8_FROZEN_CONTRACT_VALUES = (
     "execution_owner_count" => 2,
     "execution_owner_ring_capacity" => 8,
     "execution_owner_idle_strategy" =>
-        "Agent.YieldingIdleStrategy",
+        "Agent.BusySpinIdleStrategy",
     "execution_owner_placement" =>
         "unique Julia default-pool threads; no OS affinity",
     "execution_owner_maximum_lateness_ns" => 50_000_000,
@@ -184,8 +184,8 @@ function validate_gate8_contract(contract)
     contract["execution_owner_ring_capacity"] == 8 || error(
         "the frozen Gate 8 owner-ring capacity is eight")
     contract["execution_owner_idle_strategy"] ==
-        "Agent.YieldingIdleStrategy" || error(
-        "the Gate 8 candidate requires Agent.YieldingIdleStrategy")
+        "Agent.BusySpinIdleStrategy" || error(
+        "the Gate 8 candidate requires Agent.BusySpinIdleStrategy")
     contract["execution_owner_placement"] ==
         "unique Julia default-pool threads; no OS affinity" || error(
         "the Gate 8 Agent candidate requires explicit Julia-thread assignment")
