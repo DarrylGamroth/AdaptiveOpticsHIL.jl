@@ -46,6 +46,31 @@ end
         state, endpoint, clock, observed_execution_ns)
 end
 
+@inline function failure_publication_allocations!(
+    coordinator,
+    record)
+    return @allocated HIL_LIFECYCLE._publish_run_failure!(
+        coordinator, 1, record)
+end
+
+@inline function failure_shutdown_allocations!(
+    coordinator,
+    record)
+    return @allocated begin
+        HIL_LIFECYCLE._publish_run_failure!(
+            coordinator, 1, record)
+        first_run_failure(coordinator)
+        HIL_LIFECYCLE._begin_run_shutdown!(coordinator, 100)
+        HIL_LIFECYCLE._run_shutdown_requested(coordinator)
+        HIL_LIFECYCLE._acknowledge_run_stop!(coordinator, 1)
+        HIL_LIFECYCLE._run_shutdown_acknowledged(coordinator)
+        HIL_LIFECYCLE._record_acknowledgement_timeouts!(
+            coordinator, 110)
+        HIL_LIFECYCLE._run_shutdown_drain_expired!(
+            coordinator, 120)
+    end
+end
+
 @testset "Operational run lifecycle" begin
     @test Base.isexported(AdaptiveOpticsHIL, :Lifecycle)
     @test !Base.isexported(
@@ -147,6 +172,7 @@ end
             reason=Symbol(""))
 
         failure = RunFailureEvent(
+            OwnerExceptionRunFailure,
             session,
             LIFECYCLE_TEST_CLOCK,
             Int32(11),
@@ -155,10 +181,13 @@ end
         @test run_session(failure) == session
         @test run_execution_clock_identity(failure) ==
             LIFECYCLE_TEST_CLOCK
+        @test run_failure_kind(failure) ==
+            OwnerExceptionRunFailure
         @test failure_event_execution_ns(failure) == 11
         @test failure_event_component(failure) == :serial_owner
         @test failure_event_reason(failure) == :injected
         unavailable_time = RunFailureEvent(
+            OwnerExceptionRunFailure,
             session,
             LIFECYCLE_TEST_CLOCK,
             nothing,
@@ -166,18 +195,21 @@ end
             :unavailable)
         @test failure_event_execution_ns(unavailable_time) === nothing
         @test_throws RunLifecycleError RunFailureEvent(
+            OwnerExceptionRunFailure,
             session,
             LIFECYCLE_TEST_CLOCK,
             false,
             :owner,
             :failed)
         @test_throws RunLifecycleError RunFailureEvent(
+            OwnerExceptionRunFailure,
             session,
             LIFECYCLE_TEST_CLOCK,
             11,
             Symbol(""),
             :failed)
         @test_throws RunLifecycleError RunFailureEvent(
+            OwnerExceptionRunFailure,
             session,
             LIFECYCLE_TEST_CLOCK,
             11,
@@ -190,6 +222,263 @@ end
         @test Base.allocatedinline(RunTerminalEvent)
         @test Base.allocatedinline(RunFailureEvent)
         @test Base.allocatedinline(RunTermination)
+    end
+
+    @testset "Prepared first-failure and acknowledgement coordination" begin
+        session = RunSessionID(411)
+        policy = RunShutdownPolicy(
+            acknowledgement_timeout_ns=10,
+            drain_timeout_ns=20)
+        @test acknowledgement_timeout_ns(policy) == 10
+        @test drain_timeout_ns(policy) == 20
+        @test_throws RunLifecycleError RunShutdownPolicy(
+            acknowledgement_timeout_ns=false,
+            drain_timeout_ns=20)
+        @test_throws RunLifecycleError RunShutdownPolicy(
+            acknowledgement_timeout_ns=0,
+            drain_timeout_ns=20)
+        @test_throws RunLifecycleError RunShutdownPolicy(
+            acknowledgement_timeout_ns=10,
+            drain_timeout_ns=big(typemax(Int64)) + 1)
+
+        owners = Memory{RunOwnerID}(undef, 3)
+        owners[1] = RunOwnerID(:serial_coordinator, 1)
+        owners[2] = RunOwnerID(:path_execution_owner, 1)
+        owners[3] = RunOwnerID(:device_submission_owner, 2)
+        @test run_owner_component(owners[2]) ==
+            :path_execution_owner
+        @test run_owner_ordinal(owners[3]) == 2
+        @test isequal(
+            owners[2], RunOwnerID(:path_execution_owner, 1))
+        @test hash(owners[2]) ==
+            hash(RunOwnerID(:path_execution_owner, 1))
+        @test sprint(show, owners[2]) ==
+            "RunOwnerID(:path_execution_owner, 1)"
+        @test_throws RunLifecycleError RunOwnerID(Symbol(""), 1)
+        @test_throws RunLifecycleError RunOwnerID(:owner, false)
+        @test_throws RunLifecycleError RunOwnerID(:owner, 0)
+
+        coordinator =
+            HIL_LIFECYCLE._prepare_run_failure_coordinator(
+                session, policy, owners)
+        @test HIL_LIFECYCLE._run_failure_owner_count(
+            coordinator) == 3
+        prepared_coordinator_owner = owners[1]
+        owners[1] = RunOwnerID(:mutated_input_owner, 1)
+        @test HIL_LIFECYCLE._run_failure_owner(
+            coordinator, 1) == prepared_coordinator_owner
+        owners[1] = prepared_coordinator_owner
+        @test_throws RunLifecycleError begin
+            HIL_LIFECYCLE._prepare_run_failure_coordinator(
+                session,
+                policy,
+                Memory{RunOwnerID}(undef, 0))
+        end
+        duplicate_owners = Memory{RunOwnerID}(undef, 2)
+        duplicate_owners[1] = owners[1]
+        duplicate_owners[2] = owners[1]
+        @test_throws RunLifecycleError begin
+            HIL_LIFECYCLE._prepare_run_failure_coordinator(
+                session, policy, duplicate_owners)
+        end
+        owner_failure = ArgumentError("owner failure")
+        record = RunFailureRecord(
+            DeviceRunFailure,
+            session,
+            owners[3],
+            OwnerDeviceCompletion,
+            nothing,
+            :execution_owner,
+            :device_failure;
+            work_sequence=7)
+        @test Base.allocatedinline(RunFailureRecord)
+        @test run_failure_kind(record) == DeviceRunFailure
+        @test run_session(record) == session
+        @test run_failure_owner(record) == owners[3]
+        @test run_failure_stage(record) == OwnerDeviceCompletion
+        @test run_failure_execution_ns(record) === nothing
+        @test run_failure_component(record) == :execution_owner
+        @test run_failure_reason(record) == :device_failure
+        @test run_failure_work_sequence(record) == 7
+        @test !applicable(
+            RunFailureRecord,
+            RequestedRunStop,
+            session,
+            owners[3],
+            OwnerExecution,
+            Int64(1),
+            :owner,
+            :failure,
+            UInt64(7))
+        @test_throws RunLifecycleError RunFailureRecord(
+            RequestedRunStop,
+            session,
+            owners[3],
+            OwnerExecution,
+            1,
+            :owner,
+            :failure)
+        @test_throws RunLifecycleError RunFailureRecord(
+            OwnerExceptionRunFailure,
+            session,
+            owners[3],
+            OwnerExecution,
+            1,
+            :owner,
+            :failure;
+            work_sequence=false)
+        stale_record = RunFailureRecord(
+            DeviceRunFailure,
+            RunSessionID(999),
+            owners[3],
+            OwnerDeviceCompletion,
+            nothing,
+            :execution_owner,
+            :stale_session)
+        @test_throws RunLifecycleError begin
+            HIL_LIFECYCLE._publish_run_failure!(
+                coordinator, 3, stale_record)
+        end
+        wrong_owner_record = RunFailureRecord(
+            DeviceRunFailure,
+            session,
+            owners[2],
+            OwnerDeviceCompletion,
+            nothing,
+            :execution_owner,
+            :wrong_owner)
+        @test_throws RunLifecycleError begin
+            HIL_LIFECYCLE._publish_run_failure!(
+                coordinator, 3, wrong_owner_record)
+        end
+        @test_throws RunLifecycleError begin
+            HIL_LIFECYCLE._publish_run_failure!(
+                coordinator, 0, record)
+        end
+
+        @test HIL_LIFECYCLE._publish_run_failure!(
+            coordinator, 3, record)
+        @test first_run_failure(coordinator) == record
+        earlier_slot_record = RunFailureRecord(
+            OwnerExceptionRunFailure,
+            session,
+            owners[2],
+            OwnerExecution,
+            99,
+            :execution_owner,
+            :later_observation)
+        @test HIL_LIFECYCLE._publish_run_failure!(
+            coordinator, 2, earlier_slot_record)
+        @test first_run_failure(coordinator) == record
+        @test !HIL_LIFECYCLE._publish_run_failure!(
+            coordinator, 3, record)
+
+        @test HIL_LIFECYCLE._begin_run_shutdown!(
+            coordinator, 100) == 1
+        @test HIL_LIFECYCLE._begin_run_shutdown!(
+            coordinator, 101) == 1
+        @test HIL_LIFECYCLE._acknowledge_run_stop!(
+            coordinator, 1)
+        @test HIL_LIFECYCLE._acknowledge_run_stop!(
+            coordinator, 2)
+        @test HIL_LIFECYCLE._record_acknowledgement_timeouts!(
+            coordinator, 110) == 0
+        @test HIL_LIFECYCLE._record_acknowledgement_timeouts!(
+            coordinator, 111) == 1
+        @test HIL_LIFECYCLE._acknowledge_run_stop!(
+            coordinator, 3)
+        @test HIL_LIFECYCLE._run_shutdown_acknowledged(
+            coordinator)
+        @test !HIL_LIFECYCLE._run_shutdown_drain_expired!(
+            coordinator, 120)
+        @test HIL_LIFECYCLE._run_shutdown_drain_expired!(
+            coordinator, 121)
+
+        accounting = run_failure_accounting(coordinator)
+        @test accounting.stop_epoch == 1
+        @test accounting.started_execution_ns == 100
+        @test accounting.acknowledgement_deadline_execution_ns ==
+            110
+        @test accounting.drain_deadline_execution_ns == 120
+        @test accounting.first_failure == record
+        @test length(accounting.owners) == 3
+        @test accounting.owners[3].failure == record
+        @test accounting.owners[3].acknowledged
+        @test accounting.owners[3].acknowledgement_timed_out
+        @test accounting.drain_timed_out
+
+        concurrent_owners = Memory{RunOwnerID}(undef, 3)
+        concurrent_owners[1] = RunOwnerID(:serial_coordinator, 1)
+        concurrent_owners[2] = RunOwnerID(:path_execution_owner, 1)
+        concurrent_owners[3] = RunOwnerID(:device_submission_owner, 1)
+        concurrent = HIL_LIFECYCLE._prepare_run_failure_coordinator(
+            RunSessionID(412), policy, concurrent_owners)
+        concurrent_records = Memory{RunFailureRecord}(undef, 3)
+        @inbounds for slot in eachindex(concurrent_records)
+            concurrent_records[slot] = RunFailureRecord(
+                OwnerExceptionRunFailure,
+                RunSessionID(412),
+                concurrent_owners[slot],
+                OwnerExecution,
+                100 + slot,
+                :injected_owner,
+                Symbol(:failure_, slot))
+        end
+        tasks = map(eachindex(concurrent_records)) do slot
+            Threads.@spawn HIL_LIFECYCLE._publish_run_failure!(
+                concurrent, slot, concurrent_records[slot])
+        end
+        @test all(fetch, tasks)
+        @test first_run_failure(concurrent) ==
+            concurrent_records[1]
+        concurrent_accounting =
+            run_failure_accounting(concurrent)
+        @test all(
+            owner -> owner.failure !== nothing,
+            concurrent_accounting.owners)
+
+        if LIFECYCLE_TESTS_WITH_COVERAGE
+            @test_skip "failure-publication allocation gate disabled under coverage instrumentation"
+        else
+            warm_owners = Memory{RunOwnerID}(undef, 1)
+            warm_owners[1] = RunOwnerID(:serial_coordinator, 1)
+            warm = HIL_LIFECYCLE._prepare_run_failure_coordinator(
+                session, policy, warm_owners)
+            measured = HIL_LIFECYCLE._prepare_run_failure_coordinator(
+                session, policy, copy(warm_owners))
+            coordinator_record = RunFailureRecord(
+                OwnerExceptionRunFailure,
+                session,
+                warm_owners[1],
+                CoordinatorFailureBoundary,
+                100,
+                :serial_coordinator,
+                :injected)
+            failure_publication_allocations!(
+                warm, coordinator_record)
+            @test @inferred(
+                HIL_LIFECYCLE._publish_run_failure!(
+                    measured,
+                    1,
+                    coordinator_record)) == true
+            allocation_measured =
+                HIL_LIFECYCLE._prepare_run_failure_coordinator(
+                    session, policy, copy(warm_owners))
+            @test failure_publication_allocations!(
+                allocation_measured,
+                coordinator_record) == 0
+
+            warm_shutdown =
+                HIL_LIFECYCLE._prepare_run_failure_coordinator(
+                    session, policy, copy(warm_owners))
+            measured_shutdown =
+                HIL_LIFECYCLE._prepare_run_failure_coordinator(
+                    session, policy, copy(warm_owners))
+            failure_shutdown_allocations!(
+                warm_shutdown, coordinator_record)
+            @test failure_shutdown_allocations!(
+                measured_shutdown, coordinator_record) == 0
+        end
     end
 
     @testset "Deterministic transition matrix and exact arm boundary" begin
@@ -660,6 +949,7 @@ end
             HIL_LIFECYCLE._fail_run!(
                 runtime_state,
                 RunFailureEvent(
+                    OwnerExceptionRunFailure,
                     RunSessionID(51),
                     LIFECYCLE_OTHER_CLOCK,
                     50,
@@ -672,6 +962,7 @@ end
         runtime_failure = HIL_LIFECYCLE._fail_run!(
             runtime_state,
             RunFailureEvent(
+                OwnerExceptionRunFailure,
                 RunSessionID(51),
                 LIFECYCLE_TEST_CLOCK,
                 nothing,
@@ -679,7 +970,7 @@ end
                 :injected))
         @test run_phase(runtime_state) == RunFailed
         @test run_termination_kind(runtime_failure) ==
-            RuntimeRunFailure
+            OwnerExceptionRunFailure
         @test run_termination_execution_ns(runtime_failure) === nothing
         @test run_termination_component(runtime_failure) == :cpu_owner
         @test run_termination_reason(runtime_failure) == :injected
@@ -688,6 +979,7 @@ end
             HIL_LIFECYCLE._fail_run!(
                 runtime_state,
                 RunFailureEvent(
+                    OwnerExceptionRunFailure,
                     RunSessionID(51),
                     LIFECYCLE_TEST_CLOCK,
                     51,

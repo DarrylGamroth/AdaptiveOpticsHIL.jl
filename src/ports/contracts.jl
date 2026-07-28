@@ -303,6 +303,7 @@ end
     CoreAdmissionUnavailable = 0x0a
     CommandEndpointMismatch = 0x0b
     LeaseReturnUnavailable = 0x0c
+    RunNotAccepting = 0x0d
 end
 
 """

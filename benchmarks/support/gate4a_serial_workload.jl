@@ -461,7 +461,10 @@ function prepare_gate4a_fixture(
     configuration = configure_serial_run(
         bridge,
         (wfs_port, feedback_port);
-        arm_timeout_ns=1_000_000_000)
+        arm_timeout_ns=1_000_000_000,
+        shutdown_policy=RunShutdownPolicy(
+            acknowledgement_timeout_ns=1_000_000_000,
+            drain_timeout_ns=2_000_000_000))
     run = prepare_serial_run(configuration)
     attempt = begin_serial_arm!(run, clock)
     readiness = AdapterReadinessSnapshot(
