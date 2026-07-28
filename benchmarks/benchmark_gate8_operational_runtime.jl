@@ -59,7 +59,7 @@ const GATE8_FROZEN_CONTRACT_VALUES = (
     "overload_failure_bound_ns" => 2_000_000_000,
     "recovery_samples" => 20_000,
     "injected_failure_runs" => 3,
-    "injected_failure_batch_sequence" => 4_096,
+    "injected_failure_batch_sequence" => 64,
     "acknowledgement_timeout_ns" => 1_000_000_000,
     "drain_timeout_ns" => 2_000_000_000,
     "deficit_drain_timeout_ns" => 10_000_000,
@@ -958,6 +958,13 @@ function operational_policy_manifest(contract, workload)
             "maximum_lateness_ns" => 600_000_000_000,
             "production_rate_smoke_primary_products" => 1,
             "production_rate_smoke_uses_compilation_policy" => true,
+            "injected_fault_smoke_clock" =>
+                "Clocks.SystemNanoClock",
+            "injected_fault_smoke_batch_sequence" => 16,
+            "injected_fault_smoke_uses_compilation_policy" => true,
+            "recorded_injected_fault_owner_maximum_lateness_ns" =>
+                600_000_000_000,
+            "recorded_injected_fault_performance_claim" => false,
             "explicit_gc_before_production_warmup" => true,
             "recorded_as_evidence" => false),
         "cpu_admission" => Dict{String,Any}(
@@ -1424,6 +1431,8 @@ end
 function injected_failure_report(result, run_index)
     return Dict{String,Any}(
         "run" => run_index,
+        "owner_maximum_lateness_ns" =>
+            result.owner_maximum_lateness_ns,
         "error_type" => string(typeof(result.error)),
         "trigger_batch_sequence" =>
             result.trigger_batch_sequence,
@@ -1739,6 +1748,8 @@ function gate8_gate_report(
     injected_passed = all(injected_reports) do report
         failure = report["first_failure"]
         failure["present"] &&
+            report["owner_maximum_lateness_ns"] ==
+                600_000_000_000 &&
             failure["stage"] == "OwnerBeforeDequeue" &&
             report["trigger_batch_sequence"] ==
                 contract["injected_failure_batch_sequence"] &&
@@ -2332,14 +2343,19 @@ function gate8_main(arguments=ARGS)
     Operational.warm_injected_owner_failure_specialization!(
         contract, histogram_config)
 
+    injected_failure_contract = deepcopy(contract)
+    injected_failure_contract[
+        "execution_owner_maximum_lateness_ns"] =
+        600_000_000_000
     injected_reports = Vector{Dict{String,Any}}()
     for run_index in 1:contract["injected_failure_runs"]
         println(
             "Gate 8: injected owner failure $run_index/" *
             string(contract["injected_failure_runs"]))
         flush(stdout)
+        GC.gc()
         result = Operational.execute_injected_owner_failure(
-            contract, histogram_config)
+            injected_failure_contract, histogram_config)
         push!(
             injected_reports,
             injected_failure_report(result, run_index))

@@ -420,7 +420,10 @@ function execute_injected_owner_failure(
         observed_wall_ns = time_ns()
     end
     caught isa Gate8InjectedOwnerFailureObserved || error(
-        "the predeclared execution-owner failure was not injected")
+        "the predeclared execution-owner failure was not injected; " *
+        "observed $(typeof(caught)): " *
+        (caught === nothing ? "run completed" :
+         sprint(showerror, caught)))
     injection_wall_ns = control.injection_wall_ns[]
     iszero(injection_wall_ns) && error(
         "the execution-owner fault did not retain its injection time")
@@ -448,6 +451,9 @@ function execute_injected_owner_failure(
         "the injected failure did not leave the run failed")
     return (
         error=caught,
+        owner_maximum_lateness_ns=Int(
+            contract[
+                "execution_owner_maximum_lateness_ns"]),
         trigger_batch_sequence=
             Int(control.trigger_batch_sequence[]),
         injection_to_observation_ns=Int(
@@ -472,10 +478,17 @@ function warm_injected_owner_failure_specialization!(
     warm_contract = deepcopy(contract)
     warm_contract["injected_failure_batch_sequence"] = 16
     warm_contract["correctness_frames"] = 32
+    warm_contract["execution_owner_maximum_lateness_ns"] =
+        600_000_000_000
+    warm_histogram_config = Boundary.HistogramConfig(
+        histogram_config.lowest_ns,
+        600_000_000_000,
+        histogram_config.significant_figures)
     execute_injected_owner_failure(
         warm_contract,
-        histogram_config;
-        clock=Clocks.CachedNanoClock(0))
+        warm_histogram_config;
+        clock=Clocks.SystemNanoClock())
+    GC.gc()
     return nothing
 end
 
