@@ -1413,6 +1413,7 @@ end
         AdaptiveOpticsSim.CUDABackend(),
         original_device_owner.compute_device,
         original_device_owner.overload_policy,
+        original_device_owner.deadline,
         original_device_owner.due,
         original_device_owner.completion)
     AdaptiveOpticsHIL.Execution._submit_owner_phase!(

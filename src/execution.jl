@@ -624,6 +624,11 @@ struct _ExecutionOwnerCompletion
     status::_ExecutionOwnerCompletionStatus
 end
 
+struct _PreparedExecutionOwnerDeadline
+    enabled::Bool
+    maximum_lateness_ns::Int64
+end
+
 """
 Run-immutable execution owner.
 
@@ -639,6 +644,7 @@ struct PreparedExecutionOwner
     backend::AbstractArrayBackend
     compute_device::AbstractComputeDevice
     overload_policy::ExecutionOwnerOverloadPolicy
+    deadline::_PreparedExecutionOwnerDeadline
     due::SPSCDescriptorRing{_ExecutionOwnerWorkDescriptor}
     completion::SPSCDescriptorRing{_ExecutionOwnerCompletion}
 end
@@ -863,6 +869,8 @@ function _prepared_owner(
     backend::AbstractArrayBackend,
     compute_device::AbstractComputeDevice,
 )
+    overload_policy = _execution_owner_policy(configuration, id)
+    maximum_lateness_ns = overload_policy.maximum_lateness_ns
     return PreparedExecutionOwner(
         id,
         kind,
@@ -870,7 +878,11 @@ function _prepared_owner(
         _copy_uint32_memory(group_ordinals),
         backend,
         compute_device,
-        _execution_owner_policy(configuration, id),
+        overload_policy,
+        _PreparedExecutionOwnerDeadline(
+            maximum_lateness_ns !== nothing,
+            something(maximum_lateness_ns, Int64(0)),
+        ),
         SPSCDescriptorRing{_ExecutionOwnerWorkDescriptor}(
             configuration.ring_capacity),
         SPSCDescriptorRing{_ExecutionOwnerCompletion}(
@@ -1012,7 +1024,8 @@ function _owner_states(count::Int)
 end
 
 function _owner_overload_states(count::Int)
-    values = Memory{_ExecutionOwnerOverloadState}(undef, count)
+    values = Memory{_ExecutionOwnerOverloadState}(
+        undef, count)
     @inbounds for index in eachindex(values)
         values[index] = _ExecutionOwnerOverloadState(
             UInt64(0),
@@ -2286,13 +2299,15 @@ end
     timing::ExecutionClockMapping,
     timestamp::PlantTimestamp,
 )
-    owner = @inbounds executor.owners[owner_ordinal]
-    maximum_lateness_ns = owner.overload_policy.maximum_lateness_ns
-    maximum_lateness_ns === nothing && return false
-    observed_execution_ns =
-        _read_execution_clock(execution_clock(timing))
+    deadline =
+        @inbounds executor.owners[owner_ordinal].deadline
+    deadline.enabled || return false
     overload =
         @inbounds executor.owner_overload_states[owner_ordinal]
+    maximum_lateness_ns =
+        deadline.maximum_lateness_ns
+    observed_execution_ns =
+        _read_execution_clock(execution_clock(timing))
     lateness_ns = _record_execution_owner_lateness!(
         overload,
         execution_lateness_ns(
