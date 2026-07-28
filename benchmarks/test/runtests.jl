@@ -297,6 +297,11 @@ end
     @test_throws ErrorException validate_gate8_contract(
         incomplete_compilation_coverage)
 
+    insufficient_overload_drive = deepcopy(contract)
+    insufficient_overload_drive["overload_fraction"] = 1.25
+    @test_throws ErrorException validate_gate8_contract(
+        insufficient_overload_drive)
+
     short_target = deepcopy(contract)
     short_target["target_samples_per_run"] =
         contract["minimum_samples_for_p99_9"] - 1

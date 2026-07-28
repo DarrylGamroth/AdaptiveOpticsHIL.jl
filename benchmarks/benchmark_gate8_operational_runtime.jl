@@ -53,7 +53,7 @@ const GATE8_FROZEN_CONTRACT_VALUES = (
     "derived_rate_preserve_capacity_time_headroom" => true,
     "near_saturation_fraction" => 0.70,
     "saturation_fraction" => 0.85,
-    "overload_fraction" => 1.25,
+    "overload_fraction" => 2.0,
     "rate_rounding_hz" => 100,
     "near_saturation_runs" => 3,
     "near_saturation_samples_per_run" => 100_000,
@@ -237,8 +237,8 @@ function validate_gate8_contract(contract)
     0 < contract["near_saturation_fraction"] <
         contract["saturation_fraction"] < 1 || error(
             "near-saturation and saturation fractions are inconsistent")
-    contract["overload_fraction"] > 1 || error(
-        "bounded overload must exceed calibrated capacity")
+    contract["overload_fraction"] == 2.0 || error(
+        "the amended bounded-overload drive is twice calibrated capacity")
     contract["soak_duration_ns"] >= 300_000_000_000 || error(
         "the Gate 8 soak must last at least 300 seconds")
     contract["soak_schedule_guard_ns"] > 0 || error(
@@ -1504,12 +1504,19 @@ function injected_failure_report(result, run_index)
 end
 
 function overload_report(result, requested_rate_hz, workload)
+    intervals = [
+        interval_snapshot(interval)
+        for interval in result.intervals
+    ]
+    isempty(intervals) && error(
+        "bounded overload did not retain operational interval evidence")
     return Dict{String,Any}(
         "requested_rate_hz" => requested_rate_hz,
         "configured_rate_hz" =>
             effective_primary_rate_hz(workload),
         "prepared_capacities" =>
             workload_capacity_snapshot(workload),
+        "intervals" => intervals,
         "error_type" => string(typeof(result.error)),
         "start_to_failure_ns" => result.start_to_failure_ns,
         "violation_observation_is_failure_boundary" =>

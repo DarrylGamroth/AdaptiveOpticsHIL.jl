@@ -627,12 +627,24 @@ function execute_required_overload(
     run_config = Boundary.BoundaryRunConfig(
         samples=contract["overload_maximum_offered"],
         checkpoint_stride=contract["checkpoint_stride"])
+    maximum_wall_ns = cld(
+        run_config.samples * 1_000_000_000,
+        contract["minimum_calibrated_rate_hz"])
+    observer = OperationalIntervalObserver(
+        max(
+            4,
+            cld(
+                maximum_wall_ns,
+                contract["interval_ns"]) + 8),
+        contract["interval_ns"])
     driver = prepare_driver(
         Clocks.SystemNanoClock(),
         workload,
         run_config,
         histogram_config,
-        agent_execution_configuration(contract))
+        agent_execution_configuration(contract);
+        observer)
+    reset_operational_observer!(observer)
     wall_start_ns = time_ns()
     caught = nothing
     observed_wall_ns = UInt64(0)
@@ -660,6 +672,7 @@ function execute_required_overload(
         "bounded overload changed its first failure during drain")
     run_phase(driver.fixture.run) == RunFailed || error(
         "bounded overload did not preserve a failed run")
+    finish_operational_observer!(observer, driver)
     return (
         error=caught,
         start_to_failure_ns=Int(
@@ -677,6 +690,7 @@ function execute_required_overload(
         ingress_closed,
         offered_primary=driver.counters.offered_primary,
         completed_primary=driver.counters.command_responses,
+        intervals=collect(interval_records(observer)),
         failure=failure_after,
         failure_accounting=
             serial_failure_accounting(driver.fixture.run),

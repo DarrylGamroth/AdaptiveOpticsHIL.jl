@@ -165,6 +165,27 @@ end
     @test serial_ownership_is_drained(result.accounting)
 end
 
+@testset "Gate 8 bounded required overload" begin
+    contract = deepcopy(GATE8_TEST_CONTRACT)
+    contract["overload_maximum_offered"] = 4_096
+    contract["execution_owner_maximum_lateness_ns"] = 1_000_000
+    contract["interval_ns"] = 1_000_000
+    overload_workload = workload_at_rate(
+        GATE8_TEST_WORKLOAD,
+        100_000;
+        preserve_capacity_time_headroom=true)
+    result = Operational.execute_required_overload(
+        contract,
+        overload_workload,
+        GATE8_TEST_HISTOGRAM)
+    report = overload_report(result, 100_000, overload_workload)
+    @test !isempty(report["intervals"])
+    @test report["first_failure"]["kind"] ==
+        "ResourcePolicyRunFailure"
+    @test report["ingress_closed"]
+    @test report["accounting"]["ownership_drained"]
+end
+
 @testset "Gate 8 injected execution-owner failure" begin
     contract = deepcopy(GATE8_TEST_CONTRACT)
     contract["injected_failure_batch_sequence"] = 16
