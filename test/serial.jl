@@ -875,6 +875,13 @@ end
         _handle_serial_capacity_overload!(policy, publication)
 end
 
+@inline function serial_acquisition_accounting_allocations(
+    run,
+    id)
+    return @allocated serial_acquisition_overload_accounting(
+        run, id)
+end
+
 @inline serial_shutdown_progress_allocations!(handle) =
     @allocated progress_serial_shutdown!(handle)
 
@@ -1346,8 +1353,12 @@ end
         @test required_wfs.products_failed == 0
 
         if SERIAL_TESTS_WITH_COVERAGE
-            @test_skip "allocation assertions are disabled under coverage"
+            @test_skip "accounting allocation gate disabled under coverage"
+            @test_skip "overload allocation gate disabled under coverage"
         else
+            @test serial_acquisition_accounting_allocations(
+                fixture.run,
+                AcquisitionID(:hil_dm_feedback)) == 0
             allocation_state =
                 AdaptiveOpticsHIL.Serial.AcquisitionPublicationState()
             AdaptiveOpticsHIL.Serial.

@@ -110,7 +110,7 @@ jobs:
         run: julia --project=. --startup-file=no test/execution.jl
 
   benchmark-contract:
-    name: Gate 4A benchmark contract / Julia 1.12 / ubuntu
+    name: Benchmark contracts / Julia 1.12 / ubuntu
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
@@ -135,3 +135,30 @@ jobs:
 
       - name: Validate benchmark contract and deterministic smoke path
         run: julia --project=benchmarks --startup-file=no benchmarks/test/runtests.jl
+
+  gate8-runtime-smoke:
+    name: Gate 8.9 operational smoke / Julia 1.12 / ubuntu
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      JULIA_NUM_THREADS: "4,0"
+      OPENBLAS_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Julia
+        uses: julia-actions/setup-julia@v3
+        with:
+          version: "1.12"
+
+      - name: Cache Julia artifacts
+        uses: julia-actions/cache@v3
+
+      - name: Instantiate benchmark environment
+        run: julia --project=benchmarks --startup-file=no -e 'using Pkg; Pkg.instantiate()'
+
+      - name: Run focused Gate 8.9 operational smoke tests
+        run: julia --project=benchmarks --startup-file=no benchmarks/test/gate8_runtime.jl

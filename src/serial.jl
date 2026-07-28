@@ -610,6 +610,24 @@ serial_rtc_ingress_liveness_accounting(run::Union{
         state.decision)
 end
 
+@inline _serial_acquisition_overload_accounting(
+    ::Tuple{},
+    ::Memory{AcquisitionPublicationState},
+    ::AcquisitionID,
+    ::Int) = nothing
+
+@inline function _serial_acquisition_overload_accounting(
+    publishers::Tuple,
+    publications::Memory{AcquisitionPublicationState},
+    id::AcquisitionID,
+    index::Int)
+    publisher = first(publishers)
+    publisher.id == id && return _acquisition_overload_accounting(
+        publisher, @inbounds(publications[index]))
+    return _serial_acquisition_overload_accounting(
+        Base.tail(publishers), publications, id, index + 1)
+end
+
 function serial_acquisition_overload_accounting(
     run::Union{
         PreparedSerialRun,
@@ -619,12 +637,9 @@ function serial_acquisition_overload_accounting(
     },
     id::AcquisitionID)
     prepared = _prepared_serial_run(run)
-    @inbounds for index in eachindex(prepared.publishers)
-        publisher = prepared.publishers[index]
-        publisher.id == id || continue
-        return _acquisition_overload_accounting(
-            publisher, prepared.state.publications[index])
-    end
+    accounting = _serial_acquisition_overload_accounting(
+        prepared.publishers, prepared.state.publications, id, 1)
+    accounting === nothing || return accounting
     throw(SerialRunError(
         :serial_run,
         :unknown_acquisition,

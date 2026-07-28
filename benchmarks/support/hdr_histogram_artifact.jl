@@ -2,6 +2,7 @@ module HILHdrHistogramArtifact
 
 using Base64
 using HdrHistogram
+using SHA
 
 const SPARSE_ENCODING =
     "AOHIL HdrHistogram sparse Int64 value/count pairs big-endian base64 v1"
@@ -83,11 +84,13 @@ function verified_sparse_histogram(
         "sparse HdrHistogram round trip changed the recorded-bin count")
     reencoded["histogram_base64"] ==
         encoded["histogram_base64"] || error(
-        "sparse HdrHistogram round trip changed recorded values or counts")
+            "sparse HdrHistogram round trip changed recorded values or counts")
     min(decoded) == min(histogram) || error(
         "sparse HdrHistogram round trip changed the minimum")
     max(decoded) == max(histogram) || error(
         "sparse HdrHistogram round trip changed the maximum")
+    encoded["histogram_sha256"] = bytes2hex(
+        SHA.sha256(base64decode(encoded["histogram_base64"])))
     return encoded
 end
 

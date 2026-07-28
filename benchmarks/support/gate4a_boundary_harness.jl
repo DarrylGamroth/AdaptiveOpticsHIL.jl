@@ -1,5 +1,6 @@
 module Gate4ABoundaryHarness
 
+using AdaptiveOpticsHIL.Execution
 using AdaptiveOpticsHIL.Lifecycle
 using AdaptiveOpticsHIL.Ownership
 using AdaptiveOpticsHIL.Ports
@@ -17,10 +18,51 @@ using .Gate4ASerialWorkload:
     feedback_product_sequence,
     latest_optical_sample_timestamp,
     prepare_gate4a_fixture,
-    primary_product_sequence
+    primary_product_sequence,
+    science_product_sequence
 
 const Plant = AdaptiveOpticsSim.Plant
 
+abstract type AbstractBoundaryObserver end
+
+struct NoBoundaryObserver <: AbstractBoundaryObserver end
+
+@inline observe_boundary_step!(
+    ::AbstractBoundaryObserver,
+    ::Any,
+    ::Any,
+    ::Int64) = nothing
+@inline observe_primary_product!(
+    ::AbstractBoundaryObserver,
+    ::UInt64,
+    ::Int64,
+    ::Int64,
+    ::Int64,
+    ::Any) = nothing
+@inline observe_feedback_product!(
+    ::AbstractBoundaryObserver,
+    ::UInt64,
+    ::Int64,
+    ::Int64,
+    ::Int64,
+    ::Any) = nothing
+@inline observe_science_product!(
+    ::AbstractBoundaryObserver,
+    ::UInt64,
+    ::Int64,
+    ::Int64,
+    ::Int64,
+    ::Any) = nothing
+@inline observe_command_outcome!(
+    ::AbstractBoundaryObserver,
+    ::UInt64,
+    ::Int64,
+    ::Int64) = nothing
+@inline observe_command_response!(
+    ::AbstractBoundaryObserver,
+    ::UInt64,
+    ::Int64,
+    ::Int64) = nothing
 struct HistogramConfig
     lowest_ns::Int64
     highest_ns::Int64
@@ -48,13 +90,17 @@ struct BoundaryRunConfig
     checkpoint_stride::Int
     stall_start_sequence::Int
     stall_frames::Int
+    science_stall_start_sequence::Int
+    science_stall_frames::Int
 end
 
 function BoundaryRunConfig(;
     samples::Integer,
     checkpoint_stride::Integer=max(1, samples),
     stall_start_sequence::Integer=0,
-    stall_frames::Integer=0)
+    stall_frames::Integer=0,
+    science_stall_start_sequence::Integer=0,
+    science_stall_frames::Integer=0)
     samples > 0 || error("run sample count must be positive")
     checkpoint_stride > 0 || error(
         "arrival checkpoint stride must be positive")
@@ -69,11 +115,25 @@ function BoundaryRunConfig(;
         stall_start_sequence == 0 || error(
             "zero-length stall requires a zero start sequence")
     end
+    science_stall_frames >= 0 || error(
+        "science-consumer stall frame count must be nonnegative")
+    if science_stall_frames > 0
+        1 <= science_stall_start_sequence <= samples || error(
+            "science-consumer stall start must lie inside the finite run")
+        science_stall_start_sequence + science_stall_frames <= samples ||
+            error(
+                "science-consumer stall must end inside the finite run")
+    else
+        science_stall_start_sequence == 0 || error(
+            "zero-length science-consumer stall requires a zero start")
+    end
     return BoundaryRunConfig(
         Int(samples),
         Int(checkpoint_stride),
         Int(stall_start_sequence),
-        Int(stall_frames))
+        Int(stall_frames),
+        Int(science_stall_start_sequence),
+        Int(science_stall_frames))
 end
 
 struct BoundaryHistograms
@@ -135,6 +195,20 @@ mutable struct BoundaryCounters
     stall_end_observed::UInt64
     initial_residual_metric::Float64
     final_residual_metric::Float64
+    generated_science::UInt64
+    published_science::UInt64
+    observed_science::UInt64
+    shed_science::UInt64
+    failed_science::UInt64
+    science_sequence_gaps::UInt64
+    maximum_science_occupancy::Int
+    science_recovery_count::UInt64
+    science_stall_start_offered::UInt64
+    science_stall_end_offered::UInt64
+    science_stall_start_generated::UInt64
+    science_stall_end_generated::UInt64
+    science_stall_start_observed::UInt64
+    science_stall_end_observed::UInt64
 end
 
 function BoundaryCounters()
@@ -171,7 +245,21 @@ function BoundaryCounters()
         UInt64(0),
         UInt64(0),
         NaN,
-        NaN)
+        NaN,
+        UInt64(0),
+        UInt64(0),
+        UInt64(0),
+        UInt64(0),
+        UInt64(0),
+        UInt64(0),
+        0,
+        UInt64(0),
+        UInt64(0),
+        UInt64(0),
+        UInt64(0),
+        UInt64(0),
+        UInt64(0),
+        UInt64(0))
 end
 
 @enum CheckpointKind::UInt8 begin
@@ -203,16 +291,19 @@ mutable struct BoundaryDriver{
     F,
     H<:BoundaryHistograms,
     C<:BoundaryCounters,
+    O<:AbstractBoundaryObserver,
 }
     fixture::F
     histograms::H
     counters::C
+    observer::O
     run_config::BoundaryRunConfig
     histogram_config::HistogramConfig
     command::Vector{Float64}
     command_lease::Base.RefValue{PayloadLeaseRef}
     primary_completion::Base.RefValue{AcquisitionCompletion}
     feedback_completion::Base.RefValue{AcquisitionCompletion}
+    science_completion::Base.RefValue{AcquisitionCompletion}
     command_outcome::Base.RefValue{
         CommandOutcome{LeasedCommandPayload}}
     checkpoints::Vector{ArrivalCheckpoint}
@@ -226,23 +317,33 @@ mutable struct BoundaryDriver{
     command_receive_timestamp_ns::Int64
     command_application_timestamp_ns::Int64
     controller_service_start_ns::UInt64
+    first_response_wall_ns::UInt64
+    offered_complete_wall_ns::UInt64
     last_optical_sample_timestamp_ns::Int64
     has_optical_sample::Bool
     last_published_primary::UInt64
     last_published_feedback::UInt64
+    last_generated_science::UInt64
     last_observed_primary::UInt64
     last_observed_feedback::UInt64
+    last_observed_science::UInt64
     last_command_sequence::UInt64
     last_outcome_sequence::UInt64
     stall_started::Bool
     stall_ended::Bool
+    science_stall_started::Bool
+    science_stall_ended::Bool
 end
 
 function prepare_boundary_driver(
     clock::Clocks.AbstractNanoClock,
     workload::Gate4AWorkloadConfig,
     run_config::BoundaryRunConfig,
-    histogram_config::HistogramConfig=HistogramConfig())
+    histogram_config::HistogramConfig=HistogramConfig();
+    optical_execution::AbstractOpticalExecutionConfiguration=
+        SerialOpticalExecution(),
+    observer::AbstractBoundaryObserver=NoBoundaryObserver(),
+    arm_timeout_ns::Integer=1_000_000_000)
     histograms = BoundaryHistograms(histogram_config)
     counters = BoundaryCounters()
     checkpoint_capacity =
@@ -252,19 +353,26 @@ function prepare_boundary_driver(
     command_lease = Ref(PayloadLeaseRef(0, 0, 0, 0))
     primary_completion = Ref{AcquisitionCompletion}()
     feedback_completion = Ref{AcquisitionCompletion}()
+    science_completion = Ref{AcquisitionCompletion}()
     command_outcome =
         Ref{CommandOutcome{LeasedCommandPayload}}()
-    fixture = prepare_gate4a_fixture(clock, workload)
+    fixture = prepare_gate4a_fixture(
+        clock,
+        workload;
+        optical_execution,
+        arm_timeout_ns)
     return BoundaryDriver(
         fixture,
         histograms,
         counters,
+        observer,
         run_config,
         histogram_config,
         command,
         command_lease,
         primary_completion,
         feedback_completion,
+        science_completion,
         command_outcome,
         checkpoints,
         0,
@@ -277,6 +385,8 @@ function prepare_boundary_driver(
         Int64(0),
         Int64(0),
         UInt64(0),
+        UInt64(0),
+        UInt64(0),
         Int64(0),
         false,
         UInt64(0),
@@ -285,8 +395,12 @@ function prepare_boundary_driver(
         UInt64(0),
         UInt64(0),
         UInt64(0),
+        UInt64(0),
+        UInt64(0),
         false,
-        run_config.stall_frames == 0)
+        run_config.stall_frames == 0,
+        false,
+        run_config.science_stall_frames == 0)
 end
 
 @inline function _elapsed_ns(start_ns::Int64, end_ns::Int64)
@@ -400,6 +514,11 @@ function _update_maximum_occupancy!(driver::BoundaryDriver)
     counters.maximum_feedback_occupancy = max(
         counters.maximum_feedback_occupancy,
         descriptor_accounting(fixture.feedback_port).occupancy)
+    if fixture.science_port !== nothing
+        counters.maximum_science_occupancy = max(
+            counters.maximum_science_occupancy,
+            descriptor_accounting(fixture.science_port).occupancy)
+    end
     counters.maximum_command_submission_occupancy = max(
         counters.maximum_command_submission_occupancy,
         descriptor_accounting(
@@ -439,6 +558,9 @@ function _update_offered_arrivals!(
     offered >= driver.counters.offered_primary || error(
         "absolute offered-arrival count regressed")
     driver.counters.offered_primary = offered
+    offered == UInt64(driver.run_config.samples) &&
+        iszero(driver.offered_complete_wall_ns) &&
+        (driver.offered_complete_wall_ns = time_ns())
     while driver.next_periodic_checkpoint <= Int(offered)
         sequence = UInt64(driver.next_periodic_checkpoint)
         _record_checkpoint!(
@@ -496,6 +618,37 @@ end
 @inline _rtc_is_stalled(driver::BoundaryDriver) =
     driver.stall_started && !driver.stall_ended
 
+function _update_science_stall_state!(driver::BoundaryDriver)
+    config = driver.run_config
+    config.science_stall_frames == 0 && return nothing
+    offered = driver.counters.offered_primary
+    start_sequence = UInt64(config.science_stall_start_sequence)
+    end_sequence = UInt64(
+        config.science_stall_start_sequence +
+        config.science_stall_frames)
+    if !driver.science_stall_started && offered >= start_sequence
+        driver.science_stall_started = true
+        driver.counters.science_stall_start_offered = offered
+        driver.counters.science_stall_start_generated =
+            driver.counters.generated_science
+        driver.counters.science_stall_start_observed =
+            driver.counters.observed_science
+    end
+    if driver.science_stall_started &&
+            !driver.science_stall_ended && offered >= end_sequence
+        driver.science_stall_ended = true
+        driver.counters.science_stall_end_offered = offered
+        driver.counters.science_stall_end_generated =
+            driver.counters.generated_science
+        driver.counters.science_stall_end_observed =
+            driver.counters.observed_science
+    end
+    return nothing
+end
+
+@inline _science_consumer_is_stalled(driver::BoundaryDriver) =
+    driver.science_stall_started && !driver.science_stall_ended
+
 function _update_published_sequences!(driver::BoundaryDriver)
     primary = primary_product_sequence(driver.fixture)
     primary >= driver.last_published_primary || error(
@@ -518,6 +671,22 @@ function _update_published_sequences!(driver::BoundaryDriver)
             feedback - driver.last_published_feedback - UInt64(1)
         driver.last_published_feedback = feedback
         driver.counters.published_feedback = feedback
+    end
+    if driver.fixture.science_port !== nothing
+        science = science_product_sequence(driver.fixture)
+        science >= driver.last_generated_science || error(
+            "science product sequence regressed")
+        driver.last_generated_science = science
+        driver.counters.generated_science = science
+        overload = serial_acquisition_overload_accounting(
+            driver.fixture.run,
+            AcquisitionID(:hil_science))
+        driver.counters.published_science =
+            overload.products_published
+        driver.counters.shed_science = overload.products_shed
+        driver.counters.failed_science = overload.products_failed
+        driver.counters.science_recovery_count =
+            overload.recovery_count
     end
     return nothing
 end
@@ -576,6 +745,13 @@ function _observe_primary_product!(driver::BoundaryDriver)
             (driver.counters.adapter_lead_misses += UInt64(1))
         product = completed_product(port, completion)
         measurement = measurement_storage(product.measurement)
+        observe_primary_product!(
+            driver.observer,
+            sequence,
+            plant_nanoseconds(completion_timestamp),
+            publication_execution_ns,
+            observation_execution_ns,
+            measurement)
         @inbounds for index in eachindex(driver.command, measurement)
             driver.command[index] -=
                 driver.fixture.config.controller_gain *
@@ -628,6 +804,16 @@ function _observe_feedback_products!(driver::BoundaryDriver)
         driver.last_observed_feedback = sequence
         observation_execution_ns =
             Clocks.time_nanos(driver.fixture.clock)
+        product = completed_product(port, completion)
+        measurement = measurement_storage(product.measurement)
+        observe_feedback_product!(
+            driver.observer,
+            sequence,
+            plant_nanoseconds(
+                acquisition_completion_timestamp(completion)),
+            acquisition_completion_publication_ns(completion),
+            observation_execution_ns,
+            measurement)
         delay = _elapsed_ns(
             acquisition_completion_publication_ns(completion),
             observation_execution_ns)
@@ -638,6 +824,41 @@ function _observe_feedback_products!(driver::BoundaryDriver)
         port_status(release_result) == PortTransferSucceeded || error(
             "feedback product lease could not be released")
         driver.counters.observed_feedback += UInt64(1)
+    end
+end
+
+function _observe_science_products!(driver::BoundaryDriver)
+    port = driver.fixture.science_port
+    port === nothing && return nothing
+    while true
+        result = try_take!(driver.science_completion, port)
+        port_status(result) == PortEmpty && return nothing
+        port_status(result) == PortTransferSucceeded || error(
+            "science completion port returned an invalid status")
+        completion = driver.science_completion[]
+        sequence = stream_sequence_value(
+            acquisition_completion_sequence(completion))
+        sequence > driver.last_observed_science || error(
+            "science completion sequence did not increase")
+        driver.counters.science_sequence_gaps +=
+            sequence - driver.last_observed_science - UInt64(1)
+        driver.last_observed_science = sequence
+        observation_execution_ns =
+            Clocks.time_nanos(driver.fixture.clock)
+        product = completed_product(port, completion)
+        measurement = measurement_storage(product.measurement)
+        observe_science_product!(
+            driver.observer,
+            sequence,
+            plant_nanoseconds(
+                acquisition_completion_timestamp(completion)),
+            acquisition_completion_publication_ns(completion),
+            observation_execution_ns,
+            measurement)
+        release_result = release_product!(port, completion)
+        port_status(release_result) == PortTransferSucceeded || error(
+            "science product lease could not be released")
+        driver.counters.observed_science += UInt64(1)
     end
 end
 
@@ -757,6 +978,11 @@ function _observe_command_outcomes!(driver::BoundaryDriver)
             "command application delay")
         driver.command_application_timestamp_ns =
             plant_nanoseconds(outcome_terminal_timestamp(outcome))
+        observe_command_outcome!(
+            driver.observer,
+            sequence,
+            driver.command_application_timestamp_ns,
+            publication_ns)
         driver.counters.commands_applied += UInt64(1)
         driver.counters.outcomes_consumed += UInt64(1)
         release_result = release_outcome!(port, outcome)
@@ -788,6 +1014,11 @@ function _observe_optical_sample!(driver::BoundaryDriver)
         driver.histograms.closed_loop_response,
         response,
         "closed-loop response")
+    observe_command_response!(
+        driver.observer,
+        driver.prepared_sequence,
+        sample_ns,
+        now)
     service =
         Int64(time_ns() - driver.controller_service_start_ns)
     _record_nonnegative!(
@@ -795,6 +1026,8 @@ function _observe_optical_sample!(driver::BoundaryDriver)
         service,
         "controller service time")
     driver.counters.command_responses += UInt64(1)
+    iszero(driver.first_response_wall_ns) &&
+        (driver.first_response_wall_ns = time_ns())
     driver.phase = ControllerIdle
     return nothing
 end
@@ -825,6 +1058,16 @@ end
 function _run_is_complete(driver::BoundaryDriver)
     target = UInt64(driver.run_config.samples)
     counters = driver.counters
+    science_complete = driver.fixture.science_port === nothing ||
+        (
+            counters.generated_science ==
+                counters.published_science +
+                counters.shed_science +
+                counters.failed_science &&
+            counters.observed_science == counters.published_science &&
+            descriptor_accounting(
+                driver.fixture.science_port).occupancy == 0
+        )
     return counters.offered_primary == target &&
         counters.published_primary == target &&
         counters.observed_primary == target &&
@@ -839,6 +1082,7 @@ function _run_is_complete(driver::BoundaryDriver)
         descriptor_accounting(driver.fixture.wfs_port).occupancy == 0 &&
         descriptor_accounting(
             driver.fixture.feedback_port).occupancy == 0 &&
+        science_complete &&
         descriptor_accounting(
             command_submission_port(
                 driver.fixture.command_ports)).occupancy == 0 &&
@@ -852,13 +1096,25 @@ struct BoundaryRunResult{
     H<:BoundaryHistograms,
     C<:BoundaryCounters,
     A<:SerialRunAccounting,
+    O<:Tuple,
+    L<:RTCIngressLivenessAccounting,
+    F<:RunFailureAccounting,
+    T<:NamedTuple,
 }
     histograms::H
     counters::C
     accounting::A
+    overload_accounting::O
+    terminal_phase::RunPhase
+    ingress_liveness::L
+    failure_accounting::F
+    lifecycle_timings::T
+    stop_elapsed_ns::Int64
     checkpoints::Vector{ArrivalCheckpoint}
     checkpoint_count::Int
     wall_start_ns::UInt64
+    offered_complete_wall_ns::UInt64
+    first_response_wall_ns::UInt64
     wall_end_ns::UInt64
 end
 
@@ -896,11 +1152,14 @@ function execute_boundary_run!(driver::BoundaryDriver)
         end
 
         _update_stall_state!(driver, elapsed)
+        _update_science_stall_state!(driver)
         if !_rtc_is_stalled(driver)
             _observe_command_outcomes!(driver)
             status == SerialPlantEventProcessed &&
                 _observe_optical_sample!(driver)
             _observe_feedback_products!(driver)
+            !_science_consumer_is_stalled(driver) &&
+                _observe_science_products!(driver)
             if status == SerialDeadlinePending
                 if driver.phase == ControllerIdle
                     _observe_primary_product!(driver)
@@ -910,11 +1169,18 @@ function execute_boundary_run!(driver::BoundaryDriver)
                         driver, serial_step_timestamp(result))
             end
         end
+        reclaim_serial_returns!(driver.fixture.run)
         _update_maximum_occupancy!(driver)
+        observe_boundary_step!(
+            driver.observer,
+            driver,
+            result,
+            elapsed)
         _run_is_complete(driver) && break
         _wait_for_deadline!(driver, result)
     end
     _observe_feedback_products!(driver)
+    _observe_science_products!(driver)
     reclaim_serial_returns!(driver.fixture.run)
     wall_end = time_ns()
     request = RunStopRequest(
@@ -922,14 +1188,47 @@ function execute_boundary_run!(driver::BoundaryDriver)
         execution_clock_identity(driver.fixture.armed.timing),
         Clocks.time_nanos(driver.fixture.clock);
         reason=:benchmark_complete)
+    stop_start_ns = time_ns()
     accounting = _finish_boundary_stop!(driver, request)
+    stop_elapsed_ns = Int64(time_ns() - stop_start_ns)
+    terminal_phase = run_phase(driver.fixture.run)
+    ingress_liveness =
+        serial_rtc_ingress_liveness_accounting(
+            driver.fixture.run)
+    failure_accounting =
+        serial_failure_accounting(driver.fixture.run)
+    overload_accounting = driver.fixture.science_port === nothing ?
+        (
+            serial_acquisition_overload_accounting(
+                driver.fixture.run, AcquisitionID(:hil_wfs)),
+            serial_acquisition_overload_accounting(
+                driver.fixture.run,
+                AcquisitionID(:hil_dm_feedback)),
+        ) :
+        (
+            serial_acquisition_overload_accounting(
+                driver.fixture.run, AcquisitionID(:hil_wfs)),
+            serial_acquisition_overload_accounting(
+                driver.fixture.run,
+                AcquisitionID(:hil_dm_feedback)),
+            serial_acquisition_overload_accounting(
+                driver.fixture.run, AcquisitionID(:hil_science)),
+        )
     return BoundaryRunResult(
         driver.histograms,
         driver.counters,
         accounting,
+        overload_accounting,
+        terminal_phase,
+        ingress_liveness,
+        failure_accounting,
+        driver.fixture.lifecycle_timings,
+        stop_elapsed_ns,
         driver.checkpoints,
         driver.checkpoint_count,
         wall_start,
+        driver.offered_complete_wall_ns,
+        driver.first_response_wall_ns,
         wall_end)
 end
 
@@ -938,6 +1237,12 @@ function validate_boundary_result(
     run_config::BoundaryRunConfig)
     counters = result.counters
     target = UInt64(run_config.samples)
+    result.terminal_phase == RunStopped || error(
+        "successful boundary run did not reach RunStopped")
+    serial_run_is_quiescent(result.accounting) || error(
+        "successful boundary run retained ownership after stop")
+    result.failure_accounting.first_failure === nothing || error(
+        "successful boundary run retained an unexpected failure")
     counters.offered_primary == target || error(
         "fixed arrival generator did not offer every deadline")
     counters.published_primary == target || error(
@@ -952,6 +1257,19 @@ function validate_boundary_result(
         "feedback product sequence contains a gap")
     counters.published_feedback == counters.observed_feedback || error(
         "sampled feedback was not fully consumed")
+    if counters.generated_science > 0
+        counters.generated_science ==
+            counters.published_science +
+            counters.shed_science +
+            counters.failed_science || error(
+                "science generation did not reconcile with terminal publication decisions")
+        counters.observed_science == counters.published_science || error(
+            "published science products were not fully consumed")
+        counters.failed_science == 0 || error(
+            "optional science products failed instead of following their prepared shed policy")
+        counters.science_sequence_gaps == counters.shed_science || error(
+            "science sequence gaps did not match explicit sheds")
+    end
     counters.commands_offered == target ||
         error("fake RTC did not derive one command per primary product")
     counters.commands_enqueued == target ||
@@ -994,6 +1312,15 @@ function validate_boundary_result(
         counters.maximum_primary_occupancy >=
             run_config.stall_frames || error(
             "primary completion occupancy did not retain the stall backlog")
+    end
+    if run_config.science_stall_frames > 0
+        counters.science_stall_end_observed ==
+            counters.science_stall_start_observed || error(
+                "science consumer observed a product during its declared stall")
+        counters.shed_science >= UInt64(8) || error(
+            "optional science stall did not force the predeclared shedding boundary")
+        counters.science_recovery_count >= UInt64(1) || error(
+            "optional science stream did not publish a recovery transition")
     end
     return true
 end

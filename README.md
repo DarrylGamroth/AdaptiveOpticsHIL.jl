@@ -348,13 +348,37 @@ capacity. The
 [maintained Gate 4A artifact](benchmarks/results/gate4a/2026-07-24-serial-boundary.toml)
 contains the current qualified baseline.
 
-CI runs the short deterministic benchmark-contract suite. Durable evidence is
-generated deliberately from a clean revision with one Julia and BLAS thread:
+The maintained Gate 8.9 contract separately qualifies the single-host,
+in-memory, two-owner CPU runtime over the same reduced-order boundary. It
+preserves exact serial/deterministic/threaded replay and records fixed 2 kHz
+target load, consumer interruption, optional-stream shedding, calibrated
+capacity, near-saturation, saturation, required overload, fresh recovery,
+injected owner failure, a named drain deficit, clean lifecycle timing, and a
+300 s soak. This remains a runtime and lifecycle claim: external transport,
+RTC-process latency, accelerator execution, full optical propagation, and
+instrument-scale capacity are explicitly excluded. The frozen protocol and
+claim limits are maintained in
+[Gate 8.9 issue #25](https://github.com/DarrylGamroth/AdaptiveOpticsHIL.jl/issues/25).
+
+CI runs the short benchmark-contract suite plus a focused four-thread Gate 8.9
+runtime smoke. Durable evidence is generated deliberately from a clean
+revision. Gate 4A requires one Julia and BLAS thread:
 
 ```sh
 julia --startup-file=no --project=benchmarks \
     benchmarks/benchmark_gate4a_serial_boundary.jl \
     --output benchmarks/results/gate4a/YYYY-MM-DD-serial-boundary.toml
+```
+
+Gate 8.9 requires four default-pool threads, no interactive-pool thread, and
+one BLAS/FFT-provider thread:
+
+```sh
+JULIA_NUM_THREADS=4,0 OPENBLAS_NUM_THREADS=1 \
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+julia --startup-file=no --project=benchmarks \
+    benchmarks/benchmark_gate8_operational_runtime.jl \
+    --output benchmarks/results/gate8/YYYY-MM-DD-operational-runtime.toml
 ```
 
 ## Development sources

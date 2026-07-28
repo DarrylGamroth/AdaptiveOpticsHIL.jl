@@ -1,5 +1,6 @@
 module Gate4ASerialWorkload
 
+using AdaptiveOpticsHIL.Execution
 using AdaptiveOpticsHIL.Lifecycle
 using AdaptiveOpticsHIL.Ownership
 using AdaptiveOpticsHIL.Ports
@@ -31,6 +32,11 @@ using Clocks
 
 const Plant = AdaptiveOpticsSim.Plant
 const _IDENTITY_2X2 = [1.0 0.0; 0.0 1.0]
+const _HIL_WFS_ACQUISITION = Plant.AcquisitionID(:hil_wfs)
+const _HIL_DM_FEEDBACK_ACQUISITION =
+    Plant.AcquisitionID(:hil_dm_feedback)
+const _HIL_SCIENCE_ACQUISITION =
+    Plant.AcquisitionID(:hil_science)
 
 struct Gate4AWorkloadConfig
     primary_period_ns::Int64
@@ -39,9 +45,14 @@ struct Gate4AWorkloadConfig
     feedback_period_ns::Int64
     feedback_phase_ns::Int64
     feedback_exposure_ns::Int64
+    science_enabled::Bool
+    science_sample_period_ns::Int64
+    science_period_ns::Int64
+    science_exposure_ns::Int64
     command_capacity::Int
     primary_product_capacity::Int
     feedback_product_capacity::Int
+    science_product_capacity::Int
     complete_product_lead_time_ns::Int64
     maximum_lease_hold_time_ns::Int64
     controller_gain::Float64
@@ -55,9 +66,14 @@ function Gate4AWorkloadConfig(;
     feedback_period_ns::Integer=750_000,
     feedback_phase_ns::Integer=125_000,
     feedback_exposure_ns::Integer=100_000,
+    science_enabled::Bool=false,
+    science_sample_period_ns::Integer=1_000_000,
+    science_period_ns::Integer=2_000_000,
+    science_exposure_ns::Integer=500_000,
     command_capacity::Integer=8,
     primary_product_capacity::Integer=64,
     feedback_product_capacity::Integer=64,
+    science_product_capacity::Integer=8,
     complete_product_lead_time_ns::Integer=500_000,
     maximum_lease_hold_time_ns::Integer=2_000_000,
     controller_gain::Real=0.65,
@@ -74,12 +90,20 @@ function Gate4AWorkloadConfig(;
         "feedback phase must lie inside one feedback period")
     0 < feedback_exposure_ns <= feedback_period_ns || error(
         "feedback exposure must be positive and no longer than its period")
+    science_sample_period_ns > 0 || error(
+        "science-path sample period must be positive")
+    science_period_ns > 0 || error(
+        "science acquisition period must be positive")
+    0 < science_exposure_ns <= science_period_ns || error(
+        "science exposure must be positive and no longer than its period")
     command_capacity > 0 || error(
         "command capacity must be positive")
     primary_product_capacity > 0 || error(
         "primary product capacity must be positive")
     feedback_product_capacity > 0 || error(
         "feedback product capacity must be positive")
+    science_product_capacity > 0 || error(
+        "science product capacity must be positive")
     complete_product_lead_time_ns >= 0 || error(
         "complete-product lead time must be nonnegative")
     maximum_lease_hold_time_ns > 0 || error(
@@ -95,9 +119,14 @@ function Gate4AWorkloadConfig(;
         Int64(feedback_period_ns),
         Int64(feedback_phase_ns),
         Int64(feedback_exposure_ns),
+        science_enabled,
+        Int64(science_sample_period_ns),
+        Int64(science_period_ns),
+        Int64(science_exposure_ns),
         Int(command_capacity),
         Int(primary_product_capacity),
         Int(feedback_product_capacity),
+        Int(science_product_capacity),
         Int64(complete_product_lead_time_ns),
         Int64(maximum_lease_hold_time_ns),
         Float64(controller_gain),
@@ -125,7 +154,8 @@ mutable struct Gate4AReducedOrderOpticWorkspace{V<:AbstractVector}
 end
 
 Plant.plant_model_definition_style(
-    ::Type{Gate4AReducedOrderPathModel}) = ColdPlantModelDefinition()
+    ::Type{Gate4AReducedOrderPathModel}) =
+    ColdPlantModelDefinition()
 Plant.plant_model_definition_style(
     ::Type{Gate4AReducedOrderOpticModel}) = ColdPlantModelDefinition()
 
@@ -324,6 +354,13 @@ function _prepare_gate4a_plant(config::Gate4AWorkloadConfig)
         measurement_kind=:sampled_actuator_state,
         residual_kind=:actuator_state,
         sample_period_ns=config.optical_sample_period_ns)
+    science_model = _reduced_order_model(
+        schema;
+        disturbance,
+        response_operator=Matrix{T}(_IDENTITY_2X2),
+        measurement_kind=:science_modal_residual,
+        residual_kind=:science_modal_wavefront_error,
+        sample_period_ns=config.science_sample_period_ns)
 
     telescope = Telescope(
         resolution=8,
@@ -346,24 +383,38 @@ function _prepare_gate4a_plant(config::Gate4AWorkloadConfig)
         photon_irradiance=T(1),
         T=T)
     path = OpticalPathDefinition(
-        :hil_wfs_path, source, Gate4AReducedOrderPathModel())
+        :hil_wfs_path,
+        source,
+        Gate4AReducedOrderPathModel())
+    science_path = OpticalPathDefinition(
+        :hil_science_path, source, Gate4AReducedOrderPathModel())
     residual_acquisition = AcquisitionDefinition(
         :hil_wfs, :hil_wfs_path, residual_model)
     feedback_acquisition = AcquisitionDefinition(
         :hil_dm_feedback, :hil_wfs_path, feedback_model)
+    science_acquisition = AcquisitionDefinition(
+        :hil_science, :hil_science_path, science_model)
     optic = ControllableOpticDefinition(
         :hil_dm,
         Gate4AReducedOrderOpticModel(),
         (schema,);
         placement=PupilPlanePlacement(),
         visibility=AllPathVisibility())
+    paths = config.science_enabled ? (path, science_path) : (path,)
+    acquisitions = config.science_enabled ?
+        (
+            residual_acquisition,
+            feedback_acquisition,
+            science_acquisition,
+        ) :
+        (residual_acquisition, feedback_acquisition)
     definition = PlantDefinition(
         ;
         telescope,
         atmosphere,
         controllable_optics=(optic,),
-        paths=(path,),
-        acquisitions=(residual_acquisition, feedback_acquisition))
+        paths,
+        acquisitions)
     plant = prepare_plant(
         definition;
         run_seed=config.run_seed,
@@ -373,34 +424,76 @@ function _prepare_gate4a_plant(config::Gate4AWorkloadConfig)
                 zeros(T, 2);
                 capacity=config.command_capacity),
         ))
+    optical_samples = config.science_enabled ?
+        (
+            OpticalSampleDefinition(
+                :hil_wfs_path,
+                PeriodicSchedule(
+                    period_ns=config.optical_sample_period_ns,
+                    phase_ns=0)),
+            OpticalSampleDefinition(
+                :hil_science_path,
+                PeriodicSchedule(
+                    period_ns=config.science_sample_period_ns,
+                    phase_ns=0)),
+        ) :
+        (
+            OpticalSampleDefinition(
+                :hil_wfs_path,
+                PeriodicSchedule(
+                    period_ns=config.optical_sample_period_ns,
+                    phase_ns=0)),
+        )
+    acquisition_events = config.science_enabled ?
+        (
+            AcquisitionEventDefinition(
+                :hil_wfs,
+                DirectMeasurementAcquisitionDefinition(
+                    PlantDuration(config.primary_exposure_ns)),
+                PeriodicAcquisitionStart(
+                    PeriodicSchedule(
+                        period_ns=config.primary_period_ns,
+                        phase_ns=0))),
+            AcquisitionEventDefinition(
+                :hil_dm_feedback,
+                DirectMeasurementAcquisitionDefinition(
+                    PlantDuration(config.feedback_exposure_ns)),
+                PeriodicAcquisitionStart(
+                    PeriodicSchedule(
+                        period_ns=config.feedback_period_ns,
+                        phase_ns=config.feedback_phase_ns))),
+            AcquisitionEventDefinition(
+                :hil_science,
+                DirectMeasurementAcquisitionDefinition(
+                    PlantDuration(config.science_exposure_ns)),
+                PeriodicAcquisitionStart(
+                    PeriodicSchedule(
+                        period_ns=config.science_period_ns,
+                        phase_ns=0))),
+        ) :
+        (
+            AcquisitionEventDefinition(
+                :hil_wfs,
+                DirectMeasurementAcquisitionDefinition(
+                    PlantDuration(config.primary_exposure_ns)),
+                PeriodicAcquisitionStart(
+                    PeriodicSchedule(
+                        period_ns=config.primary_period_ns,
+                        phase_ns=0))),
+            AcquisitionEventDefinition(
+                :hil_dm_feedback,
+                DirectMeasurementAcquisitionDefinition(
+                    PlantDuration(config.feedback_exposure_ns)),
+                PeriodicAcquisitionStart(
+                    PeriodicSchedule(
+                        period_ns=config.feedback_period_ns,
+                        phase_ns=config.feedback_phase_ns))),
+        )
     event_loop = prepare_plant_event_loop(
         plant,
         PlantEventLoopDefinition(
-            (
-                OpticalSampleDefinition(
-                    :hil_wfs_path,
-                    PeriodicSchedule(
-                        period_ns=config.optical_sample_period_ns,
-                        phase_ns=0)),
-            ),
-            (
-                AcquisitionEventDefinition(
-                    :hil_wfs,
-                    DirectMeasurementAcquisitionDefinition(
-                        PlantDuration(config.primary_exposure_ns)),
-                    PeriodicAcquisitionStart(
-                        PeriodicSchedule(
-                            period_ns=config.primary_period_ns,
-                            phase_ns=0))),
-                AcquisitionEventDefinition(
-                    :hil_dm_feedback,
-                    DirectMeasurementAcquisitionDefinition(
-                        PlantDuration(config.feedback_exposure_ns)),
-                    PeriodicAcquisitionStart(
-                        PeriodicSchedule(
-                            period_ns=config.feedback_period_ns,
-                            phase_ns=config.feedback_phase_ns))),
-            )))
+            optical_samples,
+            acquisition_events))
     return (; plant, event_loop, schema)
 end
 
@@ -411,8 +504,17 @@ end
 
 function prepare_gate4a_fixture(
     clock::Clocks.AbstractNanoClock,
-    config::Gate4AWorkloadConfig=Gate4AWorkloadConfig())
+    config::Gate4AWorkloadConfig=Gate4AWorkloadConfig();
+    optical_execution::AbstractOpticalExecutionConfiguration=
+        SerialOpticalExecution(),
+    arm_timeout_ns::Integer=1_000_000_000,
+    shutdown_policy::RunShutdownPolicy=RunShutdownPolicy(
+        acknowledgement_timeout_ns=1_000_000_000,
+        drain_timeout_ns=2_000_000_000))
+    fixture_start_ns = time_ns()
     core = _prepare_gate4a_plant(config)
+    wfs_acquisition = prepared_acquisition(
+        core.plant, :hil_wfs)
     session = RunSessionID(config.run_seed)
     endpoint = prepared_command_endpoint(core.plant, :hil_dm)
     command_ports = prepare_command_ports(
@@ -458,14 +560,45 @@ function prepare_gate4a_fixture(
         ring_capacity=config.feedback_product_capacity,
         delivery_contract=delivery,
         overload_policy=required_acquisition_policy)
+    optional_science_policy = AcquisitionOverloadPolicy(
+        OptionalResource(),
+        DropNewestOnFull();
+        maximum_lateness_ns=nothing,
+        recovery_occupancy=0)
+    science_port = config.science_enabled ?
+        prepare_acquisition_completion_port(
+            AcquisitionID(:hil_science),
+            _product_buffers(
+                core.plant,
+                :hil_science,
+                config.science_product_capacity);
+            session,
+            product_pool_id=UInt64(0x7c22),
+            ring_capacity=config.science_product_capacity,
+            delivery_contract=delivery,
+            overload_policy=optional_science_policy) :
+        nothing
+    acquisition_ports = config.science_enabled ?
+        (wfs_port, feedback_port, science_port) :
+        (wfs_port, feedback_port)
     configuration = configure_serial_run(
         bridge,
-        (wfs_port, feedback_port);
-        arm_timeout_ns=1_000_000_000,
-        shutdown_policy=RunShutdownPolicy(
-            acknowledgement_timeout_ns=1_000_000_000,
-            drain_timeout_ns=2_000_000_000))
+        acquisition_ports;
+        optical_execution,
+        arm_timeout_ns,
+        shutdown_policy)
+    configured_ns = time_ns()
     run = prepare_serial_run(configuration)
+    precompile(
+        begin_serial_arm!,
+        (typeof(run), typeof(clock)))
+    precompile(
+        arm_serial_run!,
+        (
+            ArmingSerialRun{typeof(run),typeof(clock)},
+            AdapterReadinessSnapshot,
+        ))
+    prepared_ns = time_ns()
     attempt = begin_serial_arm!(run, clock)
     readiness = AdapterReadinessSnapshot(
         session,
@@ -473,7 +606,16 @@ function prepare_gate4a_fixture(
         AdapterReady,
         Clocks.time_nanos(clock))
     armed = arm_serial_run!(attempt, readiness)
+    armed_ns = time_ns()
     running = start_serial_run!(armed)
+    started_ns = time_ns()
+    lifecycle_timings = (
+        configuration_ns=Int(configured_ns - fixture_start_ns),
+        preparation_ns=Int(prepared_ns - configured_ns),
+        arm_ns=Int(armed_ns - prepared_ns),
+        start_ns=Int(started_ns - armed_ns),
+        total_ns=Int(started_ns - fixture_start_ns),
+    )
     return merge(
         core,
         (;
@@ -482,28 +624,38 @@ function prepare_gate4a_fixture(
             bridge,
             wfs_port,
             feedback_port,
+            science_port,
+            wfs_acquisition,
             configuration,
             run,
             clock,
             attempt,
             readiness,
             armed,
-            running))
+            running,
+            lifecycle_timings))
 end
 
 primary_product_sequence(fixture) = acquisition_product_sequence(
     fixture.event_loop,
     plant_event_loop_state(fixture.run.state.bridge),
-    :hil_wfs)
+    _HIL_WFS_ACQUISITION)
 
 feedback_product_sequence(fixture) = acquisition_product_sequence(
     fixture.event_loop,
     plant_event_loop_state(fixture.run.state.bridge),
-    :hil_dm_feedback)
+    _HIL_DM_FEEDBACK_ACQUISITION)
+
+science_product_sequence(fixture) = fixture.science_port === nothing ?
+    UInt64(0) :
+    acquisition_product_sequence(
+        fixture.event_loop,
+        plant_event_loop_state(fixture.run.state.bridge),
+        _HIL_SCIENCE_ACQUISITION)
 
 function latest_optical_sample_timestamp(fixture)
     return Plant.reduced_order_sample_timestamp(
-        prepared_acquisition(fixture.plant, :hil_wfs))
+        fixture.wfs_acquisition)
 end
 
 end
