@@ -336,6 +336,12 @@ if "gate8" in SELECTED_BENCHMARK_TEST_GROUPS
     @test_throws ErrorException validate_gate8_contract(
         invalid_owner_count)
 
+    invalid_scheduler_priority = deepcopy(contract)
+    invalid_scheduler_priority[
+        "execution_scheduler_priority"] = 19
+    @test_throws ErrorException validate_gate8_contract(
+        invalid_scheduler_priority)
+
     relaxed_latency = deepcopy(contract)
     relaxed_latency[
         "max_target_p99_publication_lateness_ns"] += 1

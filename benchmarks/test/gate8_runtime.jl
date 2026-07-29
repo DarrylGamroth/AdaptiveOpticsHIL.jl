@@ -84,7 +84,8 @@ end
     @test length(pinning["owner_cpu_ids"]) ==
         GATE8_TEST_CONTRACT["execution_owner_count"]
     @test !pinning["cpu_reservation_claimed"]
-    @test !pinning["real_time_scheduling_claimed"]
+    @test !haskey(
+        pinning, "real_time_scheduling_claimed")
     contract = deepcopy(GATE8_TEST_CONTRACT)
     contract["correctness_frames"] = 64
     report = exact_correctness_report(

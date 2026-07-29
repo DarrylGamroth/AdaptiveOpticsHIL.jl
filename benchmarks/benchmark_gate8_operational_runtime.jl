@@ -31,6 +31,8 @@ const GATE8_FROZEN_CONTRACT_VALUES = (
         "four Julia default-pool threads pinned to distinct physical cores; owners assigned to threads and CPU IDs",
     "thread_pinning_policy" =>
         "ThreadPinning.pinthreads(:cores); distinct physical cores before SMT siblings",
+    "execution_scheduler_policy" => "SCHED_FIFO",
+    "execution_scheduler_priority" => 20,
     "execution_owner_maximum_lateness_ns" => 50_000_000,
     "required_product_capacity_horizon_ns" => 64_000_000,
     "arm_timeout_ns" => 5_000_000_000,
@@ -195,6 +197,12 @@ function validate_gate8_contract(contract)
         "ThreadPinning.pinthreads(:cores); distinct physical cores before SMT siblings" ||
         error(
             "the Gate 8 Agent candidate requires the frozen physical-core pinning policy")
+    contract["execution_scheduler_policy"] == "SCHED_FIFO" ||
+        error(
+            "the Gate 8 Agent candidate requires Linux SCHED_FIFO")
+    contract["execution_scheduler_priority"] == 20 ||
+        error(
+            "the Gate 8 Agent candidate requires SCHED_FIFO priority 20")
     contract["execution_owner_maximum_lateness_ns"] ==
         50_000_000 || error(
             "the amended Gate 8 owner watchdog is 50 ms")
@@ -991,6 +999,14 @@ function operational_policy_manifest(contract, workload)
             "thread_pinning" =>
                 Operational.gate8_thread_pinning_snapshot(
                     contract),
+            "scheduler" => Dict{String,Any}(
+                "policy" =>
+                    contract["execution_scheduler_policy"],
+                "priority" =>
+                    contract["execution_scheduler_priority"],
+                "configured_externally" => true,
+                "cpu_reservation_claimed" => false,
+                "cpu_irq_isolation_claimed" => false),
             "due_and_completion_ring_capacity" =>
                 contract["execution_owner_ring_capacity"],
             "overload_action" => "FailRunOnOwnerOverload",
@@ -1086,14 +1102,15 @@ function gate8_environment_snapshot(
     contract_path,
     repository_status,
     contract,
-    workload)
+    workload,
+    scheduler)
     report = environment_snapshot(
         contract_path,
         repository_status)
     report["invocation"] =
         "JULIA_NUM_THREADS=4,0 OPENBLAS_NUM_THREADS=1 " *
         "OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 " *
-        "julia --startup-file=no " *
+        "chrt --fifo 20 julia --startup-file=no " *
         "--project=benchmarks " *
         "benchmarks/benchmark_gate8_operational_runtime.jl " *
         "--output <artifact>"
@@ -1103,6 +1120,7 @@ function gate8_environment_snapshot(
         "interactive" => Threads.nthreads(:interactive))
     report["thread_pinning"] =
         Operational.gate8_thread_pinning_snapshot(contract)
+    report["scheduler"] = scheduler
     report["fft_threads"] = 1
     report["julia_num_gc_threads"] =
         get(ENV, "JULIA_NUM_GC_THREADS", "runtime default")
@@ -2317,6 +2335,8 @@ function gate8_main(arguments=ARGS)
         contract["julia_interactive_threads"] || error(
         "Gate 8 evidence requires the frozen interactive-pool thread count")
     Operational.pin_gate8_julia_threads!(contract)
+    scheduler =
+        Operational.require_gate8_scheduler!(contract)
     Base.JLOptions().startupfile == 2 || error(
         "Gate 8 evidence requires --startup-file=no")
     Base.JLOptions().code_coverage == 0 || error(
@@ -2333,7 +2353,8 @@ function gate8_main(arguments=ARGS)
         options.contract_path,
         repository_status,
         contract,
-        workload)
+        workload,
+        scheduler)
 
     println("Gate 8: cold lifecycle and first use")
     flush(stdout)

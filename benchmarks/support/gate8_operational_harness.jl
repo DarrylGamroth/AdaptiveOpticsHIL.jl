@@ -265,6 +265,94 @@ function pin_gate8_julia_threads!(
     return cpu_ids
 end
 
+const GATE8_SCHED_FIFO_POLICY_ID = 1
+
+@inline function _gate8_current_scheduler()
+    policy = ccall(
+        :sched_getscheduler,
+        Cint,
+        (Cint,),
+        0)
+    policy >= 0 || error(
+        "Gate 8 could not read the current Linux scheduler policy")
+    parameter = Ref{Cint}(0)
+    ccall(
+        :sched_getparam,
+        Cint,
+        (Cint, Ref{Cint}),
+        0,
+        parameter) == 0 || error(
+            "Gate 8 could not read the current Linux scheduler priority")
+    return Int(policy), Int(parameter[])
+end
+
+function gate8_scheduler_snapshot(contract)
+    Sys.islinux() || error(
+        "Gate 8 SCHED_FIFO qualification is supported only on Linux")
+    thread_count = Threads.nthreads(:default)
+    julia_thread_ids = fill(0, thread_count)
+    linux_thread_ids = fill(0, thread_count)
+    cpu_ids = fill(-1, thread_count)
+    policy_ids = fill(-1, thread_count)
+    priorities = fill(-1, thread_count)
+    Threads.@threads :static for _ in 1:thread_count
+        julia_thread_id = Threads.threadid()
+        policy, priority = _gate8_current_scheduler()
+        @inbounds begin
+            julia_thread_ids[julia_thread_id] =
+                julia_thread_id
+            linux_thread_ids[julia_thread_id] =
+                Int(ccall(:gettid, Cint, ()))
+            cpu_ids[julia_thread_id] =
+                Int(ccall(:sched_getcpu, Cint, ()))
+            policy_ids[julia_thread_id] = policy
+            priorities[julia_thread_id] = priority
+        end
+    end
+    expected_policy = contract["execution_scheduler_policy"]
+    expected_priority =
+        contract["execution_scheduler_priority"]
+    matching_policy =
+        expected_policy == "SCHED_FIFO" &&
+        all(==(GATE8_SCHED_FIFO_POLICY_ID), policy_ids)
+    matching_priority =
+        all(==(expected_priority), priorities)
+    return Dict{String,Any}(
+        "provider" => "Linux sched_getscheduler/sched_getparam",
+        "required_policy" => expected_policy,
+        "required_policy_id" =>
+            GATE8_SCHED_FIFO_POLICY_ID,
+        "required_priority" => expected_priority,
+        "julia_default_thread_ids" =>
+            julia_thread_ids,
+        "linux_thread_ids" => linux_thread_ids,
+        "cpu_ids" => cpu_ids,
+        "policy_ids" => policy_ids,
+        "priorities" => priorities,
+        "all_threads_match_contract" =>
+            matching_policy && matching_priority,
+        "cpu_reservation_claimed" => false,
+        "cpu_irq_isolation_claimed" => false,
+        "profile_requires_real_time_scheduling" => true,
+        "real_time_scheduling_claimed" =>
+            matching_policy && matching_priority)
+end
+
+function require_gate8_scheduler!(contract)
+    snapshot = gate8_scheduler_snapshot(contract)
+    snapshot["all_threads_match_contract"] || error(
+        "Gate 8 evidence requires every Julia default-pool thread " *
+        "to run under $(contract["execution_scheduler_policy"]) " *
+        "priority $(contract["execution_scheduler_priority"])")
+    snapshot["cpu_ids"] ==
+        collect(gate8_thread_cpu_ids(contract)) || error(
+            "Gate 8 scheduler sampling did not execute each Julia " *
+            "thread on its pinned CPU")
+    allunique(snapshot["linux_thread_ids"]) || error(
+        "Gate 8 scheduler sampling did not observe distinct Linux threads")
+    return snapshot
+end
+
 function gate8_owner_cpu_ids(contract)
     thread_ids = gate8_owner_thread_ids(contract)
     cpu_ids = gate8_thread_cpu_ids(contract)
@@ -292,8 +380,7 @@ function gate8_thread_pinning_snapshot(contract)
             collect(gate8_owner_thread_ids(contract)),
         "owner_cpu_ids" =>
             collect(gate8_owner_cpu_ids(contract)),
-        "cpu_reservation_claimed" => false,
-        "real_time_scheduling_claimed" => false)
+        "cpu_reservation_claimed" => false)
 end
 
 gate8_owner_idle_strategy_factory(::Any) =

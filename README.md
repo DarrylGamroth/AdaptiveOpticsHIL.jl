@@ -425,9 +425,11 @@ claim limits are maintained in
 The selected low-tail candidate assigns each owner to a distinct Julia thread
 and CPU, pins all four Julia default-pool threads to distinct physical cores
 with ThreadPinning.jl, and uses `Agent.BusySpinIdleStrategy` for owner and
-coordinator barrier waits. It consumes CPU continuously while idle. Affinity
-does not reserve cores; the candidate carries no CPU/IRQ-isolation or real-time
-scheduling claim.
+coordinator barrier waits. It consumes CPU continuously while idle. The
+qualifying process runs under Linux `SCHED_FIFO` priority 20; the benchmark
+verifies the policy and priority on every Julia default-pool thread and records
+their Linux thread and CPU IDs. This profile still does not reserve cores or
+claim CPU/IRQ isolation.
 
 CI runs the bounded benchmark-contract suite plus the focused four-thread
 Gate 8.9 runtime smoke. The full Gate 8 campaign is a deliberate qualification
@@ -447,7 +449,7 @@ one BLAS/FFT-provider thread:
 ```sh
 JULIA_NUM_THREADS=4,0 OPENBLAS_NUM_THREADS=1 \
 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
-julia --startup-file=no --project=benchmarks \
+chrt --fifo 20 julia --startup-file=no --project=benchmarks \
     benchmarks/benchmark_gate8_operational_runtime.jl \
     --output benchmarks/results/gate8/YYYY-MM-DD-operational-runtime.toml
 ```
