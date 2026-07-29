@@ -54,11 +54,10 @@ const GATE8_FROZEN_CONTRACT_VALUES = (
     "calibration_runs" => 3,
     "calibration_samples_per_run" => 100_000,
     "minimum_calibrated_rate_hz" => 4_500,
-    "derived_rate_preserve_capacity_time_headroom" => true,
-    "near_saturation_fraction" => 0.70,
-    "saturation_fraction" => 0.85,
-    "overload_fraction" => 2.0,
-    "rate_rounding_hz" => 100,
+    "stress_rate_preserve_capacity_time_headroom" => true,
+    "near_saturation_rate_hz" => 3_000,
+    "saturation_rate_hz" => 4_000,
+    "overload_rate_hz" => 12_000,
     "near_saturation_runs" => 3,
     "near_saturation_samples_per_run" => 100_000,
     "saturation_runs" => 3,
@@ -87,7 +86,7 @@ const GATE8_FROZEN_CONTRACT_VALUES = (
     "max_inclusive_alloc_bytes_per_frame" => 16_384,
     "max_gc_fraction" => 0.05,
     "max_target_rate_error_fraction" => 0.005,
-    "max_derived_rate_error_fraction" => 0.01,
+    "max_stress_rate_error_fraction" => 0.01,
     "max_target_p99_publication_lateness_ns" => 500_000,
     "max_target_p99_observation_delay_ns" => 500_000,
     "max_target_p99_closed_loop_response_ns" => 1_000_000,
@@ -248,11 +247,16 @@ function validate_gate8_contract(contract)
         contract["science_stall_primary_frames"] +
         contract["science_recovery_frames"] || error(
             "the science phase does not retain its declared recovery tail")
-    0 < contract["near_saturation_fraction"] <
-        contract["saturation_fraction"] < 1 || error(
-            "near-saturation and saturation fractions are inconsistent")
-    contract["overload_fraction"] == 2.0 || error(
-        "the amended bounded-overload drive is twice calibrated capacity")
+    contract["target_rate_hz"] <
+        contract["near_saturation_rate_hz"] <
+        contract["saturation_rate_hz"] <=
+        contract["minimum_calibrated_rate_hz"] || error(
+            "fixed target, near-saturation, saturation, and " *
+            "calibration-eligibility rates are inconsistent")
+    contract["overload_rate_hz"] >=
+        2 * contract["minimum_calibrated_rate_hz"] || error(
+            "the fixed bounded-overload drive must remain at least " *
+            "twice the host-eligibility floor")
     contract["soak_duration_ns"] >= 300_000_000_000 || error(
         "the Gate 8 soak must last at least 300 seconds")
     contract["soak_schedule_guard_ns"] > 0 || error(
@@ -332,18 +336,6 @@ function validate_gate8_contract(contract)
     contract["minimum_calibrated_rate_hz"] >=
         2 * contract["target_rate_hz"] || error(
             "calibrated-capacity eligibility must remain at least twice the target rate")
-    derived_rate(
-        contract["minimum_calibrated_rate_hz"],
-        contract["near_saturation_fraction"],
-        contract["rate_rounding_hz"],
-    ) > contract["target_rate_hz"] || error(
-        "floor-derived near-saturation rate must remain above the target rate")
-    derived_rate(
-        contract["minimum_calibrated_rate_hz"],
-        contract["saturation_fraction"],
-        contract["rate_rounding_hz"],
-    ) > contract["target_rate_hz"] || error(
-        "floor-derived saturation rate must remain above the target rate")
     burst_duration_ns =
         contract["burst_frames"] *
         workload["primary_period_ns"]
@@ -1015,14 +1007,21 @@ function operational_policy_manifest(contract, workload)
                     "execution_owner_maximum_lateness_ns"],
             "batch_observation" =>
                 "per-interval completed path-batch and owner work counters"),
-        "derived_rate_capacity_policy" => Dict{String,Any}(
+        "stress_rate_capacity_policy" => Dict{String,Any}(
             "preserve_time_headroom" =>
                 contract[
-                    "derived_rate_preserve_capacity_time_headroom"],
+                    "stress_rate_preserve_capacity_time_headroom"],
             "scaling_basis" =>
-                "ceil(base capacity * base primary period / derived primary period)",
+                "ceil(base capacity * base primary period / stress primary period)",
             "applies_to" =>
                 "command, primary, feedback, and science bounded capacities",
+            "rates_selected_from_unpaced_calibration" => false,
+            "near_saturation_rate_hz" =>
+                contract["near_saturation_rate_hz"],
+            "saturation_rate_hz" =>
+                contract["saturation_rate_hz"],
+            "overload_rate_hz" =>
+                contract["overload_rate_hz"],
             "target_phase_capacities_unchanged" => true),
         "compilation_hygiene" => Dict{String,Any}(
             "uniformly_scaled_primary_rate_hz" => 0.25,
@@ -2096,7 +2095,7 @@ function gate8_gate_report(
             "passed" =>
                 rate_fidelity_passed(
                     near_reports,
-                    contract["max_derived_rate_error_fraction"]) &&
+                    contract["max_stress_rate_error_fraction"]) &&
                 all(
                     report -> bounded_success_accounting(
                         report, contract),
@@ -2105,7 +2104,7 @@ function gate8_gate_report(
             "passed" =>
                 rate_fidelity_passed(
                     saturation_reports,
-                    contract["max_derived_rate_error_fraction"]) &&
+                    contract["max_stress_rate_error_fraction"]) &&
                 all(
                     report -> bounded_success_accounting(
                         report, contract),
@@ -2240,17 +2239,6 @@ function gate8_gate_report(
         get(gate, "passed", true)
         for gate in values(gates))
     return gates
-end
-
-function derived_rate(
-    calibrated_rate_hz,
-    fraction,
-    rounding_hz)
-    rate = floor(
-        calibrated_rate_hz * fraction / rounding_hz) *
-        rounding_hz
-    rate > 0 || error("derived operational rate was not positive")
-    return rate
 end
 
 function minimum_soak_sample_count(contract, workload)
@@ -2515,24 +2503,15 @@ function gate8_main(arguments=ARGS)
             "measured_minimum_hz=$(calibrated_rate_hz), " *
             "required_minimum_hz=" *
             string(contract["minimum_calibrated_rate_hz"]))
-    near_rate_hz = derived_rate(
-        calibrated_rate_hz,
-        contract["near_saturation_fraction"],
-        contract["rate_rounding_hz"])
-    saturation_rate_hz = derived_rate(
-        calibrated_rate_hz,
-        contract["saturation_fraction"],
-        contract["rate_rounding_hz"])
-    overload_rate_hz = derived_rate(
-        calibrated_rate_hz,
-        contract["overload_fraction"],
-        contract["rate_rounding_hz"])
+    near_rate_hz = contract["near_saturation_rate_hz"]
+    saturation_rate_hz = contract["saturation_rate_hz"]
+    overload_rate_hz = contract["overload_rate_hz"]
 
     near_workload = workload_at_rate(
         workload,
         near_rate_hz;
         preserve_capacity_time_headroom=contract[
-            "derived_rate_preserve_capacity_time_headroom"])
+            "stress_rate_preserve_capacity_time_headroom"])
     near_config = Harness.BoundaryRunConfig(
         samples=contract["near_saturation_samples_per_run"],
         checkpoint_stride=contract["checkpoint_stride"])
@@ -2561,7 +2540,7 @@ function gate8_main(arguments=ARGS)
         workload,
         saturation_rate_hz;
         preserve_capacity_time_headroom=contract[
-            "derived_rate_preserve_capacity_time_headroom"])
+            "stress_rate_preserve_capacity_time_headroom"])
     saturation_config = Harness.BoundaryRunConfig(
         samples=contract["saturation_samples_per_run"],
         checkpoint_stride=contract["checkpoint_stride"])
@@ -2594,7 +2573,7 @@ function gate8_main(arguments=ARGS)
         workload,
         overload_rate_hz;
         preserve_capacity_time_headroom=contract[
-            "derived_rate_preserve_capacity_time_headroom"])
+            "stress_rate_preserve_capacity_time_headroom"])
     overload_result = Operational.execute_required_overload(
         contract,
         overload_workload,

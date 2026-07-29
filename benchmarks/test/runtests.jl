@@ -361,7 +361,7 @@ if "gate8" in SELECTED_BENCHMARK_TEST_GROUPS
         incomplete_compilation_coverage)
 
     insufficient_overload_drive = deepcopy(contract)
-    insufficient_overload_drive["overload_fraction"] = 1.25
+    insufficient_overload_drive["overload_rate_hz"] = 8_000
     @test_throws ErrorException validate_gate8_contract(
         insufficient_overload_drive)
 
@@ -375,16 +375,13 @@ if "gate8" in SELECTED_BENCHMARK_TEST_GROUPS
     @test contract["minimum_calibrated_rate_hz"] == 4_500
     @test contract["minimum_calibrated_rate_hz"] >=
         2 * contract["target_rate_hz"]
-    @test derived_rate(
-        contract["minimum_calibrated_rate_hz"],
-        contract["near_saturation_fraction"],
-        contract["rate_rounding_hz"],
-    ) > contract["target_rate_hz"]
-    @test derived_rate(
-        contract["minimum_calibrated_rate_hz"],
-        contract["saturation_fraction"],
-        contract["rate_rounding_hz"],
-    ) > contract["target_rate_hz"]
+    @test contract["near_saturation_rate_hz"] == 3_000
+    @test contract["saturation_rate_hz"] == 4_000
+    @test contract["overload_rate_hz"] == 12_000
+    @test contract["target_rate_hz"] <
+        contract["near_saturation_rate_hz"] <
+        contract["saturation_rate_hz"] <=
+        contract["minimum_calibrated_rate_hz"]
     @test workload.science_enabled
     @test workload.primary_period_ns ==
         contract["workload"]["primary_period_ns"]

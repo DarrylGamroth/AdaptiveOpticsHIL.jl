@@ -415,7 +415,8 @@ The maintained Gate 8.9 contract separately qualifies the single-host,
 in-memory, two-owner CPU runtime over the same reduced-order boundary. It
 preserves exact serial/deterministic/Agent-owner replay and records fixed 2 kHz
 target load, consumer interruption, optional-stream shedding, calibrated
-capacity, near-saturation, saturation, required overload, fresh recovery,
+host eligibility, fixed-rate near-saturation and saturation, required overload,
+fresh recovery,
 injected owner failure, a named drain deficit, clean lifecycle timing, and a
 300 s soak. This remains a runtime and lifecycle claim: external transport,
 RTC-process latency, accelerator execution, full optical propagation, and
