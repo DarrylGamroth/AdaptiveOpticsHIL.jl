@@ -8,6 +8,7 @@ const TEST_GROUP_FILES = (
     "ports" => "ports.jl",
     "serial" => "serial.jl",
     "execution" => "execution.jl",
+    "hsm-proof" => "hsm_lifecycle_proof.jl",
 )
 
 function selected_test_groups(arguments)

@@ -12,12 +12,14 @@ Clocks = "6b5ade5d-6e95-4584-b343-73eec2e8782b"
 AdaptiveOpticsSim = {url = "https://github.com/DarrylGamroth/AdaptiveOpticsSim.jl.git", rev = "5bf180341faad9350622f9c660147205aebf33dc"}
 Agent = {url = "https://github.com/DarrylGamroth/Agent.jl.git", rev = "71e3af4e5c112f0433e03d57a570bc74ffd05ccc"}
 Clocks = {url = "https://github.com/DarrylGamroth/Clocks.jl.git", rev = "1b705421648b70b6d171f8a95d6c2d16c2444d0b"}
+Hsm = {url = "https://github.com/DarrylGamroth/Hsm.jl.git", rev = "1d751d462dead3e25cfa5a4eb53328e0b7507c3d"}
 
 [compat]
 AdaptiveOpticsSim = "0.1"
 Agent = "0.4.1"
 Aqua = "0.8"
 Clocks = "0.3"
+Hsm = "0.3"
 InteractiveUtils = "1"
 LinearAlgebra = "1"
 Test = "1"
@@ -25,9 +27,10 @@ julia = "1.12"
 
 [extras]
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
+Hsm = "ae4ab49b-60bf-4949-b8fd-fb49b1a0d067"
 InteractiveUtils = "b77e0a4c-d291-57a0-90e8-8db25a27a240"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Aqua", "InteractiveUtils", "LinearAlgebra", "Test"]
+test = ["Aqua", "Hsm", "InteractiveUtils", "LinearAlgebra", "Test"]
