@@ -17,6 +17,14 @@ const DEFAULT_GATE8_CONTRACT = joinpath(
     BENCHMARK_ROOT,
     "contracts",
     "gate8_operational_runtime.toml")
+const GATE8_ENVIRONMENT_PACKAGES = (
+    "AdaptiveOpticsHIL",
+    "AdaptiveOpticsSim",
+    "Agent",
+    "Clocks",
+    "HdrHistogram",
+    "ThreadPinning",
+)
 
 const GATE8_FROZEN_CONTRACT_VALUES = (
     "julia_threads" => 4,
@@ -1114,6 +1122,8 @@ function gate8_environment_snapshot(
         "benchmarks/benchmark_gate8_operational_runtime.jl " *
         "--output <artifact>"
     report["package_load_ns"] = GATE8_PACKAGE_LOAD_NS
+    report["packages"] =
+        package_snapshot(GATE8_ENVIRONMENT_PACKAGES)
     report["thread_pools"] = Dict{String,Any}(
         "default" => Threads.nthreads(:default),
         "interactive" => Threads.nthreads(:interactive))

@@ -303,6 +303,14 @@ if "gate8" in SELECTED_BENCHMARK_TEST_GROUPS
 @testset "Gate 8 operational benchmark contract" begin
     contract = TOML.parsefile(DEFAULT_GATE8_CONTRACT)
     @test validate_gate8_contract(contract)
+    @test Set(GATE8_ENVIRONMENT_PACKAGES) == Set((
+        "AdaptiveOpticsHIL",
+        "AdaptiveOpticsSim",
+        "Agent",
+        "Clocks",
+        "HdrHistogram",
+        "ThreadPinning",
+    ))
 
     semantic_fields = semantic_counter_field_names()
     @test semantic_fields isa Vector{String}
