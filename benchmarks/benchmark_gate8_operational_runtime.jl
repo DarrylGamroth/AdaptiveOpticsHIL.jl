@@ -1118,8 +1118,18 @@ function gate8_environment_snapshot(
     report["thread_pools"] = Dict{String,Any}(
         "default" => Threads.nthreads(:default),
         "interactive" => Threads.nthreads(:interactive))
-    report["thread_pinning"] =
+    thread_pinning =
         Operational.gate8_thread_pinning_snapshot(contract)
+    report["thread_pinning"] = thread_pinning
+    report["coordinator_allowed_cpu_list"] =
+        report["allowed_cpu_list"]
+    report["allowed_cpu_list"] = join(
+        thread_pinning["julia_default_thread_cpu_ids"], ",")
+    report["allowed_cpu_list_scope"] =
+        "union of per-thread affinity; exact mapping is in thread_pinning"
+    report["affinity_applied_by_benchmark"] = true
+    report["isolation_applied_by_benchmark"] = false
+    report["affinity_or_isolation_applied_by_benchmark"] = true
     report["scheduler"] = scheduler
     report["fft_threads"] = 1
     report["julia_num_gc_threads"] =
