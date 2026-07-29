@@ -947,12 +947,21 @@ end
         :command_bridge_event_loop)
     @test Base.ispublic(AdaptiveOpticsHIL.Ports,
         :pending_command_receive_timestamp)
-    @test !AdaptiveOpticsHIL.Serial._command_precedes_plant_event(
-        nothing, nothing)
-    @test !AdaptiveOpticsHIL.Serial._command_precedes_plant_event(
-        nothing, PlantTimestamp(0))
-    @test AdaptiveOpticsHIL.Serial._command_precedes_plant_event(
-        PlantTimestamp(0), nothing)
+    @test !Base.invokelatest(
+        AdaptiveOpticsHIL.Serial._command_precedes_plant_event,
+        nothing,
+        nothing,
+    )
+    @test !Base.invokelatest(
+        AdaptiveOpticsHIL.Serial._command_precedes_plant_event,
+        nothing,
+        PlantTimestamp(0),
+    )
+    @test Base.invokelatest(
+        AdaptiveOpticsHIL.Serial._command_precedes_plant_event,
+        PlantTimestamp(0),
+        nothing,
+    )
     @test AdaptiveOpticsHIL.Serial._command_precedes_plant_event(
         PlantTimestamp(0), PlantTimestamp(0))
     @test !AdaptiveOpticsHIL.Serial._command_precedes_plant_event(

@@ -1781,15 +1781,19 @@ end
         "RTC-ingress-liveness observation exceeded its inclusive execution-clock deadline"))
 end
 
-@inline _command_precedes_plant_event(
+@inline function _command_precedes_plant_event(
     ::Nothing,
     ::Union{Nothing,PlantTimestamp},
-) = false
+)
+    return false
+end
 
-@inline _command_precedes_plant_event(
+@inline function _command_precedes_plant_event(
     ::PlantTimestamp,
     ::Nothing,
-) = true
+)
+    return true
+end
 
 @inline _command_precedes_plant_event(
     command::PlantTimestamp,

@@ -855,6 +855,9 @@ end
     ) isa YieldingIdleStrategy
     @test default_agent_mode.placement isa
         SchedulerManagedExecutionOwnerPlacement
+    @test_throws ExecutionOwnerError AdaptiveOpticsHIL.Execution.
+        _validate_execution_owner_placement(
+            ExecutionTestUnsupportedPlacement())
     name_probe = AdaptiveOpticsHIL.Execution._ExecutionOwnerAgent(
         nothing,
         1,
