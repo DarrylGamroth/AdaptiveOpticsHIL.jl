@@ -47,6 +47,10 @@ end
 const SELECTED_GATE8_RUNTIME_TEST_GROUPS =
     selected_gate8_runtime_test_groups(ARGS)
 
+Operational.pin_gate8_julia_threads!(
+    GATE8_TEST_CONTRACT;
+    require_physical_cores=false)
+
 if "runtime" in SELECTED_GATE8_RUNTIME_TEST_GROUPS
 @testset "Gate 8 secondary product numerical traces" begin
     observer = Operational.ProductTraceObserver(1)
@@ -69,6 +73,18 @@ if "runtime" in SELECTED_GATE8_RUNTIME_TEST_GROUPS
 end
 
 @testset "Gate 8 execution topology correctness" begin
+    pinning =
+        Operational.gate8_thread_pinning_snapshot(
+            GATE8_TEST_CONTRACT)
+    @test pinning["all_threads_pinned"]
+    @test pinning["unique_cpu_ids"]
+    @test length(
+        pinning["julia_default_thread_cpu_ids"]) ==
+        GATE8_TEST_CONTRACT["julia_threads"]
+    @test length(pinning["owner_cpu_ids"]) ==
+        GATE8_TEST_CONTRACT["execution_owner_count"]
+    @test !pinning["cpu_reservation_claimed"]
+    @test !pinning["real_time_scheduling_claimed"]
     contract = deepcopy(GATE8_TEST_CONTRACT)
     contract["correctness_frames"] = 64
     report = exact_correctness_report(

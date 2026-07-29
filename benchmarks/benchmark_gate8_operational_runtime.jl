@@ -28,7 +28,9 @@ const GATE8_FROZEN_CONTRACT_VALUES = (
     "execution_owner_idle_strategy" =>
         "Agent.BusySpinIdleStrategy",
     "execution_owner_placement" =>
-        "unique Julia default-pool threads; no OS affinity",
+        "four Julia default-pool threads pinned to distinct physical cores; owners assigned to threads and CPU IDs",
+    "thread_pinning_policy" =>
+        "ThreadPinning.pinthreads(:cores); distinct physical cores before SMT siblings",
     "execution_owner_maximum_lateness_ns" => 50_000_000,
     "required_product_capacity_horizon_ns" => 64_000_000,
     "arm_timeout_ns" => 5_000_000_000,
@@ -187,8 +189,12 @@ function validate_gate8_contract(contract)
         "Agent.BusySpinIdleStrategy" || error(
         "the Gate 8 candidate requires Agent.BusySpinIdleStrategy")
     contract["execution_owner_placement"] ==
-        "unique Julia default-pool threads; no OS affinity" || error(
-        "the Gate 8 Agent candidate requires explicit Julia-thread assignment")
+        "four Julia default-pool threads pinned to distinct physical cores; owners assigned to threads and CPU IDs" || error(
+        "the Gate 8 Agent candidate requires explicit Julia-thread and CPU assignment")
+    contract["thread_pinning_policy"] ==
+        "ThreadPinning.pinthreads(:cores); distinct physical cores before SMT siblings" ||
+        error(
+            "the Gate 8 Agent candidate requires the frozen physical-core pinning policy")
     contract["execution_owner_maximum_lateness_ns"] ==
         50_000_000 || error(
             "the amended Gate 8 owner watchdog is 50 ms")
@@ -982,6 +988,9 @@ function operational_policy_manifest(contract, workload)
                 contract["execution_owner_idle_strategy"],
             "placement" =>
                 contract["execution_owner_placement"],
+            "thread_pinning" =>
+                Operational.gate8_thread_pinning_snapshot(
+                    contract),
             "due_and_completion_ring_capacity" =>
                 contract["execution_owner_ring_capacity"],
             "overload_action" => "FailRunOnOwnerOverload",
@@ -1092,6 +1101,8 @@ function gate8_environment_snapshot(
     report["thread_pools"] = Dict{String,Any}(
         "default" => Threads.nthreads(:default),
         "interactive" => Threads.nthreads(:interactive))
+    report["thread_pinning"] =
+        Operational.gate8_thread_pinning_snapshot(contract)
     report["fft_threads"] = 1
     report["julia_num_gc_threads"] =
         get(ENV, "JULIA_NUM_GC_THREADS", "runtime default")
@@ -2301,7 +2312,8 @@ function gate8_main(arguments=ARGS)
             "Gate 8 evidence requires all declared Julia threads in the default pool")
     Threads.nthreads(:interactive) ==
         contract["julia_interactive_threads"] || error(
-            "Gate 8 evidence requires the frozen interactive-pool thread count")
+        "Gate 8 evidence requires the frozen interactive-pool thread count")
+    Operational.pin_gate8_julia_threads!(contract)
     Base.JLOptions().startupfile == 2 || error(
         "Gate 8 evidence requires --startup-file=no")
     Base.JLOptions().code_coverage == 0 || error(

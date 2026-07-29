@@ -12,6 +12,7 @@ import Agent
 using Clocks
 using HdrHistogram
 using LinearAlgebra
+using ThreadPinning
 
 using ..Gate4ABoundaryHarness
 
@@ -229,16 +230,86 @@ function gate8_owner_thread_ids(contract)
     return Tuple(default_threads[(end - owner_count + 1):end])
 end
 
+function gate8_thread_cpu_ids(contract)
+    expected_count = contract["julia_threads"]
+    cpu_ids = Tuple(Int(cpu_id) for cpu_id in
+        ThreadPinning.getcpuids())
+    length(cpu_ids) == expected_count || error(
+        "Gate 8 requires one resolved CPU ID per Julia default-pool thread")
+    all(ThreadPinning.getispinned()) || error(
+        "Gate 8 requires every Julia default-pool thread to be pinned")
+    allunique(cpu_ids) || error(
+        "Gate 8 requires unique CPU IDs for all Julia default-pool threads")
+    return cpu_ids
+end
+
+function pin_gate8_julia_threads!(
+    contract;
+    require_physical_cores::Bool=true)
+    Sys.islinux() || error(
+        "Gate 8 ThreadPinning qualification is supported only on Linux")
+    Threads.nthreads(:default) == contract["julia_threads"] || error(
+        "Gate 8 cannot pin an unexpected Julia default-pool topology")
+    ThreadPinning.pinthreads(
+        :cores;
+        nthreads=contract["julia_threads"],
+        threadpool=:default,
+        warn=false)
+    cpu_ids = gate8_thread_cpu_ids(contract)
+    if require_physical_cores
+        all(
+            cpu_id -> !ThreadPinning.ishyperthread(cpu_id),
+            cpu_ids) || error(
+                "Gate 8 requires distinct physical cores before SMT siblings")
+    end
+    return cpu_ids
+end
+
+function gate8_owner_cpu_ids(contract)
+    thread_ids = gate8_owner_thread_ids(contract)
+    cpu_ids = gate8_thread_cpu_ids(contract)
+    return ntuple(
+        index -> cpu_ids[thread_ids[index]],
+        length(thread_ids))
+end
+
+function gate8_thread_pinning_snapshot(contract)
+    cpu_ids = gate8_thread_cpu_ids(contract)
+    return Dict{String,Any}(
+        "provider" => "ThreadPinning.jl",
+        "policy" => contract["thread_pinning_policy"],
+        "julia_default_thread_ids" =>
+            collect(1:length(cpu_ids)),
+        "julia_default_thread_cpu_ids" =>
+            collect(cpu_ids),
+        "all_threads_pinned" =>
+            all(ThreadPinning.getispinned()),
+        "unique_cpu_ids" => allunique(cpu_ids),
+        "physical_cores_before_smt" => all(
+            cpu_id -> !ThreadPinning.ishyperthread(cpu_id),
+            cpu_ids),
+        "owner_thread_ids" =>
+            collect(gate8_owner_thread_ids(contract)),
+        "owner_cpu_ids" =>
+            collect(gate8_owner_cpu_ids(contract)),
+        "cpu_reservation_claimed" => false,
+        "real_time_scheduling_claimed" => false)
+end
+
 gate8_owner_idle_strategy_factory(::Any) =
     Agent.BusySpinIdleStrategy
 
-agent_execution_configuration(contract) =
-    execution_owner_configuration(
+function agent_execution_configuration(contract)
+    thread_ids = gate8_owner_thread_ids(contract)
+    cpu_ids = gate8_owner_cpu_ids(contract)
+    return execution_owner_configuration(
         AgentExecutionOwners(
             gate8_owner_idle_strategy_factory(contract);
             placement=ThreadAssignedExecutionOwnerPlacement(
-                gate8_owner_thread_ids(contract))),
+                thread_ids;
+                cpu_ids)),
         contract)
+end
 
 deterministic_execution_configuration(contract) =
     execution_owner_configuration(
@@ -419,7 +490,8 @@ function execute_injected_owner_failure(
         AgentExecutionOwners(
             idle_strategy_factory;
             placement=ThreadAssignedExecutionOwnerPlacement(
-                gate8_owner_thread_ids(contract))),
+                gate8_owner_thread_ids(contract);
+                cpu_ids=gate8_owner_cpu_ids(contract))),
         contract)
     observer = Gate8FailureTriggerObserver(
         control,

@@ -10,7 +10,8 @@ fft_threads = 1
 execution_owner_count = 2
 execution_owner_ring_capacity = 8
 execution_owner_idle_strategy = "Agent.BusySpinIdleStrategy"
-execution_owner_placement = "unique Julia default-pool threads; no OS affinity"
+execution_owner_placement = "four Julia default-pool threads pinned to distinct physical cores; owners assigned to threads and CPU IDs"
+thread_pinning_policy = "ThreadPinning.pinthreads(:cores); distinct physical cores before SMT siblings"
 execution_owner_maximum_lateness_ns = 50000000
 required_product_capacity_horizon_ns = 64000000
 arm_timeout_ns = 5000000000
@@ -85,7 +86,7 @@ future_baseline_floor_ns = 50000
 scope_exclusions = [
     "external transport, codec, middleware, or RTC-process latency",
     "automatic placement, mixed CPU/GPU placement, GPU operational latency, and multi-GPU",
-    "multi-process, multi-host, cross-host clock discipline, affinity, isolation, and ThreadPinning",
+    "multi-process, multi-host, cross-host clock discipline, CPU/IRQ isolation, and real-time scheduling",
     "full optical propagation, detector physics, production instrument scale, NFIRAOS, and MORFEO capacity",
     "progressive readout, asynchronous PROPER, and production RTC interoperability",
 ]
@@ -133,4 +134,4 @@ unpaced_claim_limit = "capacity calibration is a self-paced diagnostic for rate 
 derived_rate_capacity_policy = "required WFS and feedback paths cover the frozen 64 ms base horizon; near-saturation, saturation, and overload scale bounded descriptor/payload counts by the primary-rate ratio so their time headroom matches the 2 kHz workload"
 injected_failure_policy = "fresh SystemNanoClock fixtures inject at owner batch 64 under the 600 s fault-isolation owner allowance so the benchmark fault is the stable first failure; acknowledgement and drain retain their 1 s and 2 s gates"
 correctness_oracle = "identical serial, deterministic-owner, and Agent-owner reduced-order products, event timestamps, command outcomes, lifecycle state, optional sequence gaps, and final ownership accounting"
-claim = "one non-isolated CPU host, one Julia process, in-memory canonical ports, two long-lived Agent execution owners, deterministic reduced-order workload"
+claim = "one non-isolated CPU host, one Julia process, four physical-core-pinned Julia threads, in-memory canonical ports, two long-lived Agent execution owners, deterministic reduced-order workload"

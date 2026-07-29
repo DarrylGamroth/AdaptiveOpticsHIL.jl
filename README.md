@@ -353,8 +353,10 @@ Package tests are split into `timing`, `lifecycle`, `ownership`, `ports`,
 during development:
 
 ```sh
-julia --startup-file=no --project=. test/runtests.jl execution
-julia --startup-file=no --project=. test/runtests.jl ports serial
+timeout 120s julia --startup-file=no --project=. \
+    test/runtests.jl execution
+timeout 120s julia --startup-file=no --project=. \
+    test/runtests.jl ports serial
 ```
 
 `Pkg.test()` remains the complete package and Aqua gate. The benchmark-contract
@@ -374,12 +376,14 @@ shedding, overload, failure, and drain paths with small workloads. It is the
 development and CI check; it is not durable latency evidence:
 
 ```sh
-JULIA_NUM_THREADS=4,0 OPENBLAS_NUM_THREADS=1 \
-OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
-timeout 120s julia --compile=min -O0 --startup-file=no \
+env JULIA_NUM_THREADS=4,0 OPENBLAS_NUM_THREADS=1 \
+    OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+    timeout 120s julia --compile=min -O0 --startup-file=no \
     --project=benchmarks \
     benchmarks/test/gate8_runtime.jl runtime
-timeout 120s julia --compile=min -O0 --startup-file=no \
+env JULIA_NUM_THREADS=4,0 OPENBLAS_NUM_THREADS=1 \
+    OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+    timeout 120s julia --compile=min -O0 --startup-file=no \
     --project=benchmarks \
     benchmarks/test/gate8_runtime.jl failure
 ```
@@ -419,9 +423,11 @@ instrument-scale capacity are explicitly excluded. The frozen protocol and
 claim limits are maintained in
 [Gate 8.9 issue #25](https://github.com/DarrylGamroth/AdaptiveOpticsHIL.jl/issues/25).
 The selected low-tail candidate assigns each owner to a distinct Julia thread
-and uses `Agent.BusySpinIdleStrategy` for owner and coordinator barrier waits.
-It consumes CPU continuously while idle and carries no OS-affinity, isolation,
-real-time scheduling, or ThreadPinning claim.
+and CPU, pins all four Julia default-pool threads to distinct physical cores
+with ThreadPinning.jl, and uses `Agent.BusySpinIdleStrategy` for owner and
+coordinator barrier waits. It consumes CPU continuously while idle. Affinity
+does not reserve cores; the candidate carries no CPU/IRQ-isolation or real-time
+scheduling claim.
 
 CI runs the bounded benchmark-contract suite plus the focused four-thread
 Gate 8.9 runtime smoke. The full Gate 8 campaign is a deliberate qualification
