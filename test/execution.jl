@@ -26,6 +26,8 @@ const EXECUTION_TEST_SHUTDOWN_POLICY = RunShutdownPolicy(
     drain_timeout_ns=2_000_000_000)
 
 struct ExecutionTestUnsupportedMode <: AbstractExecutionOwnerMode end
+struct ExecutionTestUnsupportedPlacement <:
+    AbstractExecutionOwnerPlacement end
 struct ExecutionTestUnsupportedIdle end
 (::ExecutionTestUnsupportedIdle)() = nothing
 
@@ -836,6 +838,8 @@ end
         serial_executor)
     @test AdaptiveOpticsHIL.Execution.
         _progress_optical_execution_shutdown!(serial_executor)
+    @test AdaptiveOpticsHIL.Execution.
+        _stop_optical_execution!(serial_executor) === serial_executor
     @test !AdaptiveOpticsHIL.Execution._execution_batch_active(
         serial_executor)
     @test AdaptiveOpticsHIL.Execution.
@@ -851,6 +855,16 @@ end
     ) isa YieldingIdleStrategy
     @test default_agent_mode.placement isa
         SchedulerManagedExecutionOwnerPlacement
+    name_probe = AdaptiveOpticsHIL.Execution._ExecutionOwnerAgent(
+        nothing,
+        1,
+        OwnerBeforeDequeue,
+        UInt64(0),
+        "execution-test-owner",
+    )
+    @test Agent.name(name_probe) == "execution-test-owner"
+    @test_throws AgentTerminationException Agent.on_error(
+        name_probe, AgentTerminationException())
     assigned_placement =
         ThreadAssignedExecutionOwnerPlacement((2, 3))
     @test assigned_placement.thread_ids == (2, 3)
@@ -871,6 +885,28 @@ end
         (2, 3), (4,))
     @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerPlacement(
         (2, 3); cpu_ids=(4, 4))
+    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerPlacement(
+        (2, 3); cpu_ids=(true, false))
+    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerPlacement(
+        (2, 3); cpu_ids=(4, "5"))
+    if Base.get_extension(
+            Agent, :AgentThreadPinningExt) === nothing
+        missing_pinning_runner = AgentRunner(
+            YieldingIdleStrategy(), nothing)
+        missing_pinning_placement =
+            ThreadAssignedExecutionOwnerPlacement(
+                (Threads.threadid(),); cpu_ids=(0,))
+        @test_throws ArgumentError AdaptiveOpticsHIL.Execution.
+            _start_execution_owner_runner(
+                missing_pinning_runner,
+                missing_pinning_placement,
+                1,
+            )
+        @test !Agent.is_started(missing_pinning_runner)
+        close(missing_pinning_runner)
+    else
+        @test_skip "missing-ThreadPinning error path requires the extension to be unloaded"
+    end
     backoff_agent_mode = AgentExecutionOwners(
         () -> BackoffIdleStrategy(4, 2, 1_000, 50_000))
     @test backoff_agent_mode.idle_strategy_factory().
@@ -980,6 +1016,13 @@ end
             duplicate_override,
             duplicate_override,
         ),
+    )
+    @test_throws ExecutionOwnerError ExecutionOwnerConfiguration(
+        capacity_configuration.mode,
+        capacity_configuration.cpu_budget,
+        capacity_configuration.cpu_environment;
+        owner_policy=capacity_configuration.owner_policy,
+        owner_policy_overrides=(nothing,),
     )
     @test !applicable(
         ExecutionOwnerConfiguration,
@@ -1160,6 +1203,7 @@ end
     @test missing_error isa ExecutionOwnerError
     @test missing_error.reason ==
         :missing_deterministic_completion
+    @test execution_owner_placement(missing_executor) === nothing
 
     capacity = execution_test_fixture()
     capacity_executor = prepare_execution_test_executor(

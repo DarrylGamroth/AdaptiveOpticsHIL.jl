@@ -947,6 +947,16 @@ end
         :command_bridge_event_loop)
     @test Base.ispublic(AdaptiveOpticsHIL.Ports,
         :pending_command_receive_timestamp)
+    @test !AdaptiveOpticsHIL.Serial._command_precedes_plant_event(
+        nothing, nothing)
+    @test !AdaptiveOpticsHIL.Serial._command_precedes_plant_event(
+        nothing, PlantTimestamp(0))
+    @test AdaptiveOpticsHIL.Serial._command_precedes_plant_event(
+        PlantTimestamp(0), nothing)
+    @test AdaptiveOpticsHIL.Serial._command_precedes_plant_event(
+        PlantTimestamp(0), PlantTimestamp(0))
+    @test !AdaptiveOpticsHIL.Serial._command_precedes_plant_event(
+        PlantTimestamp(1), PlantTimestamp(0))
 
     @testset "Preparation, readiness, and nonblocking pacing" begin
         fixture = serial_test_fixture()
@@ -975,6 +985,13 @@ end
             fixture.readiness
         @test run_termination(fixture.configuration) === nothing
         @test run_termination(fixture.running) === nothing
+        unknown_acquisition_error = captured_serial_error() do
+            serial_acquisition_overload_accounting(
+                fixture.run, AcquisitionID(:unknown))
+        end
+        @test unknown_acquisition_error isa SerialRunError
+        @test unknown_acquisition_error.reason ==
+            :unknown_acquisition
         direct_bridge = prepare_command_bridge(
             fixture.command_ports,
             prepared_command_endpoint(fixture.plant, :hil_dm))
