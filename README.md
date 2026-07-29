@@ -423,6 +423,11 @@ RTC-process latency, accelerator execution, full optical propagation, and
 instrument-scale capacity are explicitly excluded. The frozen protocol and
 claim limits are maintained in
 [Gate 8.9 issue #25](https://github.com/DarrylGamroth/AdaptiveOpticsHIL.jl/issues/25).
+The
+[maintained Gate 8.9 artifact](benchmarks/results/gate8/2026-07-28-operational-runtime.toml)
+and its
+[hash manifest](benchmarks/results/gate8/artifact-manifest.toml)
+contain the current qualified baseline.
 The selected low-tail candidate assigns each owner to a distinct Julia thread
 and CPU, pins all four Julia default-pool threads to distinct physical cores
 with ThreadPinning.jl, and uses `Agent.BusySpinIdleStrategy` for owner and
