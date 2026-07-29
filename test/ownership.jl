@@ -39,6 +39,7 @@ function ring_allocation_bytes(
     validate_ring_layout(ring)
 
     submit_bytes = @allocated try_submit!(ring, UInt64(14))
+    peek_bytes = @allocated try_peek!(output, ring)
     take_bytes = @allocated try_take!(output, ring)
     try_submit!(ring, UInt64(15))
     try_submit!(ring, UInt64(16))
@@ -47,6 +48,7 @@ function ring_allocation_bytes(
     layout_validation_bytes = @allocated validate_ring_layout(ring)
     return (;
         submit_bytes,
+        peek_bytes,
         take_bytes,
         batch_bytes,
         accounting_bytes,
@@ -282,6 +284,8 @@ end
     @testset "Empty, full, wraparound, and slot reuse" begin
         ring = SPSCDescriptorRing{UInt64}(3)
         output = Ref(UInt64(999))
+        @test @inferred(try_peek!(output, ring)) == RingEmpty
+        @test output[] == 999
         @test @inferred(try_take!(output, ring)) == RingEmpty
         @test output[] == 999
 
@@ -291,6 +295,11 @@ end
         @test try_submit!(ring, UInt64(4)) == RingFull
         @test ring_accounting(ring).occupancy == 3
 
+        @test try_peek!(output, ring) == RingTransferSucceeded
+        @test output[] == 1
+        @test ring_accounting(ring).occupancy == 3
+        @test try_peek!(output, ring) == RingTransferSucceeded
+        @test output[] == 1
         @test try_take!(output, ring) == RingTransferSucceeded
         @test output[] == 1
         @test try_submit!(ring, UInt64(4)) == RingTransferSucceeded
@@ -406,11 +415,15 @@ end
         @test close_ring!(ring) == RingClosed
         @test try_submit!(ring, UInt64(3)) == RingClosed
 
+        @test try_peek!(output, ring) == RingTransferSucceeded
+        @test output[] == 1
         @test try_take!(output, ring) == RingTransferSucceeded
         @test output[] == 1
         @test try_take!(output, ring) == RingTransferSucceeded
         @test output[] == 2
         @test try_take!(output, ring) == RingClosed
+        @test output[] == 2
+        @test try_peek!(output, ring) == RingClosed
         @test output[] == 2
 
         destination = fill(UInt64(0), 2)
@@ -434,12 +447,15 @@ end
         output = Ref(UInt64(0))
         @test @inferred(try_submit!(ring, UInt64(1))) ==
               RingTransferSucceeded
+        @test @inferred(try_peek!(output, ring)) ==
+              RingTransferSucceeded
         @test @inferred(try_take!(output, ring)) == RingTransferSucceeded
         if OWNERSHIP_TESTS_WITH_COVERAGE
             @test_skip "allocation assertions are disabled under coverage"
         else
             @test ring_allocation_bytes(ring, output) == (
                 submit_bytes=0,
+                peek_bytes=0,
                 take_bytes=0,
                 batch_bytes=0,
                 accounting_bytes=0,

@@ -870,9 +870,18 @@ end
 
 @inline function serial_optional_shed_allocations!(
     policy,
+    publisher,
     publication)
     return @allocated AdaptiveOpticsHIL.Serial.
-        _handle_serial_capacity_overload!(policy, publication)
+        _handle_serial_capacity_overload!(
+            policy, publisher, publication)
+end
+
+@inline function serial_acquisition_accounting_allocations(
+    run,
+    id)
+    return @allocated serial_acquisition_overload_accounting(
+        run, id)
 end
 
 @inline serial_shutdown_progress_allocations!(handle) =
@@ -936,6 +945,27 @@ end
         AdaptiveOpticsHIL.Serial.SerialRunState, :lifecycle)
     @test Base.ispublic(AdaptiveOpticsHIL.Ports,
         :command_bridge_event_loop)
+    @test Base.ispublic(AdaptiveOpticsHIL.Ports,
+        :pending_command_receive_timestamp)
+    @test !Base.invokelatest(
+        AdaptiveOpticsHIL.Serial._command_precedes_plant_event,
+        nothing,
+        nothing,
+    )
+    @test !Base.invokelatest(
+        AdaptiveOpticsHIL.Serial._command_precedes_plant_event,
+        nothing,
+        PlantTimestamp(0),
+    )
+    @test Base.invokelatest(
+        AdaptiveOpticsHIL.Serial._command_precedes_plant_event,
+        PlantTimestamp(0),
+        nothing,
+    )
+    @test AdaptiveOpticsHIL.Serial._command_precedes_plant_event(
+        PlantTimestamp(0), PlantTimestamp(0))
+    @test !AdaptiveOpticsHIL.Serial._command_precedes_plant_event(
+        PlantTimestamp(1), PlantTimestamp(0))
 
     @testset "Preparation, readiness, and nonblocking pacing" begin
         fixture = serial_test_fixture()
@@ -964,6 +994,13 @@ end
             fixture.readiness
         @test run_termination(fixture.configuration) === nothing
         @test run_termination(fixture.running) === nothing
+        unknown_acquisition_error = captured_serial_error() do
+            serial_acquisition_overload_accounting(
+                fixture.run, AcquisitionID(:unknown))
+        end
+        @test unknown_acquisition_error isa SerialRunError
+        @test unknown_acquisition_error.reason ==
+            :unknown_acquisition
         direct_bridge = prepare_command_bridge(
             fixture.command_ports,
             prepared_command_endpoint(fixture.plant, :hil_dm))
@@ -978,6 +1015,41 @@ end
             SerialDeadlinePending
         @test serial_step_timestamp(pending) == PlantTimestamp(500_000)
         @test serial_step_time_until_ns(pending) == 500_000
+
+        chronological = serial_test_fixture(
+            session=RunSessionID(0x7c45))
+        @test serial_step_status(
+            step_serial_run!(chronological.running)) ==
+            SerialPlantEventProcessed
+        Clocks.advance!(chronological.clock, 1_000_000)
+        queue_serial_test_command!(
+            chronological;
+            receive_ns=1_000_000,
+            effective_ns=2_000_000,
+            advance_ns=0,
+        )
+        earlier_event =
+            step_serial_run!(chronological.running)
+        @test serial_step_status(earlier_event) ==
+            SerialPlantEventProcessed
+        @test serial_step_timestamp(earlier_event) ==
+            PlantTimestamp(500_000)
+        ordered_command =
+            step_serial_run!(chronological.running)
+        @test serial_step_status(ordered_command) ==
+            SerialCommandProcessed
+        @test serial_step_timestamp(ordered_command) ==
+            PlantTimestamp(1_000_000)
+        finish_serial_stop!(
+            chronological,
+            RunStopRequest(
+                run_session(chronological.run),
+                execution_clock_identity(
+                    chronological.armed.timing),
+                Clocks.time_nanos(chronological.clock);
+                reason=:chronological_command_test,
+            ),
+        )
 
         if SERIAL_TESTS_WITH_COVERAGE
             @test_skip "allocation assertions are disabled under coverage"
@@ -1346,15 +1418,28 @@ end
         @test required_wfs.products_failed == 0
 
         if SERIAL_TESTS_WITH_COVERAGE
-            @test_skip "allocation assertions are disabled under coverage"
+            @test_skip "accounting allocation gate disabled under coverage"
+            @test_skip "overload allocation gate disabled under coverage"
         else
+            @test serial_acquisition_accounting_allocations(
+                fixture.run,
+                AcquisitionID(:hil_dm_feedback)) == 0
             allocation_state =
                 AdaptiveOpticsHIL.Serial.AcquisitionPublicationState()
+            optional_publisher = only(
+                publisher
+                for publisher in fixture.run.publishers
+                if publisher.id == AcquisitionID(:hil_dm_feedback)
+            )
             AdaptiveOpticsHIL.Serial.
                 _handle_serial_capacity_overload!(
-                    optional_policy, allocation_state)
+                    optional_policy,
+                    optional_publisher,
+                    allocation_state)
             @test serial_optional_shed_allocations!(
-                optional_policy, allocation_state) == 0
+                optional_policy,
+                optional_publisher,
+                allocation_state) == 0
         end
 
         deadline_policy = AcquisitionOverloadPolicy(
@@ -1407,7 +1492,7 @@ end
         @test serial_optical_execution_configuration(
             fixture.run) === owner_configuration
         @test execution_owner_mode(executor) === mode
-        @test execution_owner_idle_policy(executor) === nothing
+        @test execution_owner_idle_strategy_factory(executor) === nothing
         @test execution_cpu_budget(executor) ===
             owner_configuration.cpu_budget
         @test execution_cpu_environment(executor) ===
@@ -1615,40 +1700,40 @@ end
         @test execution_owners_phase(serial_optical_execution(
             owner_oracle.fixture.run)) == ExecutionOwnersStopped
 
-        threaded_configuration =
+        agent_configuration =
             serial_test_execution_owner_configuration(
-                ThreadedExecutionOwners();
+                AgentExecutionOwners();
                 outer_owner_count=1,
             )
-        threaded_fixture = serial_test_fixture(
-            optical_execution=threaded_configuration)
-        threaded_executor =
-            serial_optical_execution(threaded_fixture.run)
-        @test execution_owners_phase(threaded_executor) ==
+        agent_fixture = serial_test_fixture(
+            optical_execution=agent_configuration)
+        agent_executor =
+            serial_optical_execution(agent_fixture.run)
+        @test execution_owners_phase(agent_executor) ==
             ExecutionOwnersRunning
-        threaded_before =
-            execution_owner_accounting(threaded_executor, 1)
-        @test threaded_before.startup_acknowledged
-        @test !iszero(threaded_before.task_id)
+        agent_before =
+            execution_owner_accounting(agent_executor, 1)
+        @test agent_before.startup_acknowledged
+        @test !iszero(agent_before.task_id)
         @test serial_step_status(step_serial_run!(
-            threaded_fixture.running)) ==
+            agent_fixture.running)) ==
             SerialPlantEventProcessed
-        threaded_after =
-            execution_owner_accounting(threaded_executor, 1)
-        @test threaded_after.task_id == threaded_before.task_id
-        threaded_request = RunStopRequest(
-            run_session(threaded_fixture.run),
-            execution_clock_identity(threaded_fixture.armed.timing),
-            Clocks.time_nanos(threaded_fixture.clock))
-        threaded_stopped_accounting = finish_serial_stop!(
-            threaded_fixture, threaded_request)
-        @test execution_owners_phase(threaded_executor) ==
+        agent_after =
+            execution_owner_accounting(agent_executor, 1)
+        @test agent_after.task_id == agent_before.task_id
+        agent_request = RunStopRequest(
+            run_session(agent_fixture.run),
+            execution_clock_identity(agent_fixture.armed.timing),
+            Clocks.time_nanos(agent_fixture.clock))
+        agent_stopped_accounting = finish_serial_stop!(
+            agent_fixture, agent_request)
+        @test execution_owners_phase(agent_executor) ==
             ExecutionOwnersStopped
         @test execution_owner_accounting(
-            threaded_executor, 1).stop_acknowledged
-        threaded_stopped_owner =
-            first(threaded_stopped_accounting.execution_owners)
-        @test threaded_stopped_owner.stop_acknowledged
+            agent_executor, 1).stop_acknowledged
+        agent_stopped_owner =
+            first(agent_stopped_accounting.execution_owners)
+        @test agent_stopped_owner.stop_acknowledged
     end
 
     @testset "Composition and lifecycle rejection" begin
@@ -1958,6 +2043,12 @@ end
         @test exhausted_error isa SerialRunError
         @test exhausted_error.reason ==
             :acquisition_product_capacity
+        @test exhausted_error.component == :hil_wfs
+        @test exhausted_error.context.acquisition ==
+            AcquisitionID(:hil_wfs)
+        @test exhausted_error.context.sequence == UInt64(2)
+        @test exhausted_error.context.product_occupancy ==
+            exhausted_error.context.product_capacity
         @test run_phase(exhausted.run) == RunFailed
         @test run_termination_kind(run_termination(exhausted.run)) ==
             ResourcePolicyRunFailure

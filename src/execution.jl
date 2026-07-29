@@ -4,13 +4,15 @@
 Prepared, transport-neutral execution ownership for optical path groups.
 Core retains the deterministic plant, path-local products, numerical plans,
 and device contexts. This namespace adds fixed owner identity, bounded SPSC
-due/completion handoffs, explicit CPU admission, and optional long-lived Julia
-tasks. It does not choose placement, pin threads, move products between memory
-domains, sleep, or create one task per event.
+due/completion handoffs, explicit CPU admission, and optional long-lived
+Agent.jl duty-cycle tasks. Placement remains explicit; optional CPU IDs are
+forwarded to Agent.jl's ThreadPinning.jl extension. This namespace does not
+move products between memory domains or create one task per event.
 """
 module Execution
 
 import AdaptiveOpticsSim.Plant
+import Agent
 
 using AdaptiveOpticsSim: AbstractArrayBackend, AbstractComputeDevice
 using AdaptiveOpticsSim: CPUBackend
@@ -49,6 +51,7 @@ using ..Lifecycle: OwnerAfterDequeue, OwnerBeforeDequeue
 using ..Lifecycle: OwnerCompletionPublication, OwnerDeviceCompletion
 using ..Lifecycle: OwnerExecution, OwnerMaterialization
 using ..Lifecycle: PreparedRunFailureCoordinator
+using ..Lifecycle: RunFailureStage
 using ..Lifecycle: RunOwnerID, RunSessionID, RunShutdownPolicy
 using ..Lifecycle: _acknowledge_run_stop!
 using ..Lifecycle: _begin_run_shutdown!
@@ -71,9 +74,10 @@ using ..Timing: execution_lateness_ns
 export ExecutionOwnerError
 export AbstractOpticalExecutionConfiguration, SerialOpticalExecution
 export AbstractExecutionOwnerMode
-export DeterministicExecutionOwners, ThreadedExecutionOwners
-export AbstractExecutionOwnerIdlePolicy
-export YieldingExecutionOwnerIdle, HybridExecutionOwnerIdle
+export DeterministicExecutionOwners, AgentExecutionOwners
+export AbstractExecutionOwnerPlacement
+export SchedulerManagedExecutionOwnerPlacement
+export ThreadAssignedExecutionOwnerPlacement
 export ExecutionOwnerConfiguration
 export ExecutionOwnerID, execution_owner_id_value
 export ExecutionOwnerKind, PathGroupExecutionOwner, DeviceBatchExecutionOwner
@@ -90,7 +94,8 @@ export ExecutionOwnerPolicyOverride
 export execution_owner_overload_policy, execution_owner_overload_action
 export resource_criticality, maximum_resource_lateness_ns
 export overload_recovery_occupancy, resource_is_required
-export execution_owner_mode, execution_owner_idle_policy
+export execution_owner_mode, execution_owner_idle_strategy_factory
+export execution_owner_placement
 export execution_cpu_budget, execution_cpu_environment
 export execution_owner_ring_capacity, execution_owners_phase
 export execution_batches_completed
@@ -147,76 +152,235 @@ end
 DeterministicExecutionOwners(; alternate_order::Bool=true) =
     DeterministicExecutionOwners(alternate_order)
 
-"""Idle behavior for a long-lived execution-owner task."""
-abstract type AbstractExecutionOwnerIdlePolicy end
-
-"""Yield the current Julia task whenever its owner ring is empty."""
-struct YieldingExecutionOwnerIdle <: AbstractExecutionOwnerIdlePolicy end
+"""Placement policy for long-lived Agent.jl execution owners."""
+abstract type AbstractExecutionOwnerPlacement end
 
 """
-Poll for `spin_count` empty observations, then yield once.
+Allow Agent.jl to launch migratable, scheduler-cooperative owner tasks.
 
-This is a bounded cooperative hybrid. Pure unbounded spin is deliberately not
-offered before a deployment has separately established thread affinity and a
-reserved coordinator context.
+This portable policy is appropriate for deterministic correctness tests and
+resource-constrained development. AgentRunner yields after every duty cycle in
+this mode, so it is not the production low-tail placement policy.
 """
-struct HybridExecutionOwnerIdle <: AbstractExecutionOwnerIdlePolicy
-    spin_count::UInt32
+struct SchedulerManagedExecutionOwnerPlacement <:
+    AbstractExecutionOwnerPlacement end
 
-    function HybridExecutionOwnerIdle(spin_count::UInt32)
-        iszero(spin_count) && _execution_owner_error(
-            :invalid_idle_policy,
-            "hybrid idle spin count must be positive",
+"""
+Assign each execution owner to one unique Julia default-pool thread.
+
+`thread_ids` is ordered by prepared owner ordinal. Optional zero-based
+`cpu_ids` are forwarded to Agent.jl's ThreadPinning extension. CPU affinity
+requires the caller to load ThreadPinning.jl and does not reserve a physical
+core, establish real-time priority, or prove that SMT siblings and interrupts
+are isolated. Arm, start, and run this mode from one sticky coordinator task
+on an unassigned Julia managed thread.
+"""
+struct ThreadAssignedExecutionOwnerPlacement{
+    T<:Tuple,
+    C<:Union{Nothing,Tuple},
+} <: AbstractExecutionOwnerPlacement
+    thread_ids::T
+    cpu_ids::C
+
+    function ThreadAssignedExecutionOwnerPlacement(
+        thread_ids,
+        cpu_ids,
+    )
+        threads = _checked_execution_owner_ids(
+            thread_ids,
+            _checked_execution_owner_thread_id,
+            :invalid_owner_thread,
+            "assigned Julia thread IDs",
         )
-        return new(spin_count)
+        cpus = if cpu_ids === nothing
+            nothing
+        else
+            checked_cpu_ids = _checked_execution_owner_ids(
+                cpu_ids,
+                _checked_execution_owner_cpu_id,
+                :invalid_owner_cpu,
+                "assigned OS CPU IDs",
+            )
+            length(checked_cpu_ids) == length(threads) ||
+                _execution_owner_error(
+                    :invalid_owner_cpu,
+                    "assigned OS CPU IDs must match the Julia thread-ID count",
+                )
+            checked_cpu_ids
+        end
+        return new{typeof(threads),typeof(cpus)}(threads, cpus)
     end
 end
 
-function HybridExecutionOwnerIdle(spin_count::Integer)
-    spin_count > 0 || _execution_owner_error(
-        :invalid_idle_policy,
-        "hybrid idle spin count must be positive",
+@inline function _checked_execution_owner_thread_id(
+    value::Integer,
+)
+    value > 0 || _execution_owner_error(
+        :invalid_owner_thread,
+        "assigned Julia thread IDs must be positive",
     )
-    spin_count <= typemax(UInt32) || _execution_owner_error(
-        :invalid_idle_policy,
-        "hybrid idle spin count exceeds UInt32 range",
+    value <= typemax(Int) || _execution_owner_error(
+        :invalid_owner_thread,
+        "assigned Julia thread ID exceeds the supported Int range",
     )
-    return HybridExecutionOwnerIdle(UInt32(spin_count))
+    return Int(value)
 end
 
-HybridExecutionOwnerIdle(::Bool) = _execution_owner_error(
-    :invalid_idle_policy,
-    "hybrid idle spin count must be an integer count, not Bool",
+@inline _checked_execution_owner_thread_id(
+    ::Bool,
+) = _execution_owner_error(
+    :invalid_owner_thread,
+    "assigned Julia thread IDs must be integer identifiers, not Bool",
 )
 
-"""
-Run every prepared execution owner in one long-lived Julia task.
+@inline _checked_execution_owner_thread_id(
+    ::Any,
+) = _execution_owner_error(
+    :invalid_owner_thread,
+    "assigned Julia thread IDs must be integer identifiers",
+)
 
-The task may migrate between Julia threads; this mode makes no affinity or
-ThreadPinning claim. Its prepared idle policy is applied outside the rings.
-"""
-struct ThreadedExecutionOwners{
-    P<:AbstractExecutionOwnerIdlePolicy,
-} <: AbstractExecutionOwnerMode
-    idle_policy::P
+@inline function _checked_execution_owner_cpu_id(
+    value::Integer,
+)
+    value >= 0 || _execution_owner_error(
+        :invalid_owner_cpu,
+        "assigned OS CPU IDs must be nonnegative",
+    )
+    value <= typemax(Int) || _execution_owner_error(
+        :invalid_owner_cpu,
+        "assigned OS CPU ID exceeds the supported Int range",
+    )
+    return Int(value)
 end
 
-ThreadedExecutionOwners() =
-    ThreadedExecutionOwners(YieldingExecutionOwnerIdle())
+@inline _checked_execution_owner_cpu_id(
+    ::Bool,
+) = _execution_owner_error(
+    :invalid_owner_cpu,
+    "assigned OS CPU IDs must be integer identifiers, not Bool",
+)
 
-_validate_execution_owner_idle_policy(
-    ::YieldingExecutionOwnerIdle,
-) = nothing
-_validate_execution_owner_idle_policy(
-    ::HybridExecutionOwnerIdle,
-) = nothing
+@inline _checked_execution_owner_cpu_id(
+    ::Any,
+) = _execution_owner_error(
+    :invalid_owner_cpu,
+    "assigned OS CPU IDs must be integer identifiers",
+)
 
-function _validate_execution_owner_idle_policy(
-    ::AbstractExecutionOwnerIdlePolicy,
+function _checked_execution_owner_ids(
+    values::Tuple,
+    checker,
+    reason::Symbol,
+    label::AbstractString,
+)
+    isempty(values) && _execution_owner_error(
+        reason,
+        "$label cannot be empty",
+    )
+    checked = ntuple(index -> checker(values[index]), length(values))
+    length(unique(checked)) == length(checked) ||
+        _execution_owner_error(
+            reason,
+            "$label must be unique",
+        )
+    return checked
+end
+
+function _checked_execution_owner_ids(
+    ::Any,
+    ::Any,
+    reason::Symbol,
+    label::AbstractString,
 )
     return _execution_owner_error(
-        :unsupported_idle_policy,
-        "execution-owner idle policy is not supported",
+        reason,
+        "$label must be supplied as a tuple",
+    )
+end
+
+function ThreadAssignedExecutionOwnerPlacement(
+    thread_ids;
+    cpu_ids=nothing,
+)
+    return ThreadAssignedExecutionOwnerPlacement(
+        thread_ids, cpu_ids)
+end
+
+"""
+Run every prepared execution owner as one long-lived Agrona-style Agent.jl
+duty-cycle agent.
+
+`idle_strategy_factory()` is checked once when this configuration is built,
+then called once for the coordinator wait path and once for every owner runner
+during preparation. It must be side-effect-free apart from constructing the
+strategy, return the same concrete `Agent.IdleStrategy` type each time, and
+return distinct instances when that type is mutable. Rings, overload decisions,
+stop epochs, and drain accounting remain owned by AdaptiveOpticsHIL.
+"""
+struct AgentExecutionOwners{
+    I<:Agent.IdleStrategy,
+    F,
+    P<:AbstractExecutionOwnerPlacement,
+} <: AbstractExecutionOwnerMode
+    idle_strategy_factory::F
+    placement::P
+end
+
+function AgentExecutionOwners(
+    idle_strategy_type::Type{I};
+    placement::AbstractExecutionOwnerPlacement=
+        SchedulerManagedExecutionOwnerPlacement(),
+) where {I<:Agent.IdleStrategy}
+    applicable(idle_strategy_type) || _execution_owner_error(
+        :invalid_idle_strategy_factory,
+        "Agent idle-strategy factory must be callable without arguments",
+    )
+    _checked_agent_idle_strategy(idle_strategy_type)
+    return AgentExecutionOwners{
+        I,
+        typeof(idle_strategy_type),
+        typeof(placement),
+    }(idle_strategy_type, placement)
+end
+
+function AgentExecutionOwners(
+    idle_strategy_factory;
+    placement::AbstractExecutionOwnerPlacement=
+        SchedulerManagedExecutionOwnerPlacement(),
+)
+    applicable(idle_strategy_factory) || _execution_owner_error(
+        :invalid_idle_strategy_factory,
+        "Agent idle-strategy factory must be callable without arguments",
+    )
+    strategy = _checked_agent_idle_strategy(
+        idle_strategy_factory)
+    return AgentExecutionOwners{
+        typeof(strategy),
+        typeof(idle_strategy_factory),
+        typeof(placement),
+    }(idle_strategy_factory, placement)
+end
+
+AgentExecutionOwners(;
+    placement::AbstractExecutionOwnerPlacement=
+        SchedulerManagedExecutionOwnerPlacement(),
+) = AgentExecutionOwners(
+    Agent.YieldingIdleStrategy; placement)
+
+_validate_execution_owner_placement(
+    ::SchedulerManagedExecutionOwnerPlacement,
+) = nothing
+_validate_execution_owner_placement(
+    ::ThreadAssignedExecutionOwnerPlacement,
+) = nothing
+
+function _validate_execution_owner_placement(
+    ::AbstractExecutionOwnerPlacement,
+)
+    return _execution_owner_error(
+        :unsupported_owner_placement,
+        "execution-owner placement policy is not supported",
     )
 end
 
@@ -225,9 +389,9 @@ _validate_execution_owner_mode(
 ) = nothing
 
 function _validate_execution_owner_mode(
-    mode::ThreadedExecutionOwners,
+    mode::AgentExecutionOwners,
 )
-    return _validate_execution_owner_idle_policy(mode.idle_policy)
+    return _validate_execution_owner_placement(mode.placement)
 end
 
 function _validate_execution_owner_mode(
@@ -624,6 +788,11 @@ struct _ExecutionOwnerCompletion
     status::_ExecutionOwnerCompletionStatus
 end
 
+struct _PreparedExecutionOwnerDeadline
+    enabled::Bool
+    maximum_lateness_ns::Int64
+end
+
 """
 Run-immutable execution owner.
 
@@ -639,6 +808,7 @@ struct PreparedExecutionOwner
     backend::AbstractArrayBackend
     compute_device::AbstractComputeDevice
     overload_policy::ExecutionOwnerOverloadPolicy
+    deadline::_PreparedExecutionOwnerDeadline
     due::SPSCDescriptorRing{_ExecutionOwnerWorkDescriptor}
     completion::SPSCDescriptorRing{_ExecutionOwnerCompletion}
 end
@@ -747,8 +917,8 @@ end
 Prepared bounded owner executor accepted by the core path-batch policy seam.
 
 The object retains exact state/workspace identity, so it cannot be mixed with
-another prepared serial run. Worker tasks are created only while arming a
-threaded mode and remain stable until nominal stop.
+another prepared serial run. Worker tasks are created only while arming an
+Agent mode and remain stable until nominal stop.
 """
 struct PreparedExecutionOwnerExecutor{
     M<:AbstractExecutionOwnerMode,
@@ -756,6 +926,7 @@ struct PreparedExecutionOwnerExecutor{
     P<:PreparedPlantEventLoop,
     S<:PlantEventLoopState,
     W<:PlantEventLoopWorkspace,
+    I,
 } <: AbstractOpticalPathBatchExecutor
     session::RunSessionID
     prepared::P
@@ -769,7 +940,10 @@ struct PreparedExecutionOwnerExecutor{
     coordinator::_ExecutionCoordinatorState
     coordinator_workspace::_ExecutionCoordinatorWorkspace
     failures::PreparedRunFailureCoordinator
-    tasks::Memory{Task}
+    # Cold lifecycle registry: each start call crosses a function barrier and
+    # the spawned Agent loop retains its concrete runner/strategy/agent type.
+    runners::Memory{Agent.AgentRunner}
+    coordinator_idle_strategy::I
     mode::M
     cpu_budget::B
     cpu_environment::CPUExecutionEnvironment
@@ -814,12 +988,22 @@ end
 
 execution_owner_mode(executor::PreparedExecutionOwnerExecutor) =
     executor.mode
-execution_owner_idle_policy(
+execution_owner_idle_strategy_factory(
     executor::PreparedExecutionOwnerExecutor{
-        <:ThreadedExecutionOwners,
+        <:AgentExecutionOwners,
     },
-) = executor.mode.idle_policy
-execution_owner_idle_policy(
+) = executor.mode.idle_strategy_factory
+execution_owner_idle_strategy_factory(
+    ::PreparedExecutionOwnerExecutor{
+        <:DeterministicExecutionOwners,
+    },
+) = nothing
+execution_owner_placement(
+    executor::PreparedExecutionOwnerExecutor{
+        <:AgentExecutionOwners,
+    },
+) = executor.mode.placement
+execution_owner_placement(
     ::PreparedExecutionOwnerExecutor{
         <:DeterministicExecutionOwners,
     },
@@ -863,6 +1047,8 @@ function _prepared_owner(
     backend::AbstractArrayBackend,
     compute_device::AbstractComputeDevice,
 )
+    overload_policy = _execution_owner_policy(configuration, id)
+    maximum_lateness_ns = overload_policy.maximum_lateness_ns
     return PreparedExecutionOwner(
         id,
         kind,
@@ -870,7 +1056,11 @@ function _prepared_owner(
         _copy_uint32_memory(group_ordinals),
         backend,
         compute_device,
-        _execution_owner_policy(configuration, id),
+        overload_policy,
+        _PreparedExecutionOwnerDeadline(
+            maximum_lateness_ns !== nothing,
+            something(maximum_lateness_ns, Int64(0)),
+        ),
         SPSCDescriptorRing{_ExecutionOwnerWorkDescriptor}(
             configuration.ring_capacity),
         SPSCDescriptorRing{_ExecutionOwnerCompletion}(
@@ -969,7 +1159,7 @@ function _simultaneous_cpu_owner_count(
 end
 
 function _simultaneous_cpu_owner_count(
-    ::ThreadedExecutionOwners,
+    ::AgentExecutionOwners,
     count::Int,
 )
     return count
@@ -1012,7 +1202,8 @@ function _owner_states(count::Int)
 end
 
 function _owner_overload_states(count::Int)
-    values = Memory{_ExecutionOwnerOverloadState}(undef, count)
+    values = Memory{_ExecutionOwnerOverloadState}(
+        undef, count)
     @inbounds for index in eachindex(values)
         values[index] = _ExecutionOwnerOverloadState(
             UInt64(0),
@@ -1049,10 +1240,207 @@ function _completion_scratch(count::Int)
     return values
 end
 
-_task_storage(::DeterministicExecutionOwners, ::Int) =
-    Memory{Task}(undef, 0)
-_task_storage(::ThreadedExecutionOwners, count::Int) =
-    Memory{Task}(undef, count)
+_runner_storage(::DeterministicExecutionOwners, ::Int) =
+    Memory{Agent.AgentRunner}(undef, 0)
+_runner_storage(::AgentExecutionOwners, count::Int) =
+    Memory{Agent.AgentRunner}(undef, count)
+
+@noinline function _agent_idle_strategy_factory_error(error)
+    return _execution_owner_error(
+        :idle_strategy_factory_failed,
+        "Agent idle-strategy factory failed: $(sprint(showerror, error))",
+    )
+end
+
+_checked_agent_idle_strategy_result(
+    strategy::Agent.IdleStrategy,
+) = strategy
+
+function _checked_agent_idle_strategy_result(::Any)
+    return _execution_owner_error(
+        :invalid_idle_strategy,
+        "Agent idle-strategy factory must return an Agent.IdleStrategy",
+    )
+end
+
+function _checked_agent_idle_strategy(factory)
+    strategy = try
+        factory()
+    catch error
+        _agent_idle_strategy_factory_error(error)
+    end
+    return _checked_agent_idle_strategy_result(strategy)
+end
+
+function _new_agent_idle_strategy(
+    mode::AgentExecutionOwners{I},
+) where {I<:Agent.IdleStrategy}
+    strategy = _checked_agent_idle_strategy(
+        mode.idle_strategy_factory)
+    typeof(strategy) === I || _execution_owner_error(
+        :inconsistent_idle_strategy,
+        "Agent idle-strategy factory changed its concrete return type after configuration",
+    )
+    return strategy::I
+end
+
+function _prepare_agent_idle_strategies(
+    ::DeterministicExecutionOwners,
+    ::Int,
+)
+    return nothing, Memory{Agent.IdleStrategy}(undef, 0)
+end
+
+function _prepare_agent_idle_strategies(
+    mode::AgentExecutionOwners{I},
+    owner_count::Int,
+) where {I<:Agent.IdleStrategy}
+    coordinator = _new_agent_idle_strategy(mode)
+    owners = Memory{I}(undef, owner_count)
+    @inbounds for owner_ordinal in eachindex(owners)
+        strategy = _new_agent_idle_strategy(mode)
+        if ismutabletype(I)
+            strategy === coordinator && _execution_owner_error(
+                :shared_idle_strategy,
+                "mutable Agent idle strategies cannot be shared by " *
+                "the coordinator and an owner runner",
+            )
+            for earlier_ordinal in 1:(owner_ordinal - 1)
+                strategy === owners[earlier_ordinal] &&
+                    _execution_owner_error(
+                        :shared_idle_strategy,
+                        "mutable Agent idle strategies cannot be shared by owner runners",
+                    )
+            end
+        end
+        owners[owner_ordinal] = strategy
+    end
+    return coordinator, owners
+end
+
+function _validate_prepared_owner_placement(
+    ::SchedulerManagedExecutionOwnerPlacement,
+    ::Int,
+)
+    return nothing
+end
+
+function _validate_prepared_owner_placement(
+    placement::ThreadAssignedExecutionOwnerPlacement,
+    owner_count::Int,
+)
+    length(placement.thread_ids) == owner_count ||
+        _execution_owner_error(
+            :owner_placement_cardinality,
+            "assigned Julia thread-ID count must equal the prepared execution-owner count",
+        )
+    default_thread_count = Threads.nthreads(:default)
+    owner_count <= default_thread_count ||
+        _execution_owner_error(
+            :coordinator_context_capacity,
+            "thread-assigned execution-owner count exceeds the Julia default-pool size",
+        )
+    @inbounds for thread_id in placement.thread_ids
+        1 <= thread_id <= Threads.maxthreadid() ||
+            _execution_owner_error(
+                :invalid_owner_thread,
+                "assigned Julia thread ID is not present in this process",
+            )
+        Threads.threadpool(thread_id) === :default ||
+            _execution_owner_error(
+                :invalid_owner_thread_pool,
+                "execution owners may be assigned only to Julia default-pool threads",
+            )
+    end
+    return nothing
+end
+
+function _validate_prepared_owner_placement(
+    mode::AgentExecutionOwners,
+    owner_count::Int,
+)
+    return _validate_prepared_owner_placement(
+        mode.placement, owner_count)
+end
+
+_validate_prepared_owner_placement(
+    ::DeterministicExecutionOwners,
+    ::Int,
+) = nothing
+
+_validate_execution_owner_coordinator_context(
+    ::SchedulerManagedExecutionOwnerPlacement,
+) = nothing
+
+function _validate_execution_owner_coordinator_context(
+    placement::ThreadAssignedExecutionOwnerPlacement,
+)
+    current_task().sticky || _execution_owner_error(
+        :unstable_coordinator_task,
+        "thread-assigned execution owners require a sticky coordinator task",
+    )
+    coordinator_thread_id = Threads.threadid()
+    coordinator_pool = Threads.threadpool(coordinator_thread_id)
+    coordinator_pool in (:default, :interactive) ||
+        _execution_owner_error(
+            :invalid_coordinator_thread_pool,
+            "thread-assigned execution owners require the coordinator " *
+            "on a Julia managed thread",
+        )
+    @inbounds for owner_thread_id in placement.thread_ids
+        owner_thread_id == coordinator_thread_id &&
+            _execution_owner_error(
+                :coordinator_owner_thread_collision,
+                "the coordinator Julia thread cannot also host an assigned execution owner",
+            )
+    end
+    return nothing
+end
+
+mutable struct _ExecutionOwnerAgent{E}
+    executor::E
+    owner_ordinal::Int
+    stage::RunFailureStage
+    batch_sequence::UInt64
+    agent_name::String
+end
+
+Agent.name(agent::_ExecutionOwnerAgent) = agent.agent_name
+
+function _prepare_execution_owner_runners!(
+    ::PreparedExecutionOwnerExecutor{
+        <:DeterministicExecutionOwners,
+    },
+    ::Memory{Agent.IdleStrategy},
+)
+    return nothing
+end
+
+function _prepare_execution_owner_runners!(
+    executor::PreparedExecutionOwnerExecutor{
+        <:AgentExecutionOwners,
+    },
+    strategies::Memory{I},
+) where {I<:Agent.IdleStrategy}
+    length(strategies) == length(executor.runners) ||
+        _execution_owner_error(
+            :idle_strategy_cardinality,
+            "prepared Agent idle-strategy count does not match the execution-owner count",
+        )
+    @inbounds for owner_ordinal in eachindex(executor.runners)
+        owner = executor.owners[owner_ordinal]
+        agent = _ExecutionOwnerAgent(
+            executor,
+            owner_ordinal,
+            OwnerCompletionPublication,
+            UInt64(0),
+            "execution-owner-$(execution_owner_id_value(owner.id))",
+        )
+        executor.runners[owner_ordinal] =
+            Agent.AgentRunner(strategies[owner_ordinal], agent)
+    end
+    return nothing
+end
 
 function _execution_failure_owner_ids(
     owners::Memory{PreparedExecutionOwner})
@@ -1115,6 +1503,11 @@ function _prepare_optical_execution(
     )
     _validate_execution_owner_budget(configuration, owners)
     owner_count = length(owners)
+    _validate_prepared_owner_placement(
+        configuration.mode, owner_count)
+    coordinator_idle_strategy, owner_idle_strategies =
+        _prepare_agent_idle_strategies(
+            configuration.mode, owner_count)
     submitted = Memory{UInt64}(undef, owner_count)
     completions = Memory{UInt64}(undef, owner_count)
     startup = Memory{Bool}(undef, owner_count)
@@ -1132,7 +1525,7 @@ function _prepare_optical_execution(
         session,
         shutdown_policy,
         _execution_failure_owner_ids(owners))
-    return PreparedExecutionOwnerExecutor(
+    executor = PreparedExecutionOwnerExecutor(
         session,
         prepared,
         state,
@@ -1159,12 +1552,16 @@ function _prepare_optical_execution(
             _completion_scratch(owner_count),
         ),
         failures,
-        _task_storage(configuration.mode, owner_count),
+        _runner_storage(configuration.mode, owner_count),
+        coordinator_idle_strategy,
         configuration.mode,
         configuration.cpu_budget,
         configuration.cpu_environment,
         configuration.ring_capacity,
     )
+    _prepare_execution_owner_runners!(
+        executor, owner_idle_strategies)
+    return executor
 end
 
 function _execution_failure_coordinator(
@@ -1218,33 +1615,10 @@ _execution_ownership_is_drained(
     executor::AbstractOpticalPathBatchExecutor) =
     _execution_is_quiescent(executor)
 
-@inline _next_idle_poll(
-    ::YieldingExecutionOwnerIdle,
-    ::UInt32,
-) = (yield(); zero(UInt32))
-
-@inline function _next_idle_poll(
-    policy::HybridExecutionOwnerIdle,
-    poll_count::UInt32,
-)
-    next = poll_count + one(UInt32)
-    if next >= policy.spin_count
-        yield()
-        return zero(UInt32)
-    end
-    GC.safepoint()
-    return next
-end
-
-@inline function _wait_idle(
-    mode::ThreadedExecutionOwners,
-    poll_count::UInt32,
-)
-    return _next_idle_poll(mode.idle_policy, poll_count)
-end
-
 @noinline function _wait_for_owner_progress(
-    ::DeterministicExecutionOwners,
+    ::PreparedExecutionOwnerExecutor{
+        <:DeterministicExecutionOwners,
+    },
     ::UInt32,
     reason::Symbol,
     message::AbstractString,
@@ -1253,22 +1627,42 @@ end
 end
 
 @inline function _wait_for_owner_progress(
-    mode::ThreadedExecutionOwners,
+    executor::PreparedExecutionOwnerExecutor{
+        <:AgentExecutionOwners,
+    },
     poll_count::UInt32,
     ::Symbol,
     ::AbstractString,
 )
-    return _wait_idle(mode, poll_count)
+    Agent.idle(executor.coordinator_idle_strategy, 0)
+    GC.safepoint()
+    return zero(poll_count)
+end
+
+@inline function _reset_coordinator_idle!(
+    ::PreparedExecutionOwnerExecutor{
+        <:DeterministicExecutionOwners,
+    },
+)
+    return nothing
+end
+
+@inline function _reset_coordinator_idle!(
+    executor::PreparedExecutionOwnerExecutor{
+        <:AgentExecutionOwners,
+    },
+)
+    Agent.idle(executor.coordinator_idle_strategy, 1)
+    return nothing
 end
 
 function _submit_completion!(
     executor::PreparedExecutionOwnerExecutor{
-        <:ThreadedExecutionOwners,
+        <:AgentExecutionOwners,
     },
     owner::PreparedExecutionOwner,
     completion::_ExecutionOwnerCompletion,
 )
-    poll_count = zero(UInt32)
     while true
         status = try_submit!(owner.completion, completion)
         status == RingTransferSucceeded && return nothing
@@ -1276,7 +1670,8 @@ function _submit_completion!(
             :completion_publication,
             "execution owner could not publish a completion acknowledgement",
         )
-        poll_count = _wait_idle(executor.mode, poll_count)
+        GC.safepoint()
+        yield()
     end
 end
 
@@ -1495,7 +1890,7 @@ end
 
 function _finish_execution_owner!(
     executor::PreparedExecutionOwnerExecutor{
-        <:ThreadedExecutionOwners,
+        <:AgentExecutionOwners,
     },
     owner_ordinal::Int)
     owner = @inbounds executor.owners[owner_ordinal]
@@ -1544,94 +1939,137 @@ function _finish_execution_owner!(
     return nothing
 end
 
-function _execution_owner_loop!(
-    executor::PreparedExecutionOwnerExecutor{
-        <:ThreadedExecutionOwners,
-    },
-    owner_ordinal::Int)
+function Agent.on_start(agent::_ExecutionOwnerAgent)
+    executor = agent.executor
+    owner_ordinal = agent.owner_ordinal
+    owner = @inbounds executor.owners[owner_ordinal]
+    state = @inbounds executor.owner_states[owner_ordinal]
+    state.task_id = objectid(current_task())
+    state.last_thread_id = Threads.threadid()
+    agent.stage = OwnerCompletionPublication
+    agent.batch_sequence = UInt64(0)
+    _submit_completion!(
+        executor,
+        owner,
+        _ExecutionOwnerCompletion(
+            executor.session,
+            owner.id,
+            UInt64(0),
+            _ExecutionOwnerStartup,
+            _ExecutionOwnerWorkCompleted,
+        ),
+    )
+    agent.stage = OwnerBeforeDequeue
+    return nothing
+end
+
+function Agent.do_work(agent::_ExecutionOwnerAgent)
+    executor = agent.executor
+    owner_ordinal = agent.owner_ordinal
     owner = @inbounds executor.owners[owner_ordinal]
     state = @inbounds executor.owner_states[owner_ordinal]
     workspace = @inbounds executor.owner_workspaces[owner_ordinal]
-    state.task_id = objectid(current_task())
-    state.last_thread_id = Threads.threadid()
-    stage = OwnerCompletionPublication
-    batch_sequence = UInt64(0)
-    try
-        _submit_completion!(
-            executor,
-            owner,
-            _ExecutionOwnerCompletion(
-                executor.session,
-                owner.id,
-                UInt64(0),
-                _ExecutionOwnerStartup,
-                _ExecutionOwnerWorkCompleted,
-            ),
-        )
-        poll_count = zero(UInt32)
-        stage = OwnerBeforeDequeue
-        while true
-            if _run_shutdown_requested(executor.failures)
-                _drain_cancelled_owner_work!(
-                    executor, owner_ordinal)
-                break
-            end
-            status = try_take!(workspace.work, owner.due)
-            if status == RingTransferSucceeded
-                poll_count = zero(UInt32)
-                descriptor = workspace.work[]
-                batch_sequence = descriptor.batch_sequence
-                stage = OwnerAfterDequeue
-                if _run_shutdown_requested(executor.failures)
-                    # COV_EXCL_START
-                    # The cancellation operation is directly tested. Entering
-                    # this branch requires the stop epoch to publish in the
-                    # unforceable interval between one SPSC take and this
-                    # immediately following acquire observation.
-                    state.work_cancelled += UInt64(1)
-                    _drain_cancelled_owner_work!(
-                        executor, owner_ordinal)
-                    break
-                    # COV_EXCL_STOP
-                end
-                _service_owner_work!(
-                    executor, owner_ordinal, descriptor)
-                state.activity == _ExecutionOwnerFailedActivity &&
-                    break
-                stage = OwnerBeforeDequeue
-                batch_sequence = UInt64(0)
-                continue
-            end
-            status == RingClosed && break
-            status == RingEmpty || _execution_owner_error(
-                :due_work_consumption,
-                "execution owner observed an invalid due-work ring result",
-            )
-            poll_count = _wait_idle(executor.mode, poll_count)
+    if _run_shutdown_requested(executor.failures)
+        _drain_cancelled_owner_work!(executor, owner_ordinal)
+        throw(Agent.AgentTerminationException())
+    end
+    agent.stage = OwnerBeforeDequeue
+    status = try_take!(workspace.work, owner.due)
+    if status == RingTransferSucceeded
+        descriptor = workspace.work[]
+        agent.batch_sequence = descriptor.batch_sequence
+        agent.stage = OwnerAfterDequeue
+        if _run_shutdown_requested(executor.failures)
+            # COV_EXCL_START
+            # The cancellation operation is directly tested. Entering this
+            # branch requires the stop epoch to publish in the unforceable
+            # interval between one SPSC take and this immediately following
+            # acquire observation.
+            state.work_cancelled += UInt64(1)
+            _drain_cancelled_owner_work!(executor, owner_ordinal)
+            throw(Agent.AgentTerminationException())
+            # COV_EXCL_STOP
         end
-    catch error
+        _service_owner_work!(
+            executor, owner_ordinal, descriptor)
+        state.activity == _ExecutionOwnerFailedActivity &&
+            throw(Agent.AgentTerminationException())
+        agent.stage = OwnerBeforeDequeue
+        agent.batch_sequence = UInt64(0)
+        return 1
+    end
+    status == RingClosed &&
+        throw(Agent.AgentTerminationException())
+    status == RingEmpty || _execution_owner_error(
+        :due_work_consumption,
+        "execution owner observed an invalid due-work ring result",
+    )
+    return 0
+end
+
+Agent.on_error(
+    ::_ExecutionOwnerAgent,
+    error::Agent.AgentTerminationException,
+) = throw(error)
+
+function Agent.on_error(agent::_ExecutionOwnerAgent, error)
+    executor = agent.executor
+    owner_ordinal = agent.owner_ordinal
+    state = @inbounds executor.owner_states[owner_ordinal]
+    if state.activity != _ExecutionOwnerFailedActivity
         state.failure = error
         state.active_batch_sequence = UInt64(0)
         state.activity = _ExecutionOwnerFailedActivity
         _publish_execution_owner_failure!(
             executor,
             owner_ordinal,
-            stage,
+            agent.stage,
             error,
-            batch_sequence)
+            agent.batch_sequence)
     end
-    _finish_execution_owner!(executor, owner_ordinal)
+    throw(Agent.AgentTerminationException(
+        "AdaptiveOpticsHIL execution owner failed"))
+end
+
+function Agent.on_close(agent::_ExecutionOwnerAgent)
+    _finish_execution_owner!(
+        agent.executor, agent.owner_ordinal)
     return nothing
 end
 
-function _spawn_execution_owner(
+function _start_execution_owner_runner(
     executor::PreparedExecutionOwnerExecutor{
-        <:ThreadedExecutionOwners,
+        <:AgentExecutionOwners,
     },
     owner_ordinal::Int,
 )
-    return Threads.@spawn _execution_owner_loop!(
-        executor, owner_ordinal)
+    runner = @inbounds executor.runners[owner_ordinal]
+    return _start_execution_owner_runner(
+        runner, executor.mode.placement, owner_ordinal)
+end
+
+function _start_execution_owner_runner(
+    runner::Agent.AgentRunner,
+    ::SchedulerManagedExecutionOwnerPlacement,
+    ::Int,
+)
+    Agent.start(runner)
+    return runner
+end
+
+function _start_execution_owner_runner(
+    runner::Agent.AgentRunner,
+    placement::ThreadAssignedExecutionOwnerPlacement,
+    owner_ordinal::Int,
+)
+    thread_id = @inbounds placement.thread_ids[owner_ordinal]
+    if placement.cpu_ids === nothing
+        Agent.start_on_thread(runner, thread_id)
+    else
+        cpu_id = @inbounds placement.cpu_ids[owner_ordinal]
+        Agent.start_on_thread(runner, thread_id; cpuid=cpu_id)
+    end
+    return runner
 end
 
 function _take_expected_completion!(
@@ -1647,6 +2085,7 @@ function _take_expected_completion!(
     while true
         status = try_take!(scratch, owner.completion)
         if status == RingTransferSucceeded
+            _reset_coordinator_idle!(executor)
             completion = scratch[]
             completion.session == executor.session ||
                 _execution_owner_error(
@@ -1680,7 +2119,7 @@ function _take_expected_completion!(
                 "coordinator observed an invalid completion-ring result",
             )
         poll_count = _wait_for_owner_progress(
-            executor.mode,
+            executor,
             poll_count,
             :missing_deterministic_completion,
             "deterministic owner did not publish its completion",
@@ -1722,17 +2161,19 @@ end
 
 function _arm_optical_execution!(
     executor::PreparedExecutionOwnerExecutor{
-        <:ThreadedExecutionOwners,
+        <:AgentExecutionOwners,
     },
 )
     executor.coordinator.phase == ExecutionOwnersPrepared ||
         _execution_owner_error(
             :invalid_phase,
-            "threaded execution owners can arm only from prepared",
+            "Agent execution owners can arm only from prepared",
         )
+    _validate_execution_owner_coordinator_context(
+        executor.mode.placement)
     @inbounds for owner_ordinal in eachindex(executor.owners)
-        executor.tasks[owner_ordinal] =
-            _spawn_execution_owner(executor, owner_ordinal)
+        _start_execution_owner_runner(
+            executor, owner_ordinal)
     end
     _collect_lifecycle_acknowledgements!(
         executor,
@@ -1828,9 +2269,14 @@ _begin_execution_owner_mode_shutdown!(
 
 _begin_execution_owner_mode_shutdown!(
     executor::PreparedExecutionOwnerExecutor{
-        <:ThreadedExecutionOwners,
+        <:AgentExecutionOwners,
     },
-) = executor
+) = begin
+    @inbounds for runner in executor.runners
+        Agent.is_started(runner) || close(runner)
+    end
+    executor
+end
 
 function _begin_optical_execution_shutdown!(
     executor::PreparedExecutionOwnerExecutor,
@@ -1892,11 +2338,11 @@ end
 
 @inline function _execution_owner_task_done(
     executor::PreparedExecutionOwnerExecutor{
-        <:ThreadedExecutionOwners,
+        <:AgentExecutionOwners,
     },
     owner_ordinal::Int)
-    isassigned(executor.tasks, owner_ordinal) || return false
-    return istaskdone(@inbounds executor.tasks[owner_ordinal])
+    isassigned(executor.runners, owner_ordinal) || return false
+    return Agent.is_closed(@inbounds executor.runners[owner_ordinal])
 end
 
 function _progress_optical_execution_shutdown!(
@@ -2286,13 +2732,15 @@ end
     timing::ExecutionClockMapping,
     timestamp::PlantTimestamp,
 )
-    owner = @inbounds executor.owners[owner_ordinal]
-    maximum_lateness_ns = owner.overload_policy.maximum_lateness_ns
-    maximum_lateness_ns === nothing && return false
-    observed_execution_ns =
-        _read_execution_clock(execution_clock(timing))
+    deadline =
+        @inbounds executor.owners[owner_ordinal].deadline
+    deadline.enabled || return false
     overload =
         @inbounds executor.owner_overload_states[owner_ordinal]
+    maximum_lateness_ns =
+        deadline.maximum_lateness_ns
+    observed_execution_ns =
+        _read_execution_clock(execution_clock(timing))
     lateness_ns = _record_execution_owner_lateness!(
         overload,
         execution_lateness_ns(
@@ -2409,7 +2857,7 @@ function _service_deterministic_phase!(
 end
 
 _service_deterministic_phase!(
-    ::PreparedExecutionOwnerExecutor{<:ThreadedExecutionOwners},
+    ::PreparedExecutionOwnerExecutor{<:AgentExecutionOwners},
     ::UInt64,
     ::Int,
     ::_ExecutionOwnerWorkPhase,
@@ -2490,7 +2938,11 @@ function _collect_owner_phase!(
                 end
             end
         end
-        made_progress && (poll_count = zero(UInt32); continue)
+        if made_progress
+            _reset_coordinator_idle!(executor)
+            poll_count = zero(UInt32)
+            continue
+        end
         @inbounds for due_index in 1:owner_count
             owner_ordinal =
                 Int(workspace.due_owner_ordinals[due_index])
@@ -2501,7 +2953,7 @@ function _collect_owner_phase!(
                     executor, owner_ordinal)
         end
         poll_count = _wait_for_owner_progress(
-            executor.mode,
+            executor,
             poll_count,
             :missing_deterministic_completion,
             "deterministic owner phase did not complete",

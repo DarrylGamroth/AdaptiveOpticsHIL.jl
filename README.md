@@ -45,6 +45,8 @@ foundation for command and acquisition ports:
 - a fixed-capacity SPSC ring for compact, concrete, immutable descriptors
 - explicit success, full, empty, and closed results with close-and-drain
   behavior
+- consumer-owned non-transferring inspection of the next descriptor when a
+  scheduler must choose work before taking ownership
 - release/acquire sequence publication with producer, consumer, and closure
   state isolated under a prepared 64- or 128-byte cache-line upper-bound
   contract
@@ -94,14 +96,24 @@ oracle. An explicit `ExecutionOwnerConfiguration` selects either:
 
 - `DeterministicExecutionOwners()`, which drives the same bounded owner paths
   synchronously and can vary completion order without creating tasks; or
-- `ThreadedExecutionOwners()`, which creates one long-lived Julia task per
-  owner during arm and reuses it until nominal stop.
+- `AgentExecutionOwners(factory; placement)`, which creates one long-lived
+  Agrona-style Agent.jl duty-cycle agent per owner during arm and reuses it
+  until nominal stop.
 
-Threaded owners use an explicit yielding or bounded spin/yield idle policy.
-They are not pinned, may migrate between Julia threads, and do not pace the
-plant. Preparation validates a declared core `CPUExecutionBudget` against an
-observed `CPUExecutionEnvironment` without changing Julia, FFT, or BLAS thread
-settings.
+The factory creates one independent Agent.jl idle strategy for every owner and
+one for the coordinator wait path. Scheduler-managed placement is portable and
+cooperative. `ThreadAssignedExecutionOwnerPlacement` assigns owners to unique
+Julia default-pool threads. This mode must be armed, started, and run from one
+sticky coordinator task on a different managed Julia thread; arm rejects a
+coordinator/owner thread collision. The coordinator may use the default or
+interactive pool. Optional CPU IDs use Agent.jl's ThreadPinning.jl extension
+when the caller has loaded ThreadPinning.jl. Assignment or affinity does not
+reserve a physical core, establish OS scheduling priority, or prove
+SMT/interrupt isolation.
+Preparation validates a declared core `CPUExecutionBudget` against an observed
+`CPUExecutionEnvironment` without changing Julia, FFT, or BLAS thread settings.
+Busy-spin strategies are appropriate only when the deployment has separately
+reserved the corresponding cores and accepted their power and thermal cost.
 
 Every `ExecutionOwnerConfiguration` also requires one immutable
 `ExecutionOwnerOverloadPolicy`. A base policy classifies all owners as
@@ -117,8 +129,8 @@ each due timestamp it performs the core
 begin → materialize → seal → execute → complete contract, so independently
 owned WFS and optional science paths may execute concurrently only after all
 current-epoch inputs are materialized. Nominal stop closes every owner input,
-collects one stop acknowledgement per owner, joins threaded tasks, and verifies
-empty ring/accounting state. `serial_run_accounting` includes a cold snapshot
+collects one stop acknowledgement per owner, joins Agent runner tasks, and
+verifies empty ring/accounting state. `serial_run_accounting` includes a cold snapshot
 of these owners alongside port, pool, and lease accounting. Each coordinator,
 path owner, and device-submission owner has one preallocated compact
 first-failure slot and stop acknowledgement. Failure never retries or rolls
@@ -249,8 +261,8 @@ the serial topology and policies; it accepts no independent plant/event-loop
 pair that could be mixed. Preparation resolves product sources from that same
 event loop and allocates the command state, acquisition sequence state, and
 workspaces without reading the clock or accepting traffic. An explicitly
-configured threaded execution policy creates one task per already-prepared,
-stable owner only during arm.
+configured Agent execution policy creates one task per already-prepared, stable
+owner only during arm.
 Runtime handles retain the exact prepared run, so state and workspace from
 different runs cannot be combined. Clean stop requires quiescent current
 resources and records either a typed request or terminal event. Runtime errors
@@ -289,17 +301,26 @@ wall-clock state to AdaptiveOpticsSim.
 
 Each `step_serial_run!` call makes one bounded scheduling decision:
 
-- process at most one already-transferred command;
+- process at most one already-transferred command whose receive timestamp does
+  not follow the next plant event;
 - report the time remaining until the next plant event; or
 - process one complete plant timestamp, publish terminal command outcomes, and
   copy each newly complete acquisition into its prepared product pool.
 
+The coordinator non-consumingly compares the next command receive timestamp
+with the next plant event. A later command remains queue-owned while earlier
+optical events are processed, then transfers exactly once when it is
+chronologically next. An RTC adapter may therefore submit while the simulator
+is catching up without forcing the command to overtake already scheduled
+optical work or requiring the adapter to wait for a transient future-deadline
+gap.
+
 The step call never sleeps for a pending deadline, invokes callbacks, creates
 tasks, or chooses transport. The default serial executor starts no workers.
-With an explicit threaded owner policy, an optical event waits at its prepared
+With an explicit Agent execution-owner mode, an optical event waits at its prepared
 materialization and execution barriers while the coordinator and already-armed
 tasks poll only their bounded owner rings according to the selected idle
-policy. A caller may advance a `CachedNanoClock` exactly in deterministic tests
+strategy. A caller may advance a `CachedNanoClock` exactly in deterministic tests
 or apply its own pacing policy around a `SystemNanoClock` in production.
 
 Acquisition publication observes descriptor and product-pool occupancy
@@ -325,6 +346,48 @@ remain allocation-free. Inclusive serial event and routed-command steps have
 2 KiB allocation ceilings because they include the current core reduced-order
 event and event-loop admission work.
 
+## Fast development test loops
+
+Package tests are split into `timing`, `lifecycle`, `ownership`, `ports`,
+`serial`, and `execution` groups. Run only the groups affected by a change
+during development:
+
+```sh
+timeout 120s julia --startup-file=no --project=. \
+    test/runtests.jl execution
+timeout 120s julia --startup-file=no --project=. \
+    test/runtests.jl ports serial
+```
+
+`Pkg.test()` remains the complete package and Aqua gate. The benchmark-contract
+tests are deterministic and bounded:
+
+```sh
+julia --compile=min -O0 --startup-file=no --project=benchmarks \
+    benchmarks/test/runtests.jl gate8
+julia --compile=min -O0 --startup-file=no --project=benchmarks \
+    benchmarks/test/runtests.jl gate4a
+julia --startup-file=no --project=benchmarks \
+    benchmarks/test/runtests.jl gate4a-allocation
+```
+
+The four-thread Gate 8 runtime smoke covers the operational topology, burst,
+shedding, overload, failure, and drain paths with small workloads. It is the
+development and CI check; it is not durable latency evidence:
+
+```sh
+env JULIA_NUM_THREADS=4,0 OPENBLAS_NUM_THREADS=1 \
+    OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+    timeout 120s julia --compile=min -O0 --startup-file=no \
+    --project=benchmarks \
+    benchmarks/test/gate8_runtime.jl runtime
+env JULIA_NUM_THREADS=4,0 OPENBLAS_NUM_THREADS=1 \
+    OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+    timeout 120s julia --compile=min -O0 --startup-file=no \
+    --project=benchmarks \
+    benchmarks/test/gate8_runtime.jl failure
+```
+
 ## Qualified benchmark evidence
 
 The dedicated `benchmarks/` environment keeps HdrHistogram.jl and reporting
@@ -348,13 +411,53 @@ capacity. The
 [maintained Gate 4A artifact](benchmarks/results/gate4a/2026-07-24-serial-boundary.toml)
 contains the current qualified baseline.
 
-CI runs the short deterministic benchmark-contract suite. Durable evidence is
-generated deliberately from a clean revision with one Julia and BLAS thread:
+The maintained Gate 8.9 contract separately qualifies the single-host,
+in-memory, two-owner CPU runtime over the same reduced-order boundary. It
+preserves exact serial/deterministic/Agent-owner replay and records fixed 2 kHz
+target load, consumer interruption, optional-stream shedding, calibrated
+host eligibility, fixed-rate near-saturation and saturation, required overload,
+fresh recovery,
+injected owner failure, a named drain deficit, clean lifecycle timing, and a
+300 s soak. This remains a runtime and lifecycle claim: external transport,
+RTC-process latency, accelerator execution, full optical propagation, and
+instrument-scale capacity are explicitly excluded. The frozen protocol and
+claim limits are maintained in
+[Gate 8.9 issue #25](https://github.com/DarrylGamroth/AdaptiveOpticsHIL.jl/issues/25).
+The
+[maintained Gate 8.9 artifact](benchmarks/results/gate8/2026-07-28-operational-runtime.toml)
+and its
+[hash manifest](benchmarks/results/gate8/artifact-manifest.toml)
+contain the current qualified baseline.
+The selected low-tail candidate assigns each owner to a distinct Julia thread
+and CPU, pins all four Julia default-pool threads to distinct physical cores
+with ThreadPinning.jl, and uses `Agent.BusySpinIdleStrategy` for owner and
+coordinator barrier waits. It consumes CPU continuously while idle. The
+qualifying process runs under Linux `SCHED_FIFO` priority 20; the benchmark
+verifies the policy and priority on every Julia default-pool thread and records
+their Linux thread and CPU IDs. This profile still does not reserve cores or
+claim CPU/IRQ isolation.
+
+CI runs the bounded benchmark-contract suite plus the focused four-thread
+Gate 8.9 runtime smoke. The full Gate 8 campaign is a deliberate qualification
+run, not a development test. It evaluates completed phases before entering the
+300 s soak and generates durable evidence only from a clean revision after
+every frozen gate passes. Gate 4A requires one Julia and BLAS thread:
 
 ```sh
 julia --startup-file=no --project=benchmarks \
     benchmarks/benchmark_gate4a_serial_boundary.jl \
     --output benchmarks/results/gate4a/YYYY-MM-DD-serial-boundary.toml
+```
+
+Gate 8.9 requires four default-pool threads, no interactive-pool thread, and
+one BLAS/FFT-provider thread:
+
+```sh
+JULIA_NUM_THREADS=4,0 OPENBLAS_NUM_THREADS=1 \
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+chrt --fifo 20 julia --startup-file=no --project=benchmarks \
+    benchmarks/benchmark_gate8_operational_runtime.jl \
+    --output benchmarks/results/gate8/YYYY-MM-DD-operational-runtime.toml
 ```
 
 ## Development sources

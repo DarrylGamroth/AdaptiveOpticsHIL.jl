@@ -1,6 +1,7 @@
 [deps]
 AdaptiveOpticsHIL = "c50291de-c366-4d66-93e5-abfdaae8bfec"
 AdaptiveOpticsSim = "002fb5eb-ad68-44a0-adbe-b299bfc2febc"
+Agent = "f7939a7f-2bcc-4096-952b-c44031b5533b"
 Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
 Clocks = "6b5ade5d-6e95-4584-b343-73eec2e8782b"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
@@ -11,17 +12,21 @@ SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+ThreadPinning = "811555cd-349b-4f26-b7bc-1f208b848042"
 
 [sources]
 AdaptiveOpticsHIL = {path = ".."}
-AdaptiveOpticsSim = {url = "https://github.com/DarrylGamroth/AdaptiveOpticsSim.jl.git", rev = "68ef4336e4b87cddc4e5b55acfa97c601a9c6421"}
+AdaptiveOpticsSim = {url = "https://github.com/DarrylGamroth/AdaptiveOpticsSim.jl.git", rev = "5bf180341faad9350622f9c660147205aebf33dc"}
+Agent = {url = "https://github.com/DarrylGamroth/Agent.jl.git", rev = "71e3af4e5c112f0433e03d57a570bc74ffd05ccc"}
 Clocks = {url = "https://github.com/DarrylGamroth/Clocks.jl.git", rev = "1b705421648b70b6d171f8a95d6c2d16c2444d0b"}
 HdrHistogram = {url = "https://github.com/DarrylGamroth/HdrHistogram.jl.git", rev = "5b800689d2be55bf4103fd51b38cf92859f74aa1"}
 
 [compat]
 AdaptiveOpticsHIL = "0.1"
 AdaptiveOpticsSim = "0.1"
+Agent = "0.4.1"
 Clocks = "0.3"
 HdrHistogram = "0.4"
 Test = "1"
+ThreadPinning = "1"
 julia = "1.12"

@@ -1,0 +1,5 @@
+artifact_file = "2026-07-28-operational-runtime.toml"
+artifact_sha256 = "ca30721559e92f8954f9cc0ca9eb7fe87d3b8dd4252233e890a604e5753f5bf4"
+contract_sha256 = "ad83bf11c71ff05f05e148e017ece19d03d05ae3eac83e8a40c4205f14d54747"
+schema_version = 1
+source_revision = "07eef16396e4fa7a13e902a8a0760f18d492f65f"

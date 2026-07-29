@@ -5,14 +5,17 @@ authors = ["Darryl Gamroth <dgamroth@rubus.ca>"]
 
 [deps]
 AdaptiveOpticsSim = "002fb5eb-ad68-44a0-adbe-b299bfc2febc"
+Agent = "f7939a7f-2bcc-4096-952b-c44031b5533b"
 Clocks = "6b5ade5d-6e95-4584-b343-73eec2e8782b"
 
 [sources]
-AdaptiveOpticsSim = {url = "https://github.com/DarrylGamroth/AdaptiveOpticsSim.jl.git", rev = "68ef4336e4b87cddc4e5b55acfa97c601a9c6421"}
+AdaptiveOpticsSim = {url = "https://github.com/DarrylGamroth/AdaptiveOpticsSim.jl.git", rev = "5bf180341faad9350622f9c660147205aebf33dc"}
+Agent = {url = "https://github.com/DarrylGamroth/Agent.jl.git", rev = "71e3af4e5c112f0433e03d57a570bc74ffd05ccc"}
 Clocks = {url = "https://github.com/DarrylGamroth/Clocks.jl.git", rev = "1b705421648b70b6d171f8a95d6c2d16c2444d0b"}
 
 [compat]
 AdaptiveOpticsSim = "0.1"
+Agent = "0.4.1"
 Aqua = "0.8"
 Clocks = "0.3"
 InteractiveUtils = "1"

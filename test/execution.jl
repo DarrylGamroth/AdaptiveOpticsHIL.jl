@@ -12,6 +12,7 @@ using AdaptiveOpticsSim.Plant
 using AdaptiveOpticsSim.Plant: ColdPlantModelDefinition
 using AdaptiveOpticsSim.Plant: PreparedPathExecutor
 using AdaptiveOpticsSim.Plant: prepare_pupil_opd_materialization
+using Agent
 using LinearAlgebra: BLAS
 using Clocks
 using Test
@@ -25,15 +26,29 @@ const EXECUTION_TEST_SHUTDOWN_POLICY = RunShutdownPolicy(
     drain_timeout_ns=2_000_000_000)
 
 struct ExecutionTestUnsupportedMode <: AbstractExecutionOwnerMode end
-struct ExecutionTestUnsupportedIdle <: AbstractExecutionOwnerIdlePolicy end
+struct ExecutionTestUnsupportedPlacement <:
+    AbstractExecutionOwnerPlacement end
+struct ExecutionTestUnsupportedIdle end
+(::ExecutionTestUnsupportedIdle)() = nothing
+
+mutable struct ExecutionTestAlternatingIdleFactory
+    calls::Int
+end
+
+function (factory::ExecutionTestAlternatingIdleFactory)()
+    factory.calls += 1
+    return isodd(factory.calls) ?
+        YieldingIdleStrategy() :
+        BackoffIdleStrategy(4, 2, 1_000, 50_000)
+end
+
 struct ExecutionTestUnsupportedOverloadAction <:
     AbstractExecutionOwnerOverloadAction end
 struct ExecutionTestUnsupportedConfiguration <:
     AbstractOpticalExecutionConfiguration
 end
 
-struct ExecutionBeforeDequeueFailureIdle{E} <:
-    AbstractExecutionOwnerIdlePolicy
+struct ExecutionBeforeDequeueFailureIdle{E} <: Agent.IdleStrategy
     error::E
     coordinator_task_id::UInt
 end
@@ -42,15 +57,24 @@ ExecutionBeforeDequeueFailureIdle(error) =
     ExecutionBeforeDequeueFailureIdle(
         error, objectid(current_task()))
 
-AdaptiveOpticsHIL.Execution._validate_execution_owner_idle_policy(
-    ::ExecutionBeforeDequeueFailureIdle) = nothing
+(policy::ExecutionBeforeDequeueFailureIdle)() = policy
 
-function AdaptiveOpticsHIL.Execution._next_idle_poll(
+function Agent.idle(
     policy::ExecutionBeforeDequeueFailureIdle,
-    ::UInt32)
+)
     objectid(current_task()) == policy.coordinator_task_id &&
-        return (yield(); zero(UInt32))
+        return yield()
     throw(policy.error)
+end
+
+function execution_test_assigned_threads(count::Integer)
+    default_threads = filter(
+        thread_id -> Threads.threadpool(thread_id) === :default,
+        1:Threads.maxthreadid(),
+    )
+    length(default_threads) > count ||
+        error("assigned owner test requires coordinator headroom")
+    return Tuple(default_threads[(end - Int(count) + 1):end])
 end
 
 function execution_test_owner_configuration(
@@ -100,11 +124,13 @@ mutable struct ExecutionConcurrencyProbe
     release::Threads.Atomic{Bool}
     thread_ids::Memory{Int}
     timeout_ns::UInt64
+    force_gc::Bool
 end
 
 function ExecutionConcurrencyProbe(
     expected::Integer;
     timeout_seconds::Real=5,
+    force_gc::Bool=false,
 )
     expected > 1 || throw(ArgumentError(
         "execution probe requires at least two owners"))
@@ -118,6 +144,7 @@ function ExecutionConcurrencyProbe(
         Threads.Atomic{Bool}(false),
         thread_ids,
         UInt64(round(Int, timeout_seconds * 1.0e9)),
+        force_gc,
     )
 end
 
@@ -129,6 +156,7 @@ function execution_concurrency_probe!(
     slot = Threads.atomic_add!(probe.arrivals, 1) + 1
     slot <= probe.expected || return nothing
     @inbounds probe.thread_ids[slot] = Threads.threadid()
+    slot == 1 && probe.force_gc && GC.gc()
     if slot == probe.expected
         probe.release[] = true
         return nothing
@@ -810,19 +838,123 @@ end
         serial_executor)
     @test AdaptiveOpticsHIL.Execution.
         _progress_optical_execution_shutdown!(serial_executor)
+    @test AdaptiveOpticsHIL.Execution.
+        _stop_optical_execution!(serial_executor) === serial_executor
     @test !AdaptiveOpticsHIL.Execution._execution_batch_active(
         serial_executor)
     @test AdaptiveOpticsHIL.Execution.
         _abandon_failed_optical_path_batch!(serial_executor)
     @test AdaptiveOpticsHIL.Execution._execution_accounting_is_quiescent(
         nothing)
-    @test_throws ExecutionOwnerError HybridExecutionOwnerIdle(0)
-    @test_throws ExecutionOwnerError HybridExecutionOwnerIdle(true)
-    @test HybridExecutionOwnerIdle(4).spin_count == 4
-    @test ThreadedExecutionOwners().idle_policy isa
-        YieldingExecutionOwnerIdle
-    @test ThreadedExecutionOwners(
-        HybridExecutionOwnerIdle(4)).idle_policy.spin_count == 4
+    default_agent_mode = AgentExecutionOwners()
+    @test default_agent_mode.idle_strategy_factory() isa
+        YieldingIdleStrategy
+    @test @inferred(
+        AdaptiveOpticsHIL.Execution._new_agent_idle_strategy(
+            default_agent_mode),
+    ) isa YieldingIdleStrategy
+    @test default_agent_mode.placement isa
+        SchedulerManagedExecutionOwnerPlacement
+    @test_throws ExecutionOwnerError AdaptiveOpticsHIL.Execution.
+        _validate_execution_owner_placement(
+            ExecutionTestUnsupportedPlacement())
+    name_probe = AdaptiveOpticsHIL.Execution._ExecutionOwnerAgent(
+        nothing,
+        1,
+        OwnerBeforeDequeue,
+        UInt64(0),
+        "execution-test-owner",
+    )
+    @test Agent.name(name_probe) == "execution-test-owner"
+    @test_throws AgentTerminationException Agent.on_error(
+        name_probe, AgentTerminationException())
+    assigned_placement =
+        ThreadAssignedExecutionOwnerPlacement((2, 3))
+    @test assigned_placement.thread_ids == (2, 3)
+    @test assigned_placement.cpu_ids === nothing
+    pinned_placement = ThreadAssignedExecutionOwnerPlacement(
+        (2, 3); cpu_ids=(4, 5))
+    @test pinned_placement.cpu_ids == (4, 5)
+    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerPlacement(())
+    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerPlacement([2, 3])
+    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerPlacement((2, 2))
+    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerPlacement(
+        (2, 2), nothing)
+    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerPlacement((true,))
+    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerPlacement((2, "3"))
+    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerPlacement(
+        (2, 3); cpu_ids=(4,))
+    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerPlacement(
+        (2, 3), (4,))
+    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerPlacement(
+        (2, 3); cpu_ids=(4, 4))
+    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerPlacement(
+        (2, 3); cpu_ids=(true, false))
+    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerPlacement(
+        (2, 3); cpu_ids=(4, "5"))
+    if Base.get_extension(
+            Agent, :AgentThreadPinningExt) === nothing
+        missing_pinning_runner = AgentRunner(
+            YieldingIdleStrategy(), nothing)
+        missing_pinning_placement =
+            ThreadAssignedExecutionOwnerPlacement(
+                (Threads.threadid(),); cpu_ids=(0,))
+        @test_throws ArgumentError AdaptiveOpticsHIL.Execution.
+            _start_execution_owner_runner(
+                missing_pinning_runner,
+                missing_pinning_placement,
+                1,
+            )
+        @test !Agent.is_started(missing_pinning_runner)
+        close(missing_pinning_runner)
+    else
+        @test_skip "missing-ThreadPinning error path requires the extension to be unloaded"
+    end
+    backoff_agent_mode = AgentExecutionOwners(
+        () -> BackoffIdleStrategy(4, 2, 1_000, 50_000))
+    @test backoff_agent_mode.idle_strategy_factory().
+        max_spins == 4
+    @test @inferred(
+        AdaptiveOpticsHIL.Execution._new_agent_idle_strategy(
+            backoff_agent_mode),
+    ) isa BackoffIdleStrategy
+    coordinator_idle, owner_idles = @inferred(
+        AdaptiveOpticsHIL.Execution._prepare_agent_idle_strategies(
+            backoff_agent_mode, 2),
+    )
+    @test owner_idles isa Memory{BackoffIdleStrategy}
+    @test coordinator_idle !== owner_idles[1]
+    @test owner_idles[1] !== owner_idles[2]
+    invalid_factory_error = captured_execution_test_error() do
+        AgentExecutionOwners(identity)
+    end
+    @test invalid_factory_error isa ExecutionOwnerError
+    @test invalid_factory_error.reason ==
+        :invalid_idle_strategy_factory
+    failed_factory_error = captured_execution_test_error() do
+        AgentExecutionOwners(() -> error("factory failed"))
+    end
+    @test failed_factory_error isa ExecutionOwnerError
+    @test failed_factory_error.reason ==
+        :idle_strategy_factory_failed
+    alternating_mode = AgentExecutionOwners(
+        ExecutionTestAlternatingIdleFactory(0))
+    inconsistent_factory_error =
+        captured_execution_test_error() do
+            AdaptiveOpticsHIL.Execution._new_agent_idle_strategy(
+                alternating_mode)
+        end
+    @test inconsistent_factory_error isa ExecutionOwnerError
+    @test inconsistent_factory_error.reason ==
+        :inconsistent_idle_strategy
+    shared_strategy = BackoffIdleStrategy(4, 2, 1_000, 50_000)
+    shared_mode = AgentExecutionOwners(() -> shared_strategy)
+    shared_strategy_error = captured_execution_test_error() do
+        AdaptiveOpticsHIL.Execution._prepare_agent_idle_strategies(
+            shared_mode, 1)
+    end
+    @test shared_strategy_error isa ExecutionOwnerError
+    @test shared_strategy_error.reason == :shared_idle_strategy
     capacity_configuration =
         execution_test_owner_configuration(
             DeterministicExecutionOwners())
@@ -888,6 +1020,13 @@ end
             duplicate_override,
         ),
     )
+    @test_throws ExecutionOwnerError ExecutionOwnerConfiguration(
+        capacity_configuration.mode,
+        capacity_configuration.cpu_budget,
+        capacity_configuration.cpu_environment;
+        owner_policy=capacity_configuration.owner_policy,
+        owner_policy_overrides=(nothing,),
+    )
     @test !applicable(
         ExecutionOwnerConfiguration,
         capacity_configuration.mode,
@@ -922,12 +1061,12 @@ end
         capacity_configuration.cpu_environment,
         owner_policy=capacity_configuration.owner_policy,
     )
-    @test_throws ExecutionOwnerError ExecutionOwnerConfiguration(
-        ThreadedExecutionOwners(ExecutionTestUnsupportedIdle()),
-        capacity_configuration.cpu_budget,
-        capacity_configuration.cpu_environment,
-        owner_policy=capacity_configuration.owner_policy,
-    )
+    unsupported_idle_error = captured_execution_test_error() do
+        AdaptiveOpticsHIL.Execution._new_agent_idle_strategy(
+            AgentExecutionOwners(ExecutionTestUnsupportedIdle()))
+    end
+    @test unsupported_idle_error isa ExecutionOwnerError
+    @test unsupported_idle_error.reason == :invalid_idle_strategy
     unsupported = execution_test_fixture()
     unsupported_error = captured_execution_test_error() do
         AdaptiveOpticsHIL.Execution._prepare_optical_execution(
@@ -1029,7 +1168,7 @@ end
     undersized = execution_test_fixture()
     undersized_configuration =
         execution_test_owner_configuration(
-            ThreadedExecutionOwners();
+            AgentExecutionOwners();
             outer_owner_count=1,
         )
     undersized_error = captured_execution_test_error() do
@@ -1067,6 +1206,7 @@ end
     @test missing_error isa ExecutionOwnerError
     @test missing_error.reason ==
         :missing_deterministic_completion
+    @test execution_owner_placement(missing_executor) === nothing
 
     capacity = execution_test_fixture()
     capacity_executor = prepare_execution_test_executor(
@@ -1256,7 +1396,7 @@ end
         before_dequeue = execution_test_fixture()
         before_dequeue_executor = prepare_execution_test_executor(
             before_dequeue,
-            ThreadedExecutionOwners(
+            AgentExecutionOwners(
                 ExecutionBeforeDequeueFailureIdle(
                     before_dequeue_failure));
             outer_owner_count=3,
@@ -1278,7 +1418,7 @@ end
         after_dequeue = execution_test_fixture()
         after_dequeue_executor = prepare_execution_test_executor(
             after_dequeue,
-            ThreadedExecutionOwners();
+            AgentExecutionOwners();
             outer_owner_count=3,
             session=RunSessionID(0x89e6),
         )
@@ -1340,12 +1480,12 @@ end
         publication_executor)
 
     if Threads.nthreads() < 4
-        @test_skip "threaded stop-publication fault requires four Julia threads"
+        @test_skip "Agent stop-publication fault requires four Julia threads"
     else
         stop_publication_failure = execution_test_fixture()
         stop_publication_executor = prepare_execution_test_executor(
             stop_publication_failure,
-            ThreadedExecutionOwners();
+            AgentExecutionOwners();
             outer_owner_count=3,
             session=RunSessionID(0x89e9),
         )
@@ -1413,6 +1553,7 @@ end
         AdaptiveOpticsSim.CUDABackend(),
         original_device_owner.compute_device,
         original_device_owner.overload_policy,
+        original_device_owner.deadline,
         original_device_owner.due,
         original_device_owner.completion)
     AdaptiveOpticsHIL.Execution._submit_owner_phase!(
@@ -1600,11 +1741,81 @@ end
     if Threads.nthreads() < 4
         @test_skip "three overlapping owners require four Julia threads"
     else
+        placement_fixture = execution_test_fixture()
+        placement_error = captured_execution_test_error() do
+            AdaptiveOpticsHIL.Execution._prepare_optical_execution(
+                execution_test_owner_configuration(
+                    AgentExecutionOwners(
+                        placement=
+                            ThreadAssignedExecutionOwnerPlacement(
+                                execution_test_assigned_threads(2)));
+                    outer_owner_count=3,
+                ),
+                placement_fixture.prepared,
+                placement_fixture.state,
+                placement_fixture.workspace,
+                RunSessionID(0x8a01),
+                EXECUTION_TEST_SHUTDOWN_POLICY,
+            )
+        end
+        @test placement_error isa ExecutionOwnerError
+        @test placement_error.reason ==
+            :owner_placement_cardinality
+
+        unstable_coordinator_reason = fetch(Threads.@spawn begin
+            unstable_error = captured_execution_test_error() do
+                AdaptiveOpticsHIL.Execution.
+                    _validate_execution_owner_coordinator_context(
+                        ThreadAssignedExecutionOwnerPlacement(
+                            (Threads.threadid(),)))
+            end
+            return unstable_error.reason
+        end)
+        @test unstable_coordinator_reason ==
+            :unstable_coordinator_task
+
+        collision_reason = fetch(Threads.@spawn begin
+            current_task().sticky = true
+            collision_fixture = execution_test_fixture(
+                device_batch_selection=Val(:all),
+                batchable=true,
+            )
+            collision_executor =
+                AdaptiveOpticsHIL.Execution._prepare_optical_execution(
+                    execution_test_owner_configuration(
+                        AgentExecutionOwners(
+                            placement=
+                                ThreadAssignedExecutionOwnerPlacement(
+                                    (Threads.threadid(),)));
+                        outer_owner_count=1,
+                    ),
+                    collision_fixture.prepared,
+                    collision_fixture.state,
+                    collision_fixture.workspace,
+                    RunSessionID(0x8a01),
+                    EXECUTION_TEST_SHUTDOWN_POLICY,
+                )
+            collision_error = captured_execution_test_error() do
+                AdaptiveOpticsHIL.Execution._arm_optical_execution!(
+                    collision_executor)
+            end
+            execution_owners_are_quiescent(collision_executor) ||
+                error("unarmed collision fixture was not quiescent")
+            AdaptiveOpticsHIL.Execution._stop_optical_execution!(
+                collision_executor)
+            execution_owners_phase(collision_executor) ==
+                ExecutionOwnersStopped ||
+                error("collision fixture did not stop cleanly")
+            return collision_error.reason
+        end)
+        @test collision_reason ==
+            :coordinator_owner_thread_collision
+
         backpressure = execution_test_fixture()
         backpressure_executor =
             AdaptiveOpticsHIL.Execution._prepare_optical_execution(
                 execution_test_owner_configuration(
-                    ThreadedExecutionOwners();
+                    AgentExecutionOwners();
                     outer_owner_count=3,
                 ),
                 backpressure.prepared,
@@ -1647,44 +1858,50 @@ end
             backpressure_owner.completion,
         ) == RingTransferSucceeded
 
-        threaded_serial = execution_test_fixture()
-        probe = ExecutionConcurrencyProbe(3)
-        threaded = execution_test_fixture(; probe)
-        threaded_executor = prepare_execution_test_executor(
-            threaded,
-            ThreadedExecutionOwners(HybridExecutionOwnerIdle(32));
+        agent_serial = execution_test_fixture()
+        probe = ExecutionConcurrencyProbe(3; force_gc=true)
+        agent_fixture = execution_test_fixture(; probe)
+        agent_executor = prepare_execution_test_executor(
+            agent_fixture,
+            AgentExecutionOwners(
+                () -> BackoffIdleStrategy(32, 4, 1_000, 50_000);
+                placement=ThreadAssignedExecutionOwnerPlacement(
+                    execution_test_assigned_threads(3)));
             outer_owner_count=3,
             session=RunSessionID(0x8a02),
         )
         initial_task_ids = Tuple(
             execution_owner_accounting(
-                threaded_executor, ordinal).task_id
+                agent_executor, ordinal).task_id
             for ordinal in 1:3
         )
-        @test execution_owner_idle_policy(
-            threaded_executor).spin_count == 32
-        threaded_serial_count = run_plant_events_until!(
-            threaded_serial.prepared,
-            threaded_serial.state,
-            threaded_serial.workspace,
+        @test execution_owner_idle_strategy_factory(
+            agent_executor)().max_spins == 32
+        @test execution_owner_placement(
+            agent_executor) isa
+            ThreadAssignedExecutionOwnerPlacement
+        agent_serial_count = run_plant_events_until!(
+            agent_serial.prepared,
+            agent_serial.state,
+            agent_serial.workspace,
             horizon,
         )
-        threaded_count = run_plant_events_until!(
-            threaded.prepared,
-            threaded.state,
-            threaded.workspace,
+        agent_count = run_plant_events_until!(
+            agent_fixture.prepared,
+            agent_fixture.state,
+            agent_fixture.workspace,
             horizon,
-            threaded_executor,
+            agent_executor,
         )
-        @test threaded_count == threaded_serial_count
-        compare_execution_test_runs(threaded_serial, threaded)
+        @test agent_count == agent_serial_count
+        compare_execution_test_runs(agent_serial, agent_fixture)
         @test probe.arrivals[] >= 3
         @test all(!iszero, probe.thread_ids)
         @test length(unique(collect(probe.thread_ids))) == 3
         task_ids = UInt[]
         for ordinal in 1:3
             accounting =
-                execution_owner_accounting(threaded_executor, ordinal)
+                execution_owner_accounting(agent_executor, ordinal)
             @test accounting.startup_acknowledged
             @test !iszero(accounting.task_id)
             @test accounting.work_submitted ==
@@ -1693,10 +1910,10 @@ end
         end
         @test length(unique(task_ids)) == 3
         @test Tuple(task_ids) == initial_task_ids
-        stop_execution_test_executor!(threaded_executor)
+        stop_execution_test_executor!(agent_executor)
         @test all(
             ordinal -> execution_owner_accounting(
-                threaded_executor, ordinal).stop_acknowledged,
+                agent_executor, ordinal).stop_acknowledged,
             1:3,
         )
 
@@ -1710,7 +1927,7 @@ end
         )
         independent_executor = prepare_execution_test_executor(
             independent,
-            ThreadedExecutionOwners();
+            AgentExecutionOwners();
             outer_owner_count=3,
             session=RunSessionID(0x8a03),
         )
@@ -1743,7 +1960,7 @@ end
         )
         deadline_executor = prepare_execution_test_executor(
             deadline_fixture,
-            ThreadedExecutionOwners();
+            AgentExecutionOwners();
             outer_owner_count=3,
             session=RunSessionID(0x8a04),
             owner_policy_overrides=(

@@ -98,6 +98,7 @@ using ..Ports: command_processing_endpoint
 using ..Ports: command_processing_port_result, command_processing_stage
 using ..Ports: command_disposition_workspace, command_payload_accounting
 using ..Ports: command_submission_port, matching_acquisition_completion
+using ..Ports: pending_command_receive_timestamp
 using ..Ports: outcome_credit_accounting, plant_event_loop_state
 using ..Ports: plant_event_loop_workspace
 using ..Ports: port_status, process_next_command!
@@ -151,7 +152,11 @@ struct SerialRunError <: AdaptiveOpticsHILError
     component::Symbol
     reason::Symbol
     msg::String
+    context::NamedTuple
 end
+
+SerialRunError(component::Symbol, reason::Symbol, msg::String) =
+    SerialRunError(component, reason, msg, (;))
 
 struct PreparedAcquisitionPublisher{
     P<:AcquisitionCompletionPort,
@@ -610,6 +615,24 @@ serial_rtc_ingress_liveness_accounting(run::Union{
         state.decision)
 end
 
+@inline _serial_acquisition_overload_accounting(
+    ::Tuple{},
+    ::Memory{AcquisitionPublicationState},
+    ::AcquisitionID,
+    ::Int) = nothing
+
+@inline function _serial_acquisition_overload_accounting(
+    publishers::Tuple,
+    publications::Memory{AcquisitionPublicationState},
+    id::AcquisitionID,
+    index::Int)
+    publisher = first(publishers)
+    publisher.id == id && return _acquisition_overload_accounting(
+        publisher, @inbounds(publications[index]))
+    return _serial_acquisition_overload_accounting(
+        Base.tail(publishers), publications, id, index + 1)
+end
+
 function serial_acquisition_overload_accounting(
     run::Union{
         PreparedSerialRun,
@@ -619,12 +642,9 @@ function serial_acquisition_overload_accounting(
     },
     id::AcquisitionID)
     prepared = _prepared_serial_run(run)
-    @inbounds for index in eachindex(prepared.publishers)
-        publisher = prepared.publishers[index]
-        publisher.id == id || continue
-        return _acquisition_overload_accounting(
-            publisher, prepared.state.publications[index])
-    end
+    accounting = _serial_acquisition_overload_accounting(
+        prepared.publishers, prepared.state.publications, id, 1)
+    accounting === nothing || return accounting
     throw(SerialRunError(
         :serial_run,
         :unknown_acquisition,
@@ -1525,22 +1545,51 @@ end
 end
 
 @noinline function _fail_serial_acquisition!(
+    publisher::PreparedAcquisitionPublisher,
     publication::AcquisitionPublicationState,
     decision::AcquisitionOverloadDecision,
     reason::Symbol,
     message::String)
     _mark_serial_acquisition_overload!(publication, decision)
     publication.products_failed += UInt64(1)
-    _serial_publication_error(reason, message)
+    descriptors = ring_accounting(publisher.port.ring)
+    products = acquisition_product_accounting(publisher.port)
+    context = (
+        acquisition=publisher.id,
+        sequence=publication.last_sequence,
+        descriptor_occupancy=descriptors.occupancy,
+        descriptor_capacity=descriptors.capacity,
+        product_occupancy=products.capacity - products.free,
+        product_capacity=products.capacity,
+        latest_lateness_ns=publication.latest_lateness_ns,
+        maximum_lateness_ns=publication.maximum_lateness_ns,
+        decision,
+    )
+    throw(SerialRunError(
+        publisher.id.name,
+        reason,
+        string(
+            message,
+            " (acquisition=", publisher.id.name,
+            ", sequence=", publication.last_sequence,
+            ", descriptor_occupancy=", context.descriptor_occupancy,
+            '/', context.descriptor_capacity,
+            ", product_occupancy=", context.product_occupancy,
+            '/', context.product_capacity,
+            ", latest_lateness_ns=", publication.latest_lateness_ns,
+            ')'),
+        context))
 end
 
 @inline function _handle_serial_capacity_overload!(
     policy::AcquisitionOverloadPolicy,
+    publisher::PreparedAcquisitionPublisher,
     publication::AcquisitionPublicationState)
     _serial_acquisition_may_shed(policy) &&
         return _shed_serial_acquisition!(
             publication, AcquisitionShedForCapacity)
     return _fail_serial_acquisition!(
+        publisher,
         publication,
         AcquisitionFailedForCapacity,
         :acquisition_product_capacity,
@@ -1549,11 +1598,13 @@ end
 
 @inline function _handle_serial_deadline_overload!(
     policy::AcquisitionOverloadPolicy,
+    publisher::PreparedAcquisitionPublisher,
     publication::AcquisitionPublicationState)
     _serial_acquisition_may_shed(policy) &&
         return _shed_serial_acquisition!(
             publication, AcquisitionShedForDeadline)
     return _fail_serial_acquisition!(
+        publisher,
         publication,
         AcquisitionFailedForDeadline,
         :acquisition_publication_deadline,
@@ -1619,7 +1670,8 @@ function _publish_serial_products!(
         maximum_lateness_ns = policy.maximum_lateness_ns
         if maximum_lateness_ns !== nothing &&
                 lateness_ns > maximum_lateness_ns
-            _handle_serial_deadline_overload!(policy, publication)
+            _handle_serial_deadline_overload!(
+                policy, publisher, publication)
             return _publish_serial_products!(
                 Base.tail(publishers),
                 armed,
@@ -1633,9 +1685,10 @@ function _publish_serial_products!(
         if claim_status != PayloadTransitionSucceeded
             if claim_status == PayloadPoolExhausted
                 _handle_serial_capacity_overload!(
-                    policy, publication)
+                    policy, publisher, publication)
             elseif claim_status == PayloadPoolClosed
                 _fail_serial_acquisition!(
+                    publisher,
                     publication,
                     AcquisitionFailedForCapacity,
                     :acquisition_publication_rejected,
@@ -1676,7 +1729,8 @@ function _publish_serial_products!(
             if !_serial_acquisition_may_shed(policy)
                 _abort_serial_product!(publisher.port, lease)
             end
-            _handle_serial_capacity_overload!(policy, publication)
+            _handle_serial_capacity_overload!(
+                policy, publisher, publication)
             _observe_serial_acquisition_occupancy!(
                 publication, publisher.port)
             return _publish_serial_products!(
@@ -1689,6 +1743,7 @@ function _publish_serial_products!(
         elseif publication_status != PortTransferSucceeded
             _abort_serial_product!(publisher.port, lease)
             _fail_serial_acquisition!(
+                publisher,
                 publication,
                 AcquisitionFailedForCapacity,
                 :acquisition_publication_rejected,
@@ -1726,6 +1781,25 @@ end
         "RTC-ingress-liveness observation exceeded its inclusive execution-clock deadline"))
 end
 
+@inline function _command_precedes_plant_event(
+    ::Nothing,
+    ::Union{Nothing,PlantTimestamp},
+)
+    return false
+end
+
+@inline function _command_precedes_plant_event(
+    ::PlantTimestamp,
+    ::Nothing,
+)
+    return true
+end
+
+@inline _command_precedes_plant_event(
+    command::PlantTimestamp,
+    event::PlantTimestamp,
+) = command <= event
+
 function _step_serial_run!(
     armed::ArmedSerialRun,
     state::SerialRunState,
@@ -1742,14 +1816,26 @@ function _step_serial_run!(
     liveness_status == RTCIngressLivenessExpired &&
         _fail_serial_ingress_liveness!(
             armed, state, workspace, publication_execution_ns)
-    command_result = process_next_command!(
-        configuration.command_bridge,
-        state.bridge,
-        workspace.bridge,
-        publication_execution_ns)
-    command_status = port_status(
-        command_processing_port_result(command_result))
-    if command_status == PortTransferSucceeded
+
+    event_state = plant_event_loop_state(state.bridge)
+    event_workspace = plant_event_loop_workspace(workspace.bridge)
+    timestamp = next_plant_event_timestamp(
+        configuration.event_loop, event_state, event_workspace)
+    command_timestamp = pending_command_receive_timestamp(
+        configuration.command_bridge, workspace.bridge)
+    if _command_precedes_plant_event(
+            command_timestamp, timestamp)
+        command_result = process_next_command!(
+            configuration.command_bridge,
+            state.bridge,
+            workspace.bridge,
+            publication_execution_ns)
+        command_status = port_status(
+            command_processing_port_result(command_result))
+        command_status == PortTransferSucceeded ||
+            _serial_publication_error(
+                :command_processing,
+                "the command selected by the serial scheduler was not transferred")
         admission_execution_ns =
             _read_execution_clock(execution_clock(armed.timing))
         if command_processing_stage(command_result) ==
@@ -1773,15 +1859,7 @@ function _step_serial_run!(
         return SerialStepResult(
             SerialCommandProcessed, timestamp, Int64(0))
     end
-    command_status in (PortEmpty, PortClosed) ||
-        _serial_publication_error(
-            :command_processing,
-            "the command bridge returned an invalid processing status")
 
-    event_state = plant_event_loop_state(state.bridge)
-    event_workspace = plant_event_loop_workspace(workspace.bridge)
-    timestamp = next_plant_event_timestamp(
-        configuration.event_loop, event_state, event_workspace)
     timestamp === nothing && return SerialStepResult(
         SerialEventLoopComplete, nothing, Int64(0))
     time_until_ns = execution_time_until_ns(armed.timing, timestamp)

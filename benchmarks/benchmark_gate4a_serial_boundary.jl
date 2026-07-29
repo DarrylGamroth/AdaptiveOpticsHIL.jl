@@ -857,11 +857,28 @@ function report_failed_gates(gates)
     return names
 end
 
-function write_artifact(output_path, artifact)
+function _write_toml_atomically(output_path, value)
+    buffer = IOBuffer()
+    TOML.print(buffer, value; sorted=true)
+    serialized = take!(buffer)
     mkpath(dirname(output_path))
-    open(output_path, "w") do io
-        TOML.print(io, artifact; sorted=true)
+    temporary_path, temporary_io =
+        mktemp(dirname(output_path); cleanup=false)
+    try
+        write(temporary_io, serialized)
+        flush(temporary_io)
+        close(temporary_io)
+        mv(temporary_path, output_path; force=true)
+    catch
+        isopen(temporary_io) && close(temporary_io)
+        rm(temporary_path; force=true)
+        rethrow()
     end
+    return output_path
+end
+
+function write_artifact(output_path, artifact)
+    _write_toml_atomically(output_path, artifact)
     artifact_hash = bytes2hex(SHA.sha256(read(output_path)))
     manifest_path = joinpath(
         dirname(output_path), "artifact-manifest.toml")
@@ -874,9 +891,7 @@ function write_artifact(output_path, artifact)
         "contract_sha256" =>
             artifact["environment"]["contract_sha256"],
     )
-    open(manifest_path, "w") do io
-        TOML.print(io, manifest; sorted=true)
-    end
+    _write_toml_atomically(manifest_path, manifest)
     return (; artifact_hash, manifest_path)
 end
 

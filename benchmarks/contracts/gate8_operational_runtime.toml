@@ -1,0 +1,138 @@
+schema_version = 1
+name = "gate8_single_host_cpu_operational_runtime"
+evidence_class = "single-host CPU, pinned SCHED_FIFO, in-memory, two-owner reduced-order HIL runtime and lifecycle evidence"
+protocol_issue = "https://github.com/DarrylGamroth/AdaptiveOpticsHIL.jl/issues/25"
+
+julia_threads = 4
+julia_interactive_threads = 0
+blas_threads = 1
+fft_threads = 1
+execution_owner_count = 2
+execution_owner_ring_capacity = 8
+execution_owner_idle_strategy = "Agent.BusySpinIdleStrategy"
+execution_owner_placement = "four Julia default-pool threads pinned to distinct physical cores; owners assigned to threads and CPU IDs"
+thread_pinning_policy = "ThreadPinning.pinthreads(:cores); distinct physical cores before SMT siblings"
+execution_scheduler_policy = "SCHED_FIFO"
+execution_scheduler_priority = 20
+execution_owner_maximum_lateness_ns = 50000000
+required_product_capacity_horizon_ns = 64000000
+arm_timeout_ns = 5000000000
+
+correctness_frames = 1024
+compilation_coverage_frames = 2
+warmup_frames = 5000
+baseline_runs = 3
+baseline_samples_per_run = 20000
+target_rate_hz = 2000
+target_runs = 3
+target_samples_per_run = 100000
+burst_samples = 100000
+burst_start_sequence = 50000
+burst_frames = 16
+science_shed_samples = 12000
+science_stall_start_sequence = 1000
+science_stall_primary_frames = 64
+science_recovery_frames = 10000
+calibration_runs = 3
+calibration_samples_per_run = 100000
+minimum_calibrated_rate_hz = 4500
+stress_rate_preserve_capacity_time_headroom = true
+near_saturation_rate_hz = 3000
+saturation_rate_hz = 4000
+overload_rate_hz = 12000
+near_saturation_runs = 3
+near_saturation_samples_per_run = 100000
+saturation_runs = 3
+saturation_samples_per_run = 100000
+overload_maximum_offered = 100000
+overload_failure_bound_ns = 2000000000
+recovery_samples = 20000
+injected_failure_runs = 3
+injected_failure_batch_sequence = 64
+acknowledgement_timeout_ns = 1000000000
+drain_timeout_ns = 2000000000
+deficit_drain_timeout_ns = 10000000
+soak_duration_ns = 300000000000
+soak_schedule_guard_ns = 10000000
+soak_minimum_samples = 500000
+interval_ns = 1000000000
+
+minimum_samples_for_p99 = 10000
+minimum_samples_for_p99_9 = 100000
+histogram_lowest_ns = 1
+histogram_highest_ns = 60000000000
+histogram_significant_figures = 3
+calibration_iterations = 1000000
+checkpoint_stride = 1000
+allocation_frames = 10000
+
+max_instrumentation_alloc_bytes = 0
+max_inclusive_alloc_bytes_per_frame = 16384
+max_gc_fraction = 0.05
+max_target_rate_error_fraction = 0.005
+max_stress_rate_error_fraction = 0.01
+max_target_p99_publication_lateness_ns = 500000
+max_target_p99_observation_delay_ns = 500000
+max_target_p99_closed_loop_response_ns = 1000000
+max_target_p99_9_publication_lateness_ns = 2000000
+max_target_p99_9_observation_delay_ns = 2000000
+max_target_p99_9_closed_loop_response_ns = 4000000
+relative_multiplier = 4.0
+relative_publication_floor_ns = 250000
+relative_observation_floor_ns = 250000
+relative_response_floor_ns = 500000
+future_baseline_multiplier = 1.25
+future_baseline_floor_ns = 50000
+
+scope_exclusions = [
+    "external transport, codec, middleware, or RTC-process latency",
+    "automatic placement, mixed CPU/GPU placement, GPU operational latency, and multi-GPU",
+    "multi-process, multi-host, cross-host clock discipline, CPU reservation, and CPU/IRQ isolation",
+    "full optical propagation, detector physics, production instrument scale, NFIRAOS, and MORFEO capacity",
+    "progressive readout, asynchronous PROPER, and production RTC interoperability",
+]
+
+[workload]
+provider = "LinearReducedOrderAcquisitionModel"
+backend = "CPUBackend"
+numeric_type = "Float64"
+run_seed = 31744
+controller = "two-mode integral controller"
+controller_gain = 0.65
+primary_acquisition = "hil_wfs"
+primary_period_ns = 500000
+primary_exposure_ns = 100000
+primary_optical_sample_period_ns = 100000
+feedback_acquisition = "hil_dm_feedback"
+feedback_period_ns = 750000
+feedback_phase_ns = 125000
+feedback_exposure_ns = 100000
+science_acquisition = "hil_science"
+science_period_ns = 2000000
+science_exposure_ns = 500000
+science_optical_sample_period_ns = 1000000
+command_endpoint = "hil_dm"
+command_payload_elements = 2
+command_payload_bytes = 16
+command_payload_pool_capacity = 8
+command_submission_capacity = 8
+command_completion_capacity = 8
+primary_product_capacity = 128
+primary_completion_capacity = 128
+feedback_product_capacity = 86
+feedback_completion_capacity = 86
+science_product_capacity = 8
+science_completion_capacity = 8
+complete_product_lead_time_ns = 500000
+maximum_lease_hold_time_ns = 2000000
+
+[contract]
+question = "Does the selected single-host CPU HIL runtime preserve its two-owner timing, capacity, ownership, lifecycle, failure, and recovery contracts at 2 kHz and through predeclared burst, shedding, saturation, overload, failure, deficit, and 300 s soak phases?"
+fixed_arrival_model = "schedule-preserving absolute deadlines; cumulative offered work is derived from elapsed execution-clock time and never completion-paced"
+coordinated_omission_correction = false
+coordinated_omission_reason = "arrivals remain offered and counted through consumer stalls and runtime delay, so no omitted arrival is reconstructed"
+unpaced_claim_limit = "capacity calibration is a self-paced host-eligibility diagnostic and is not a selector for fixed-arrival stress rates, fixed-arrival latency evidence, or external-RTC capacity evidence"
+stress_rate_capacity_policy = "near-saturation, saturation, and overload rates are fixed before qualification; required WFS and feedback paths cover the frozen 64 ms base horizon and scale bounded descriptor/payload counts by the primary-rate ratio so their time headroom matches the 2 kHz workload"
+injected_failure_policy = "fresh SystemNanoClock fixtures inject at owner batch 64 under the 600 s fault-isolation owner allowance so the benchmark fault is the stable first failure; acknowledgement and drain retain their 1 s and 2 s gates"
+correctness_oracle = "identical serial, deterministic-owner, and Agent-owner reduced-order products, event timestamps, command outcomes, lifecycle state, optional sequence gaps, and final ownership accounting"
+claim = "one non-isolated CPU host, one Julia process launched under Linux SCHED_FIFO priority 20, four physical-core-pinned Julia threads, in-memory canonical ports, two long-lived Agent execution owners, deterministic reduced-order workload"
