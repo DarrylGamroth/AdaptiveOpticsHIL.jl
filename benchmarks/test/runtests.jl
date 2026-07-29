@@ -304,6 +304,33 @@ if "gate8" in SELECTED_BENCHMARK_TEST_GROUPS
     contract = TOML.parsefile(DEFAULT_GATE8_CONTRACT)
     @test validate_gate8_contract(contract)
 
+    semantic_fields = semantic_counter_field_names()
+    @test semantic_fields isa Vector{String}
+    @test length(semantic_fields) ==
+        length(GATE8_SEMANTIC_COUNTER_FIELDS)
+    semantic_buffer = IOBuffer()
+    TOML.print(
+        semantic_buffer,
+        Dict("semantic_counter_fields" => semantic_fields);
+        sorted=true)
+    @test TOML.parse(String(take!(semantic_buffer)))[
+        "semantic_counter_fields"] == semantic_fields
+
+    mktempdir() do directory
+        invalid_path = joinpath(directory, "invalid.toml")
+        @test_throws ErrorException _write_toml_atomically(
+            invalid_path,
+            Dict("unsupported_tuple" => ("one", "two")))
+        @test !isfile(invalid_path)
+
+        valid_path = joinpath(directory, "valid.toml")
+        _write_toml_atomically(
+            valid_path,
+            Dict("values" => ["one", "two"]))
+        @test TOML.parsefile(valid_path)["values"] ==
+            ["one", "two"]
+    end
+
     invalid_owner_count = deepcopy(contract)
     invalid_owner_count["execution_owner_count"] = 3
     @test_throws ErrorException validate_gate8_contract(

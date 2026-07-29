@@ -1250,6 +1250,9 @@ semantic_counter_signature(counters) = Tuple(
     getfield(counters, field)
     for field in GATE8_SEMANTIC_COUNTER_FIELDS)
 
+semantic_counter_field_names() =
+    collect(String.(GATE8_SEMANTIC_COUNTER_FIELDS))
+
 function trace_sha256(trace)
     bytes = reinterpret(UInt8, collect(trace))
     return bytes2hex(SHA.sha256(bytes))
@@ -1349,7 +1352,7 @@ function exact_correctness_report(
         "frames" => frames,
         "trace_sha256" => trace_hashes(serial.observer),
         "semantic_counter_fields" =>
-            String.(GATE8_SEMANTIC_COUNTER_FIELDS),
+            semantic_counter_field_names(),
         "serial_lifecycle" =>
             successful_lifecycle_snapshot(serial.result),
         "deterministic_owner_lifecycle" =>
