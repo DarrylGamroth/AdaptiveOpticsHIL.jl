@@ -16,7 +16,7 @@ ThreadPinning = "811555cd-349b-4f26-b7bc-1f208b848042"
 
 [sources]
 AdaptiveOpticsHIL = {path = ".."}
-AdaptiveOpticsSim = {url = "https://github.com/DarrylGamroth/AdaptiveOpticsSim.jl.git", rev = "5bf180341faad9350622f9c660147205aebf33dc"}
+AdaptiveOpticsSim = {url = "https://github.com/DarrylGamroth/AdaptiveOpticsSim.jl.git", rev = "d95755c683c24c9c85f19c085e90a654c0726960"}
 Agent = {url = "https://github.com/DarrylGamroth/Agent.jl.git", rev = "71e3af4e5c112f0433e03d57a570bc74ffd05ccc"}
 Clocks = {url = "https://github.com/DarrylGamroth/Clocks.jl.git", rev = "1b705421648b70b6d171f8a95d6c2d16c2444d0b"}
 HdrHistogram = {url = "https://github.com/DarrylGamroth/HdrHistogram.jl.git", rev = "5b800689d2be55bf4103fd51b38cf92859f74aa1"}

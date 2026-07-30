@@ -7,8 +7,12 @@ using AdaptiveOpticsHIL.Timing: ExecutionClockID
 using AdaptiveOpticsHIL.Timing: execution_clock_identity
 using AdaptiveOpticsHIL.Timing: execution_clock_origin_ns
 using AdaptiveOpticsHIL.Ports: command_bridge_event_loop
-using AdaptiveOpticsSim
+import AdaptiveOpticsSim
+using AdaptiveOpticsSim.Atmospheres
+using AdaptiveOpticsSim.Backends
+using AdaptiveOpticsSim.Optics
 using AdaptiveOpticsSim.Plant
+using AdaptiveOpticsSim.WavefrontSensors
 using AdaptiveOpticsSim.Plant: AbsoluteCommand, ClipInvalidCommand
 using AdaptiveOpticsSim.Plant: AllPathVisibility
 using AdaptiveOpticsSim.Plant: ColdPlantModelDefinition
@@ -209,9 +213,9 @@ end
 function SERIAL_TEST_PLANT.prepare_path_executor(
     ::HILReducedOrderPathModel,
     definition::OpticalPathDefinition,
-    source::AdaptiveOpticsSim.AbstractSource,
+    source::AdaptiveOpticsSim.Optics.AbstractSource,
     telescope::Telescope,
-    atmosphere::AdaptiveOpticsSim.AbstractTimedAtmosphere)
+    atmosphere::AdaptiveOpticsSim.Atmospheres.AbstractTimedAtmosphere)
     T = eltype(pupil_reflectivity(telescope))
     pupil = PupilFunction(telescope; T, backend=backend(telescope))
     imaging = prepare_direct_imaging(pupil, source; zero_padding=1)
@@ -234,7 +238,7 @@ function SERIAL_TEST_PLANT.prepare_controllable_optic(
     ::HILReducedOrderOpticModel,
     definition::ControllableOpticDefinition,
     ::Telescope,
-    ::AdaptiveOpticsSim.AbstractAtmosphere)
+    ::AdaptiveOpticsSim.Atmospheres.AbstractAtmosphere)
     schema = only(command_schemas(definition))
     dimensions = command_dimensions(schema)
     length(dimensions) == 1 || throw(PlantPreparationError(
@@ -1512,7 +1516,7 @@ end
             PathGroupExecutionOwner
         @test execution_owner_backend(owner) == CPUBackend()
         @test execution_owner_compute_device(owner) ==
-            AdaptiveOpticsSim.HostComputeDevice()
+            AdaptiveOpticsSim.Backends.HostComputeDevice()
         @test execution_owner_group_count(owner) == 1
         @test execution_owner_group_ordinal(owner, 1) == 1
         @test execution_owner_overload_policy(owner) ===

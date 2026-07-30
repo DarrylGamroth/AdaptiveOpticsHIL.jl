@@ -7,7 +7,11 @@ using AdaptiveOpticsHIL.Ownership: close_ring!
 using AdaptiveOpticsHIL.Ownership: try_submit!, try_take!
 using AdaptiveOpticsHIL.Ports: OptionalResource, RequiredResource
 using AdaptiveOpticsHIL.Timing
-using AdaptiveOpticsSim
+import AdaptiveOpticsSim
+using AdaptiveOpticsSim.Atmospheres
+using AdaptiveOpticsSim.Backends
+using AdaptiveOpticsSim.Detectors
+using AdaptiveOpticsSim.Optics
 using AdaptiveOpticsSim.Plant
 using AdaptiveOpticsSim.Plant: ColdPlantModelDefinition
 using AdaptiveOpticsSim.Plant: PreparedPathExecutor
@@ -379,9 +383,9 @@ end
 function EXECUTION_TEST_PLANT.prepare_path_executor(
     model::ExecutionTestPathModel,
     definition::OpticalPathDefinition,
-    source::AdaptiveOpticsSim.AbstractSource,
+    source::AdaptiveOpticsSim.Optics.AbstractSource,
     telescope::Telescope,
-    atmosphere::AdaptiveOpticsSim.AbstractTimedAtmosphere,
+    atmosphere::AdaptiveOpticsSim.Atmospheres.AbstractTimedAtmosphere,
 )
     T = eltype(pupil_reflectivity(telescope))
     pupil = PupilFunction(telescope; T, backend=backend(telescope))
@@ -408,9 +412,9 @@ end
 function EXECUTION_TEST_PLANT.prepare_path_executor(
     ::ExecutionBatchTestPathModel,
     definition::OpticalPathDefinition,
-    source::AdaptiveOpticsSim.AbstractSource,
+    source::AdaptiveOpticsSim.Optics.AbstractSource,
     telescope::Telescope,
-    atmosphere::AdaptiveOpticsSim.AbstractTimedAtmosphere,
+    atmosphere::AdaptiveOpticsSim.Atmospheres.AbstractTimedAtmosphere,
 )
     T = eltype(pupil_reflectivity(telescope))
     pupil = PupilFunction(telescope; T, backend=backend(telescope))
@@ -827,7 +831,7 @@ end
     @test AdaptiveOpticsHIL.Execution._is_cpu_execution_owner(
         CPUBackend())
     @test !AdaptiveOpticsHIL.Execution._is_cpu_execution_owner(
-        AdaptiveOpticsSim.CUDABackend())
+        AdaptiveOpticsSim.Backends.CUDABackend())
     serial_executor =
         EXECUTION_TEST_PLANT.SerialOpticalPathBatchExecutor()
     @test AdaptiveOpticsHIL.Execution._execution_is_armed(
@@ -1550,7 +1554,7 @@ end
         original_device_owner.kind,
         typemax(UInt32),
         original_device_owner.group_ordinals,
-        AdaptiveOpticsSim.CUDABackend(),
+        AdaptiveOpticsSim.Backends.CUDABackend(),
         original_device_owner.compute_device,
         original_device_owner.overload_policy,
         original_device_owner.deadline,
