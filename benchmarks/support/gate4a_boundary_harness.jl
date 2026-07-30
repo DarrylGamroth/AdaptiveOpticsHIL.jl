@@ -6,9 +6,10 @@ using AdaptiveOpticsHIL.Ownership
 using AdaptiveOpticsHIL.Ports
 using AdaptiveOpticsHIL.Serial
 using AdaptiveOpticsHIL.Timing
-using AdaptiveOpticsSim
+import AdaptiveOpticsSim
 using AdaptiveOpticsSim.Plant
 using AdaptiveOpticsSim.Plant: AppliedCommand
+using AdaptiveOpticsSim.WavefrontSensors
 using Clocks
 using HdrHistogram
 

@@ -12,6 +12,23 @@ embedding an RTC-specific transport. RTC integrations remain free to use TCP,
 UDP, Aeron, iceoryx2, ZeroMQ, shared memory, or another transport appropriate
 to the target controller.
 
+## AdaptiveOpticsSim namespace boundary
+
+AdaptiveOpticsHIL imports physical products and execution contracts from their
+canonical AdaptiveOpticsSim owners. Integration code should do the same:
+
+```julia
+using AdaptiveOpticsSim.Backends: CPUBackend
+using AdaptiveOpticsSim.Optics: IntensityMap
+using AdaptiveOpticsSim.WavefrontSensors: WFSMeasurement
+using AdaptiveOpticsSim.Plant: AcquisitionProducts, PlantTimestamp
+```
+
+`AdaptiveOpticsSim.Plant` owns the HIL-neutral virtual plant and its prepared
+runtime contracts. AdaptiveOpticsHIL owns lifecycle, pacing, bounded ownership,
+execution coordination, and RTC-facing in-process ports. The companion package
+does not rely on flat root aliases for domain APIs.
+
 ## Execution-clock mapping
 
 `AdaptiveOpticsHIL.Timing` maps canonical

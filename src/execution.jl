@@ -14,8 +14,8 @@ module Execution
 import AdaptiveOpticsSim.Plant
 import Agent
 
-using AdaptiveOpticsSim: AbstractArrayBackend, AbstractComputeDevice
-using AdaptiveOpticsSim: CPUBackend
+using AdaptiveOpticsSim.Backends: AbstractArrayBackend
+using AdaptiveOpticsSim.Backends: AbstractComputeDevice, CPUBackend
 using AdaptiveOpticsSim.Plant: AbstractOpticalPathBatchExecutor
 using AdaptiveOpticsSim.Plant: CPUExecutionBudget, CPUExecutionEnvironment
 using AdaptiveOpticsSim.Plant: OpticalPathBatchClaim

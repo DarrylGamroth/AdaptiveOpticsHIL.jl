@@ -2147,16 +2147,16 @@ end
 
     @testset "Product-storage alias dispatch" begin
         storage = zeros(Float32, 2, 2)
-        plane_metadata = AdaptiveOpticsSim.OpticalPlaneMetadata(
-            AdaptiveOpticsSim.DetectorPlane(),
+        plane_metadata = AdaptiveOpticsSim.Optics.OpticalPlaneMetadata(
+            AdaptiveOpticsSim.Optics.DetectorPlane(),
             storage;
-            coordinate_domain=AdaptiveOpticsSim.MetricCoordinates(),
+            coordinate_domain=AdaptiveOpticsSim.Optics.MetricCoordinates(),
             sampling=(1.0f0, 1.0f0))
-        intensity = AdaptiveOpticsSim.IntensityMap(
+        intensity = AdaptiveOpticsSim.Optics.IntensityMap(
             plane_metadata, storage)
-        observation = AdaptiveOpticsSim.WFSObservation(
+        observation = AdaptiveOpticsSim.WavefrontSensors.WFSObservation(
             storage; units=:electrons, layout=:detector_pixels)
-        measurement = AdaptiveOpticsSim.WFSMeasurement(
+        measurement = AdaptiveOpticsSim.WavefrontSensors.WFSMeasurement(
             storage; units=:radian, kind=:wavefront_estimate)
         product_storage =
             AdaptiveOpticsHIL.Ports._acquisition_product_storage
@@ -2185,7 +2185,8 @@ end
             may_alias, zeros(1), (zeros(1),))
         @test !Base.invokelatest(may_alias, :left, :right)
 
-        shared_observation = AdaptiveOpticsSim.WFSObservation(
+        shared_observation =
+            AdaptiveOpticsSim.WavefrontSensors.WFSObservation(
             zeros(Float32, 2, 2);
             units=:electrons,
             layout=:detector_pixels)

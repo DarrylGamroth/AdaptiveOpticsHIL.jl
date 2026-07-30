@@ -2,12 +2,14 @@ using AdaptiveOpticsHIL
 using Test
 
 const TEST_GROUP_FILES = (
+    "namespace" => "namespace_imports.jl",
     "timing" => "timing.jl",
     "lifecycle" => "lifecycle.jl",
     "ownership" => "ownership.jl",
     "ports" => "ports.jl",
     "serial" => "serial.jl",
     "execution" => "execution.jl",
+    "quality" => "quality.jl",
 )
 
 function selected_test_groups(arguments)
@@ -22,15 +24,10 @@ function selected_test_groups(arguments)
     return filter(pair -> first(pair) in requested, TEST_GROUP_FILES)
 end
 
-isempty(ARGS) && @eval using Aqua
-
 @testset "AdaptiveOpticsHIL.jl" begin
     for (name, filename) in selected_test_groups(ARGS)
         @testset "$name" begin
             include(filename)
         end
-    end
-    isempty(ARGS) && @testset "Aqua" begin
-        Aqua.test_all(AdaptiveOpticsHIL)
     end
 end

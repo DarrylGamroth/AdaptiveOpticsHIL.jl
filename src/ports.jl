@@ -8,9 +8,11 @@ client/server role, worker, or polling policy.
 """
 module Ports
 
-using AdaptiveOpticsSim: IntensityMap, WFSMeasurement, WFSObservation
-using AdaptiveOpticsSim: backend, intensity_values
-using AdaptiveOpticsSim: measurement_storage, observation_storage
+using AdaptiveOpticsSim.Backends: backend
+using AdaptiveOpticsSim.Optics: IntensityMap, intensity_values
+using AdaptiveOpticsSim.WavefrontSensors: WFSMeasurement, WFSObservation
+using AdaptiveOpticsSim.WavefrontSensors: measurement_storage
+using AdaptiveOpticsSim.WavefrontSensors: observation_storage
 using AdaptiveOpticsSim.Plant: AcquisitionID
 using AdaptiveOpticsSim.Plant: AcquisitionProductContract
 using AdaptiveOpticsSim.Plant: AcquisitionProducts
