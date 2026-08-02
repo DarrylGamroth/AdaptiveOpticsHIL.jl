@@ -9,9 +9,12 @@ using AdaptiveOpticsHIL.Ports: OptionalResource, RequiredResource
 using AdaptiveOpticsHIL.Timing
 import AdaptiveOpticsSim
 using AdaptiveOpticsSim.Atmospheres
+using AdaptiveOpticsSim.Atmospheres: MultiLayerAtmosphereDefinition
 using AdaptiveOpticsSim.Backends
+using AdaptiveOpticsSim.Backends: HostComputeDevice
 using AdaptiveOpticsSim.Detectors
 using AdaptiveOpticsSim.Optics
+using AdaptiveOpticsSim.Optics: TelescopeDefinition
 using AdaptiveOpticsSim.Plant
 using AdaptiveOpticsSim.Plant: ColdPlantModelDefinition
 using AdaptiveOpticsSim.Plant: PreparedPathExecutor
@@ -242,6 +245,20 @@ function EXECUTION_TEST_PLANT.validate_path_materialization(
         epoch)
 end
 
+function EXECUTION_TEST_PLANT.validate_path_materialization_target(
+    materialization::ExecutionFailingMaterialization,
+    input,
+    atmosphere,
+    target::AdaptiveOpticsSim.Backends.AbstractComputeDevice,
+)
+    EXECUTION_TEST_PLANT.validate_path_materialization_target(
+        materialization.implementation,
+        input,
+        atmosphere,
+        target)
+    return materialization
+end
+
 function EXECUTION_TEST_PLANT.materialize_path_input!(
     materialization::ExecutionFailingMaterialization,
     input,
@@ -375,6 +392,16 @@ function EXECUTION_TEST_PLANT.execute_path!(
     return executed
 end
 
+function EXECUTION_TEST_PLANT.validate_path_execution_target(
+    execution::ExecutionTestPathExecution,
+    target::AdaptiveOpticsSim.Backends.AbstractComputeDevice,
+)
+    # The probe and execution counter are host-side test instrumentation.
+    EXECUTION_TEST_PLANT.validate_path_execution_target(
+        execution.imaging, target)
+    return execution
+end
+
 @inline execution_test_count(execution) = nothing
 @inline execution_test_count(
     execution::ExecutionTestPathExecution,
@@ -386,6 +413,7 @@ function EXECUTION_TEST_PLANT.prepare_path_executor(
     source::AdaptiveOpticsSim.Optics.AbstractSource,
     telescope::Telescope,
     atmosphere::AdaptiveOpticsSim.Atmospheres.AbstractTimedAtmosphere,
+    context,
 )
     T = eltype(pupil_reflectivity(telescope))
     pupil = PupilFunction(telescope; T, backend=backend(telescope))
@@ -402,6 +430,7 @@ function EXECUTION_TEST_PLANT.prepare_path_executor(
         pupil,
         direct_imaging_output(imaging),
         ExecutionTestPathExecution(imaging, model.probe, Ref(0));
+        context=context,
         materialization,
         optical_model=:execution_owner_direct_imaging,
         propagation_model=:fraunhofer_fft,
@@ -415,6 +444,7 @@ function EXECUTION_TEST_PLANT.prepare_path_executor(
     source::AdaptiveOpticsSim.Optics.AbstractSource,
     telescope::Telescope,
     atmosphere::AdaptiveOpticsSim.Atmospheres.AbstractTimedAtmosphere,
+    context,
 )
     T = eltype(pupil_reflectivity(telescope))
     pupil = PupilFunction(telescope; T, backend=backend(telescope))
@@ -428,6 +458,7 @@ function EXECUTION_TEST_PLANT.prepare_path_executor(
         pupil,
         direct_imaging_output(execution),
         execution;
+        context=context,
         materialization=prepare_pupil_opd_materialization(
             atmosphere, telescope, source, pupil),
         optical_model=:execution_owner_direct_imaging_batch,
@@ -476,14 +507,14 @@ function execution_test_fixture(;
     batchable::Bool=false,
 )
     T = Float64
-    telescope = Telescope(
+    telescope = TelescopeDefinition(
         resolution=4,
         diameter=T(4),
         central_obstruction=zero(T),
+        revision=1,
         T=T,
     )
-    atmosphere = MultiLayerAtmosphere(
-        telescope;
+    atmosphere = MultiLayerAtmosphereDefinition(;
         r0=T(0.2),
         L0=T(25),
         fractional_cn2=T[0.7, 0.3],
@@ -554,7 +585,8 @@ function execution_test_fixture(;
         3,
     )
     plant = prepare_plant(
-        PlantDefinition(; telescope, atmosphere, paths, acquisitions);
+        PlantDefinition(; telescope, atmosphere, paths, acquisitions),
+        HostComputeDevice();
         run_seed=0x8a00,
     )
     sample_periods = batchable ?

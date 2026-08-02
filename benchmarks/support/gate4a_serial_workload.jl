@@ -8,8 +8,11 @@ using AdaptiveOpticsHIL.Serial
 using AdaptiveOpticsHIL.Timing: execution_clock_identity
 import AdaptiveOpticsSim
 using AdaptiveOpticsSim.Atmospheres
+using AdaptiveOpticsSim.Atmospheres: MultiLayerAtmosphereDefinition
 using AdaptiveOpticsSim.Backends
+using AdaptiveOpticsSim.Backends: HostComputeDevice
 using AdaptiveOpticsSim.Optics
+using AdaptiveOpticsSim.Optics: TelescopeDefinition
 using AdaptiveOpticsSim.Plant
 using AdaptiveOpticsSim.WavefrontSensors
 using AdaptiveOpticsSim.Plant: AbsoluteCommand, ClipInvalidCommand
@@ -179,12 +182,48 @@ function Plant.execute_path!(
         result, input, execution.imaging)
 end
 
+function Plant.validate_path_execution_target(
+    execution::Gate4AReducedOrderPathExecution,
+    target::AdaptiveOpticsSim.Backends.AbstractComputeDevice)
+    Plant.validate_path_execution_target(execution.imaging, target)
+    return execution
+end
+
+function Plant.validate_controllable_optic_target(
+    prepared::PreparedGate4AReducedOrderOptic,
+    ::AdaptiveOpticsSim.Backends.AbstractComputeDevice)
+    # Endpoint identity and command cardinality are host configuration;
+    # target-local arrays live in the separately validated state/workspace.
+    return prepared
+end
+
+function Plant.validate_controllable_optic_state_target(
+    ::PreparedGate4AReducedOrderOptic,
+    state::Gate4AReducedOrderOpticState,
+    target::AdaptiveOpticsSim.Backends.AbstractComputeDevice)
+    compute_device(state.visible) == target || throw(PlantPreparationError(
+        :controllable_optic, :wrong_device,
+        "Gate 4A visible command occupies another target"))
+    return state
+end
+
+function Plant.validate_controllable_optic_workspace_target(
+    ::PreparedGate4AReducedOrderOptic,
+    workspace::Gate4AReducedOrderOpticWorkspace,
+    target::AdaptiveOpticsSim.Backends.AbstractComputeDevice)
+    compute_device(workspace.staged) == target || throw(PlantPreparationError(
+        :controllable_optic, :wrong_device,
+        "Gate 4A staged command occupies another target"))
+    return workspace
+end
+
 function Plant.prepare_path_executor(
     ::Gate4AReducedOrderPathModel,
     definition::OpticalPathDefinition,
     source::AdaptiveOpticsSim.Optics.AbstractSource,
     telescope::Telescope,
-    atmosphere::AdaptiveOpticsSim.Atmospheres.AbstractTimedAtmosphere)
+    atmosphere::AdaptiveOpticsSim.Atmospheres.AbstractTimedAtmosphere,
+    context)
     T = eltype(pupil_reflectivity(telescope))
     pupil = PupilFunction(telescope; T, backend=backend(telescope))
     imaging = prepare_direct_imaging(pupil, source; zero_padding=1)
@@ -196,6 +235,7 @@ function Plant.prepare_path_executor(
         pupil,
         direct_imaging_output(imaging),
         Gate4AReducedOrderPathExecution(imaging);
+        context=context,
         materialization=prepare_pupil_opd_materialization(
             atmosphere, telescope, source, pupil),
         optical_model=:gate4a_reduced_order_unused_direct_imaging,
@@ -366,13 +406,13 @@ function _prepare_gate4a_plant(config::Gate4AWorkloadConfig)
         residual_kind=:science_modal_wavefront_error,
         sample_period_ns=config.science_sample_period_ns)
 
-    telescope = Telescope(
+    telescope = TelescopeDefinition(
         resolution=8,
         diameter=T(8),
         central_obstruction=zero(T),
+        revision=1,
         T=T)
-    atmosphere = MultiLayerAtmosphere(
-        telescope;
+    atmosphere = MultiLayerAtmosphereDefinition(;
         r0=T(0.2),
         L0=T(25),
         fractional_cn2=T[1],
@@ -420,7 +460,8 @@ function _prepare_gate4a_plant(config::Gate4AWorkloadConfig)
         paths,
         acquisitions)
     plant = prepare_plant(
-        definition;
+        definition,
+        HostComputeDevice();
         run_seed=config.run_seed,
         command_endpoints=(
             CommandEndpointConfiguration(

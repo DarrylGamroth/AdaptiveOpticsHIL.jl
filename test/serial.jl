@@ -9,8 +9,11 @@ using AdaptiveOpticsHIL.Timing: execution_clock_origin_ns
 using AdaptiveOpticsHIL.Ports: command_bridge_event_loop
 import AdaptiveOpticsSim
 using AdaptiveOpticsSim.Atmospheres
+using AdaptiveOpticsSim.Atmospheres: MultiLayerAtmosphereDefinition
 using AdaptiveOpticsSim.Backends
+using AdaptiveOpticsSim.Backends: HostComputeDevice
 using AdaptiveOpticsSim.Optics
+using AdaptiveOpticsSim.Optics: TelescopeDefinition
 using AdaptiveOpticsSim.Plant
 using AdaptiveOpticsSim.WavefrontSensors
 using AdaptiveOpticsSim.Plant: AbsoluteCommand, ClipInvalidCommand
@@ -210,12 +213,49 @@ function SERIAL_TEST_PLANT.execute_path!(
         result, input, execution.imaging)
 end
 
+function SERIAL_TEST_PLANT.validate_path_execution_target(
+    execution::HILReducedOrderPathExecution,
+    target::AdaptiveOpticsSim.Backends.AbstractComputeDevice)
+    SERIAL_TEST_PLANT.validate_path_execution_target(
+        execution.imaging, target)
+    return execution
+end
+
+function SERIAL_TEST_PLANT.validate_controllable_optic_target(
+    prepared::PreparedHILReducedOrderOptic,
+    ::AdaptiveOpticsSim.Backends.AbstractComputeDevice)
+    # Endpoint identity and command cardinality are host configuration;
+    # target-local arrays live in the separately validated state/workspace.
+    return prepared
+end
+
+function SERIAL_TEST_PLANT.validate_controllable_optic_state_target(
+    ::PreparedHILReducedOrderOptic,
+    state::HILReducedOrderOpticState,
+    target::AdaptiveOpticsSim.Backends.AbstractComputeDevice)
+    compute_device(state.visible) == target || throw(PlantPreparationError(
+        :controllable_optic, :wrong_device,
+        "HIL reduced-order visible command occupies another target"))
+    return state
+end
+
+function SERIAL_TEST_PLANT.validate_controllable_optic_workspace_target(
+    ::PreparedHILReducedOrderOptic,
+    workspace::HILReducedOrderOpticWorkspace,
+    target::AdaptiveOpticsSim.Backends.AbstractComputeDevice)
+    compute_device(workspace.staged) == target || throw(PlantPreparationError(
+        :controllable_optic, :wrong_device,
+        "HIL reduced-order staged command occupies another target"))
+    return workspace
+end
+
 function SERIAL_TEST_PLANT.prepare_path_executor(
     ::HILReducedOrderPathModel,
     definition::OpticalPathDefinition,
     source::AdaptiveOpticsSim.Optics.AbstractSource,
     telescope::Telescope,
-    atmosphere::AdaptiveOpticsSim.Atmospheres.AbstractTimedAtmosphere)
+    atmosphere::AdaptiveOpticsSim.Atmospheres.AbstractTimedAtmosphere,
+    context)
     T = eltype(pupil_reflectivity(telescope))
     pupil = PupilFunction(telescope; T, backend=backend(telescope))
     imaging = prepare_direct_imaging(pupil, source; zero_padding=1)
@@ -227,6 +267,7 @@ function SERIAL_TEST_PLANT.prepare_path_executor(
         pupil,
         direct_imaging_output(imaging),
         HILReducedOrderPathExecution(imaging);
+        context=context,
         materialization=prepare_pupil_opd_materialization(
             atmosphere, telescope, source, pupil),
         optical_model=:hil_reduced_order_unused_direct_imaging,
@@ -378,13 +419,13 @@ function serial_test_plant()
         measurement_kind=:sampled_actuator_state,
         residual_kind=:actuator_state)
 
-    telescope = Telescope(
+    telescope = TelescopeDefinition(
         resolution=8,
         diameter=T(8),
         central_obstruction=zero(T),
+        revision=1,
         T=T)
-    atmosphere = MultiLayerAtmosphere(
-        telescope;
+    atmosphere = MultiLayerAtmosphereDefinition(;
         r0=T(0.2),
         L0=T(25),
         fractional_cn2=T[1],
@@ -418,7 +459,8 @@ function serial_test_plant()
         paths=(path,),
         acquisitions=(residual_acquisition, feedback_acquisition))
     plant = prepare_plant(
-        definition;
+        definition,
+        HostComputeDevice();
         run_seed=0x7c00,
         command_endpoints=(
             CommandEndpointConfiguration(
