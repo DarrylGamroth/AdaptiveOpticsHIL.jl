@@ -74,29 +74,66 @@ placement_test_path(name::Symbol) = PathExecutionGroupSubject(OpticalPathID(name
 placement_test_output(name::Symbol) = AcquisitionOutputSubject(OpticalPathID(name))
 
 @testset "Placement identifiers and explicit unknown values" begin
-    @test ExecutionResourceID(:cpu) == ExecutionResourceID(:cpu)
-    @test ExecutionResourceID(:cpu) != ExecutionResourceID(:gpu)
-    @test isless(ExecutionResourceID(:cpu), ExecutionResourceID(:gpu))
+    cpu_id = ExecutionResourceID(:cpu)
+    same_cpu_id = ExecutionResourceID(:cpu)
+    gpu_id = ExecutionResourceID(:gpu)
+    @test cpu_id == same_cpu_id
+    @test cpu_id != gpu_id
+    @test isequal(cpu_id, same_cpu_id)
+    @test hash(cpu_id) == hash(same_cpu_id)
+    @test isless(cpu_id, gpu_id)
+    @test sprint(show, cpu_id) == "ExecutionResourceID(:cpu)"
     @test_throws PlacementError ExecutionResourceID(Symbol())
     @test_throws PlacementError MemoryDomainID(Symbol())
     @test_throws PlacementError ReservedCoordinationContextID(Symbol())
-    @test PlacementFactVersion(1).value == 1
+    version = PlacementFactVersion(1)
+    same_version = PlacementFactVersion(1)
+    @test version.value == 1
+    @test isequal(version, same_version)
+    @test hash(version) == hash(same_version)
+    @test isless(version, PlacementFactVersion(2))
+    @test sprint(show, version) == "PlacementFactVersion(1)"
     @test_throws PlacementError PlacementFactVersion(0)
     @test_throws PlacementError PlacementFactVersion(UInt32(0))
     @test_throws PlacementError PlacementFactVersion(true)
-    @test FactProvenance(:test, 2).version == PlacementFactVersion(2)
+    provenance = FactProvenance(:test, 2)
+    same_provenance = FactProvenance(:test, 2)
+    @test provenance.version == PlacementFactVersion(2)
+    @test isequal(provenance, same_provenance)
+    @test hash(provenance) == hash(same_provenance)
+    @test isless(FactProvenance(:a, 1), FactProvenance(:b, 1))
     @test_throws PlacementError FactProvenance(Symbol(), 1)
 
     known = KnownByteCount(0)
+    same_known = KnownByteCount(0)
     unknown = UnknownByteCount()
     @test byte_count(known) == 0
     @test byte_count(unknown) === nothing
+    @test isequal(known, same_known)
+    @test hash(known) == hash(same_known)
+    @test unknown == UnknownByteCount()
+    @test isequal(unknown, UnknownByteCount())
+    @test hash(unknown) == hash(UnknownByteCount())
     @test_throws PlacementError KnownByteCount(-1)
     @test_throws PlacementError KnownByteCount(true)
-    @test CPUWorkerFacts(3).numa_node == UnknownNUMANode()
-    @test CPUWorkerFacts(3, NUMANodeID(1)).worker_count == 3
+    unknown_numa = UnknownNUMANode()
+    known_numa = NUMANodeID(1)
+    @test CPUWorkerFacts(3).numa_node == unknown_numa
+    @test CPUWorkerFacts(3, known_numa).worker_count == 3
+    @test isequal(known_numa, NUMANodeID(1))
+    @test hash(known_numa) == hash(NUMANodeID(1))
+    @test unknown_numa == UnknownNUMANode()
+    @test isequal(unknown_numa, UnknownNUMANode())
+    @test hash(unknown_numa) == hash(UnknownNUMANode())
     @test_throws PlacementError CPUWorkerFacts(0)
     @test_throws PlacementError NUMANodeID(-1)
+
+    accelerator_context = AcceleratorContextID(:accelerator)
+    same_accelerator_context = AcceleratorContextID(:accelerator)
+    @test accelerator_context == same_accelerator_context
+    @test isequal(accelerator_context, same_accelerator_context)
+    @test hash(accelerator_context) == hash(same_accelerator_context)
+    @test isless(accelerator_context, AcceleratorContextID(:other))
 end
 
 @testset "Placement constructors and closed value families" begin
@@ -165,6 +202,8 @@ end
     @test_throws PlacementError placement_subject(
         UnsupportedPlacementPreference())
     @test_throws PlacementError placement_subject_path(unsupported_subject)
+    @test_throws PlacementError isless(
+        unsupported_subject, placement_test_path(:science))
     @test_throws PlacementError DeviceReadyOutput(
         placement_test_output(:science), UnsupportedPlacementCriticality())
 
@@ -220,6 +259,10 @@ end
         KnownByteCount(4096)
     @test memory_domain_headroom(execution_resource_memory_domain(cpu)) ==
         KnownByteCount(512)
+    unknown_memory = MemoryDomain(
+        MemoryDomainID(:unknown_memory), ExecutionResourceID(:cpu),
+        UnknownByteCount(), UnknownByteCount())
+    @test memory_domain_capacity(unknown_memory) == UnknownByteCount()
 
     resources = ExecutionResource[cpu]
     snapshot = ResourceInventory(resources)
@@ -364,9 +407,38 @@ end
         KnownByteCount(42)
     @test total_estimated_memory_bytes(placement_estimates(facts)[2]) ==
         UnknownByteCount()
+    @test resident_memory_bytes(placement_estimates(facts)[1]) ==
+        KnownByteCount(30)
+    @test workspace_memory_bytes(placement_estimates(facts)[1]) ==
+        KnownByteCount(12)
+    @test placement_subject(placement_estimates(facts)[1]) == science
     @test handoff_payload_bytes(placement_handoffs(facts)[2]) == UnknownByteCount()
     @test handoff_maximum_in_flight(placement_handoffs(facts)[1]) == 3
     @test handoff_provenance(placement_handoffs(facts)[3]) == provenance
+    atmosphere_handoff, command_handoff, output_handoff =
+        placement_handoffs(facts)
+    @test handoff_payload_bytes(atmosphere_handoff) == KnownByteCount(128)
+    @test handoff_payload_bytes(output_handoff) == KnownByteCount(64)
+    @test handoff_maximum_in_flight(command_handoff) == 1
+    @test handoff_maximum_in_flight(output_handoff) == 2
+    @test placement_subject(atmosphere_handoff) == science
+    @test placement_subject(command_handoff) == science
+    @test placement_subject(output_handoff) == placement_test_output(:science)
+
+    science_output = placement_test_output(:science)
+    @test placement_subject_path(science) == OpticalPathID(:science)
+    @test placement_subject_path(science_output) == OpticalPathID(:science)
+    @test placement_subject_path(AtmosphereAuthoritySubject()) === nothing
+    @test placement_subject_path(CommandAuthoritySubject()) === nothing
+    @test isequal(science, placement_test_path(:science))
+    @test hash(science) == hash(placement_test_path(:science))
+    @test isequal(science_output, placement_test_output(:science))
+    @test hash(science_output) == hash(placement_test_output(:science))
+    @test isless(science, wfs)
+    output_estimate = ResourceEstimate(science_output,
+        ExecutionResourceID(:cpu), provenance,
+        KnownByteCount(1), KnownByteCount(1))
+    @test resource_estimate_subject(output_estimate) == science_output
 
     push!(estimates, ResourceEstimate(science, ExecutionResourceID(:cpu), provenance,
         KnownByteCount(1), KnownByteCount(1)))
@@ -444,8 +516,16 @@ end
     @test output_consumer_resource(acquisition_output_dispositions(values)[1]) == cpu
     @test output_consumer_memory_domain(acquisition_output_dispositions(values)[1]) == host
     @test output_consumer_resource(acquisition_output_dispositions(values)[2]) === nothing
+    @test output_consumer_memory_domain(
+        acquisition_output_dispositions(values)[2]) === nothing
+    @test output_criticality(acquisition_output_dispositions(values)[1]) ==
+        RequiredResource()
     @test output_criticality(acquisition_output_dispositions(values)[2]) ==
         OptionalResource()
+    @test placement_subject(acquisition_output_dispositions(values)[1]) ==
+        science_output
+    @test placement_subject(acquisition_output_dispositions(values)[2]) ==
+        wfs_output
 
     provenance = placement_test_provenance()
     inventory = ResourceInventory([

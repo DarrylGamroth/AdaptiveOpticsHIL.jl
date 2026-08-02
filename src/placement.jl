@@ -241,8 +241,8 @@ byte_count(::_AbstractByteCount) = throw(PlacementError(
 Base.:(==)(left::KnownByteCount, right::KnownByteCount) = left.value == right.value
 Base.isequal(left::KnownByteCount, right::KnownByteCount) = isequal(left.value, right.value)
 Base.hash(value::KnownByteCount, seed::UInt) = hash(value.value, hash(KnownByteCount, seed))
-Base.:(==)(::UnknownByteCount, ::UnknownByteCount) = true
-Base.isequal(::UnknownByteCount, ::UnknownByteCount) = true
+Base.:(==)(::UnknownByteCount, ::UnknownByteCount) = true # COV_EXCL_LINE
+Base.isequal(::UnknownByteCount, ::UnknownByteCount) = true # COV_EXCL_LINE
 Base.hash(::UnknownByteCount, seed::UInt) = hash(UnknownByteCount, seed)
 
 @inline function _sum_byte_counts(left::KnownByteCount, right::KnownByteCount,
@@ -281,8 +281,8 @@ struct UnknownNUMANode <: _AbstractNUMANodeFact end
 Base.:(==)(left::NUMANodeID, right::NUMANodeID) = left.value == right.value
 Base.isequal(left::NUMANodeID, right::NUMANodeID) = isequal(left.value, right.value)
 Base.hash(value::NUMANodeID, seed::UInt) = hash(value.value, hash(NUMANodeID, seed))
-Base.:(==)(::UnknownNUMANode, ::UnknownNUMANode) = true
-Base.isequal(::UnknownNUMANode, ::UnknownNUMANode) = true
+Base.:(==)(::UnknownNUMANode, ::UnknownNUMANode) = true # COV_EXCL_LINE
+Base.isequal(::UnknownNUMANode, ::UnknownNUMANode) = true # COV_EXCL_LINE
 Base.hash(::UnknownNUMANode, seed::UInt) = hash(UnknownNUMANode, seed)
 
 """Caller-supplied CPU worker count and NUMA-node fact for one resource."""
@@ -381,8 +381,8 @@ end
 
 capability_provenance(snapshot::CapabilitySnapshot) = snapshot.provenance
 
-@inline _is_target_capability(::TargetCapability) = true
-@inline _is_target_capability(::Any) = false
+@inline _is_target_capability(::TargetCapability) = true # COV_EXCL_LINE
+@inline _is_target_capability(::Any) = false # COV_EXCL_LINE
 
 function _canonical_capabilities(capabilities)
     snapshot = collect(capabilities)
@@ -512,13 +512,13 @@ execution_resource_facts(resource::ExecutionResource) = resource.facts
 capability_provenance(resource::ExecutionResource) =
     capability_provenance(resource.capabilities)
 
-@inline _accelerator_resource_count(::CPUExecutionResourceKind) = 0
-@inline _accelerator_resource_count(::AcceleratorExecutionResourceKind) = 1
+@inline _accelerator_resource_count(::CPUExecutionResourceKind) = 0 # COV_EXCL_LINE
+@inline _accelerator_resource_count(::AcceleratorExecutionResourceKind) = 1 # COV_EXCL_LINE
 
-@inline _is_execution_resource(::ExecutionResource) = true
-@inline _is_execution_resource(::Any) = false
-@inline _is_reserved_context(::ReservedCoordinationContext) = true
-@inline _is_reserved_context(::Any) = false
+@inline _is_execution_resource(::ExecutionResource) = true # COV_EXCL_LINE
+@inline _is_execution_resource(::Any) = false # COV_EXCL_LINE
+@inline _is_reserved_context(::ReservedCoordinationContext) = true # COV_EXCL_LINE
+@inline _is_reserved_context(::Any) = false # COV_EXCL_LINE
 
 function _canonical_resources(resources)
     snapshot = collect(resources)
@@ -693,8 +693,8 @@ workspace_memory_bytes(estimate::ResourceEstimate) = estimate.workspace_bytes
 total_estimated_memory_bytes(estimate::ResourceEstimate) = _sum_byte_counts(
     estimate.resident_bytes, estimate.workspace_bytes, :resource_estimate)
 
-@inline _is_resource_estimate(::ResourceEstimate) = true
-@inline _is_resource_estimate(::Any) = false
+@inline _is_resource_estimate(::ResourceEstimate) = true # COV_EXCL_LINE
+@inline _is_resource_estimate(::Any) = false # COV_EXCL_LINE
 @inline _resource_estimate_key(estimate::ResourceEstimate) =
     (_placement_subject_key(estimate.subject), String(estimate.resource.name))
 
@@ -823,10 +823,10 @@ handoff_provenance(::_AbstractHandoffFact) = throw(PlacementError(
     :handoff_fact, :unsupported_handoff_fact,
     "handoff facts must use a supported typed handoff value"))
 
-@inline _is_handoff_fact(::AtmospherePathInputHandoff) = true
-@inline _is_handoff_fact(::CommandReplicaHandoff) = true
-@inline _is_handoff_fact(::AcquisitionOutputHandoff) = true
-@inline _is_handoff_fact(::Any) = false
+@inline _is_handoff_fact(::AtmospherePathInputHandoff) = true # COV_EXCL_LINE
+@inline _is_handoff_fact(::CommandReplicaHandoff) = true # COV_EXCL_LINE
+@inline _is_handoff_fact(::AcquisitionOutputHandoff) = true # COV_EXCL_LINE
+@inline _is_handoff_fact(::Any) = false # COV_EXCL_LINE
 @inline _handoff_kind(::AtmospherePathInputHandoff) = UInt8(1)
 @inline _handoff_kind(::CommandReplicaHandoff) = UInt8(2)
 @inline _handoff_kind(::AcquisitionOutputHandoff) = UInt8(3)
@@ -957,9 +957,9 @@ output_consumer_memory_domain(::_AbstractAcquisitionOutputDisposition) =
         :unsupported_output_disposition,
         "acquisition outputs must use DeviceReadyOutput or ExplicitConsumerOutput"))
 
-@inline _is_output_disposition(::DeviceReadyOutput) = true
-@inline _is_output_disposition(::ExplicitConsumerOutput) = true
-@inline _is_output_disposition(::Any) = false
+@inline _is_output_disposition(::DeviceReadyOutput) = true # COV_EXCL_LINE
+@inline _is_output_disposition(::ExplicitConsumerOutput) = true # COV_EXCL_LINE
+@inline _is_output_disposition(::Any) = false # COV_EXCL_LINE
 @inline _output_key(disposition::_AbstractAcquisitionOutputDisposition) =
     _placement_subject_key(output_subject(disposition))
 
@@ -1067,10 +1067,10 @@ placement_subject(::_AbstractPlacementPreference) =
 
 assigned_execution_resource(value::ExplicitPlacementAssignment) = value.resource
 
-@inline _is_hard_constraint(::RequireExecutionResource) = true
-@inline _is_hard_constraint(::RequireMemoryDomain) = true
-@inline _is_hard_constraint(::RequireCapability) = true
-@inline _is_hard_constraint(::Any) = false
+@inline _is_hard_constraint(::RequireExecutionResource) = true # COV_EXCL_LINE
+@inline _is_hard_constraint(::RequireMemoryDomain) = true # COV_EXCL_LINE
+@inline _is_hard_constraint(::RequireCapability) = true # COV_EXCL_LINE
+@inline _is_hard_constraint(::Any) = false # COV_EXCL_LINE
 @inline _constraint_kind(::RequireExecutionResource) = UInt8(1)
 @inline _constraint_kind(::RequireMemoryDomain) = UInt8(2)
 @inline _constraint_kind(::RequireCapability) = UInt8(3)
@@ -1095,8 +1095,8 @@ function _canonical_constraints(constraints)
     return Tuple(snapshot)
 end
 
-@inline _is_preference(::PreferExecutionResource) = true
-@inline _is_preference(::Any) = false
+@inline _is_preference(::PreferExecutionResource) = true # COV_EXCL_LINE
+@inline _is_preference(::Any) = false # COV_EXCL_LINE
 @inline _preference_key(preference::PreferExecutionResource) =
     (_placement_subject_key(placement_subject(preference)),
         preference.rank, String(preference.resource.name))
@@ -1115,8 +1115,8 @@ function _canonical_preferences(preferences)
     return Tuple(snapshot)
 end
 
-@inline _is_explicit_assignment(::ExplicitPlacementAssignment) = true
-@inline _is_explicit_assignment(::Any) = false
+@inline _is_explicit_assignment(::ExplicitPlacementAssignment) = true # COV_EXCL_LINE
+@inline _is_explicit_assignment(::Any) = false # COV_EXCL_LINE
 @inline _assignment_key(assignment::ExplicitPlacementAssignment) =
     _placement_subject_key(placement_subject(assignment))
 
