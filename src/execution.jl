@@ -5,7 +5,7 @@ Prepared, transport-neutral execution ownership for optical path groups.
 Core retains the deterministic plant, path-local products, numerical plans,
 and device contexts. This namespace adds fixed owner identity, bounded SPSC
 due/completion handoffs, explicit CPU admission, and optional long-lived
-Agent.jl duty-cycle tasks. Placement remains explicit; optional CPU IDs are
+Agent.jl duty-cycle tasks. Scheduling remains explicit; optional CPU IDs are
 forwarded to Agent.jl's ThreadPinning.jl extension. This namespace does not
 move products between memory domains or create one task per event.
 """
@@ -75,9 +75,9 @@ export ExecutionOwnerError
 export AbstractOpticalExecutionConfiguration, SerialOpticalExecution
 export AbstractExecutionOwnerMode
 export DeterministicExecutionOwners, AgentExecutionOwners
-export AbstractExecutionOwnerPlacement
-export SchedulerManagedExecutionOwnerPlacement
-export ThreadAssignedExecutionOwnerPlacement
+export AbstractExecutionOwnerScheduling
+export SchedulerManagedExecutionOwnerScheduling
+export ThreadAssignedExecutionOwnerScheduling
 export ExecutionOwnerConfiguration
 export ExecutionOwnerID, execution_owner_id_value
 export ExecutionOwnerKind, PathGroupExecutionOwner, DeviceBatchExecutionOwner
@@ -95,7 +95,7 @@ export execution_owner_overload_policy, execution_owner_overload_action
 export resource_criticality, maximum_resource_lateness_ns
 export overload_recovery_occupancy, resource_is_required
 export execution_owner_mode, execution_owner_idle_strategy_factory
-export execution_owner_placement
+export execution_owner_scheduling
 export execution_cpu_budget, execution_cpu_environment
 export execution_owner_ring_capacity, execution_owners_phase
 export execution_batches_completed
@@ -152,18 +152,18 @@ end
 DeterministicExecutionOwners(; alternate_order::Bool=true) =
     DeterministicExecutionOwners(alternate_order)
 
-"""Placement policy for long-lived Agent.jl execution owners."""
-abstract type AbstractExecutionOwnerPlacement end
+"""Scheduling policy for long-lived Agent.jl execution owners."""
+abstract type AbstractExecutionOwnerScheduling end
 
 """
 Allow Agent.jl to launch migratable, scheduler-cooperative owner tasks.
 
 This portable policy is appropriate for deterministic correctness tests and
 resource-constrained development. AgentRunner yields after every duty cycle in
-this mode, so it is not the production low-tail placement policy.
+this mode, so it is not the production low-tail scheduling policy.
 """
-struct SchedulerManagedExecutionOwnerPlacement <:
-    AbstractExecutionOwnerPlacement end
+struct SchedulerManagedExecutionOwnerScheduling <:
+    AbstractExecutionOwnerScheduling end
 
 """
 Assign each execution owner to one unique Julia default-pool thread.
@@ -175,14 +175,14 @@ core, establish real-time priority, or prove that SMT siblings and interrupts
 are isolated. Arm, start, and run this mode from one sticky coordinator task
 on an unassigned Julia managed thread.
 """
-struct ThreadAssignedExecutionOwnerPlacement{
+struct ThreadAssignedExecutionOwnerScheduling{
     T<:Tuple,
     C<:Union{Nothing,Tuple},
-} <: AbstractExecutionOwnerPlacement
+} <: AbstractExecutionOwnerScheduling
     thread_ids::T
     cpu_ids::C
 
-    function ThreadAssignedExecutionOwnerPlacement(
+    function ThreadAssignedExecutionOwnerScheduling(
         thread_ids,
         cpu_ids,
     )
@@ -299,11 +299,11 @@ function _checked_execution_owner_ids(
     )
 end
 
-function ThreadAssignedExecutionOwnerPlacement(
+function ThreadAssignedExecutionOwnerScheduling(
     thread_ids;
     cpu_ids=nothing,
 )
-    return ThreadAssignedExecutionOwnerPlacement(
+    return ThreadAssignedExecutionOwnerScheduling(
         thread_ids, cpu_ids)
 end
 
@@ -321,16 +321,16 @@ stop epochs, and drain accounting remain owned by AdaptiveOpticsHIL.
 struct AgentExecutionOwners{
     I<:Agent.IdleStrategy,
     F,
-    P<:AbstractExecutionOwnerPlacement,
+    P<:AbstractExecutionOwnerScheduling,
 } <: AbstractExecutionOwnerMode
     idle_strategy_factory::F
-    placement::P
+    scheduling::P
 end
 
 function AgentExecutionOwners(
     idle_strategy_type::Type{I};
-    placement::AbstractExecutionOwnerPlacement=
-        SchedulerManagedExecutionOwnerPlacement(),
+    scheduling::AbstractExecutionOwnerScheduling=
+        SchedulerManagedExecutionOwnerScheduling(),
 ) where {I<:Agent.IdleStrategy}
     applicable(idle_strategy_type) || _execution_owner_error(
         :invalid_idle_strategy_factory,
@@ -340,14 +340,14 @@ function AgentExecutionOwners(
     return AgentExecutionOwners{
         I,
         typeof(idle_strategy_type),
-        typeof(placement),
-    }(idle_strategy_type, placement)
+        typeof(scheduling),
+    }(idle_strategy_type, scheduling)
 end
 
 function AgentExecutionOwners(
     idle_strategy_factory;
-    placement::AbstractExecutionOwnerPlacement=
-        SchedulerManagedExecutionOwnerPlacement(),
+    scheduling::AbstractExecutionOwnerScheduling=
+        SchedulerManagedExecutionOwnerScheduling(),
 )
     applicable(idle_strategy_factory) || _execution_owner_error(
         :invalid_idle_strategy_factory,
@@ -358,29 +358,29 @@ function AgentExecutionOwners(
     return AgentExecutionOwners{
         typeof(strategy),
         typeof(idle_strategy_factory),
-        typeof(placement),
-    }(idle_strategy_factory, placement)
+        typeof(scheduling),
+    }(idle_strategy_factory, scheduling)
 end
 
 AgentExecutionOwners(;
-    placement::AbstractExecutionOwnerPlacement=
-        SchedulerManagedExecutionOwnerPlacement(),
+    scheduling::AbstractExecutionOwnerScheduling=
+        SchedulerManagedExecutionOwnerScheduling(),
 ) = AgentExecutionOwners(
-    Agent.YieldingIdleStrategy; placement)
+    Agent.YieldingIdleStrategy; scheduling)
 
-_validate_execution_owner_placement(
-    ::SchedulerManagedExecutionOwnerPlacement,
+_validate_execution_owner_scheduling(
+    ::SchedulerManagedExecutionOwnerScheduling,
 ) = nothing
-_validate_execution_owner_placement(
-    ::ThreadAssignedExecutionOwnerPlacement,
+_validate_execution_owner_scheduling(
+    ::ThreadAssignedExecutionOwnerScheduling,
 ) = nothing
 
-function _validate_execution_owner_placement(
-    ::AbstractExecutionOwnerPlacement,
+function _validate_execution_owner_scheduling(
+    ::AbstractExecutionOwnerScheduling,
 )
     return _execution_owner_error(
-        :unsupported_owner_placement,
-        "execution-owner placement policy is not supported",
+        :unsupported_owner_scheduling,
+        "execution-owner scheduling policy is not supported",
     )
 end
 
@@ -391,7 +391,7 @@ _validate_execution_owner_mode(
 function _validate_execution_owner_mode(
     mode::AgentExecutionOwners,
 )
-    return _validate_execution_owner_placement(mode.placement)
+    return _validate_execution_owner_scheduling(mode.scheduling)
 end
 
 function _validate_execution_owner_mode(
@@ -998,12 +998,12 @@ execution_owner_idle_strategy_factory(
         <:DeterministicExecutionOwners,
     },
 ) = nothing
-execution_owner_placement(
+execution_owner_scheduling(
     executor::PreparedExecutionOwnerExecutor{
         <:AgentExecutionOwners,
     },
-) = executor.mode.placement
-execution_owner_placement(
+) = executor.mode.scheduling
+execution_owner_scheduling(
     ::PreparedExecutionOwnerExecutor{
         <:DeterministicExecutionOwners,
     },
@@ -1318,20 +1318,20 @@ function _prepare_agent_idle_strategies(
     return coordinator, owners
 end
 
-function _validate_prepared_owner_placement(
-    ::SchedulerManagedExecutionOwnerPlacement,
+function _validate_prepared_owner_scheduling(
+    ::SchedulerManagedExecutionOwnerScheduling,
     ::Int,
 )
     return nothing
 end
 
-function _validate_prepared_owner_placement(
-    placement::ThreadAssignedExecutionOwnerPlacement,
+function _validate_prepared_owner_scheduling(
+    scheduling::ThreadAssignedExecutionOwnerScheduling,
     owner_count::Int,
 )
-    length(placement.thread_ids) == owner_count ||
+    length(scheduling.thread_ids) == owner_count ||
         _execution_owner_error(
-            :owner_placement_cardinality,
+            :owner_scheduling_cardinality,
             "assigned Julia thread-ID count must equal the prepared execution-owner count",
         )
     default_thread_count = Threads.nthreads(:default)
@@ -1340,7 +1340,7 @@ function _validate_prepared_owner_placement(
             :coordinator_context_capacity,
             "thread-assigned execution-owner count exceeds the Julia default-pool size",
         )
-    @inbounds for thread_id in placement.thread_ids
+    @inbounds for thread_id in scheduling.thread_ids
         1 <= thread_id <= Threads.maxthreadid() ||
             _execution_owner_error(
                 :invalid_owner_thread,
@@ -1355,25 +1355,25 @@ function _validate_prepared_owner_placement(
     return nothing
 end
 
-function _validate_prepared_owner_placement(
+function _validate_prepared_owner_scheduling(
     mode::AgentExecutionOwners,
     owner_count::Int,
 )
-    return _validate_prepared_owner_placement(
-        mode.placement, owner_count)
+    return _validate_prepared_owner_scheduling(
+        mode.scheduling, owner_count)
 end
 
-_validate_prepared_owner_placement(
+_validate_prepared_owner_scheduling(
     ::DeterministicExecutionOwners,
     ::Int,
 ) = nothing
 
 _validate_execution_owner_coordinator_context(
-    ::SchedulerManagedExecutionOwnerPlacement,
+    ::SchedulerManagedExecutionOwnerScheduling,
 ) = nothing
 
 function _validate_execution_owner_coordinator_context(
-    placement::ThreadAssignedExecutionOwnerPlacement,
+    scheduling::ThreadAssignedExecutionOwnerScheduling,
 )
     current_task().sticky || _execution_owner_error(
         :unstable_coordinator_task,
@@ -1387,7 +1387,7 @@ function _validate_execution_owner_coordinator_context(
             "thread-assigned execution owners require the coordinator " *
             "on a Julia managed thread",
         )
-    @inbounds for owner_thread_id in placement.thread_ids
+    @inbounds for owner_thread_id in scheduling.thread_ids
         owner_thread_id == coordinator_thread_id &&
             _execution_owner_error(
                 :coordinator_owner_thread_collision,
@@ -1503,7 +1503,7 @@ function _prepare_optical_execution(
     )
     _validate_execution_owner_budget(configuration, owners)
     owner_count = length(owners)
-    _validate_prepared_owner_placement(
+    _validate_prepared_owner_scheduling(
         configuration.mode, owner_count)
     coordinator_idle_strategy, owner_idle_strategies =
         _prepare_agent_idle_strategies(
@@ -2045,12 +2045,12 @@ function _start_execution_owner_runner(
 )
     runner = @inbounds executor.runners[owner_ordinal]
     return _start_execution_owner_runner(
-        runner, executor.mode.placement, owner_ordinal)
+        runner, executor.mode.scheduling, owner_ordinal)
 end
 
 function _start_execution_owner_runner(
     runner::Agent.AgentRunner,
-    ::SchedulerManagedExecutionOwnerPlacement,
+    ::SchedulerManagedExecutionOwnerScheduling,
     ::Int,
 )
     Agent.start(runner)
@@ -2059,14 +2059,14 @@ end
 
 function _start_execution_owner_runner(
     runner::Agent.AgentRunner,
-    placement::ThreadAssignedExecutionOwnerPlacement,
+    scheduling::ThreadAssignedExecutionOwnerScheduling,
     owner_ordinal::Int,
 )
-    thread_id = @inbounds placement.thread_ids[owner_ordinal]
-    if placement.cpu_ids === nothing
+    thread_id = @inbounds scheduling.thread_ids[owner_ordinal]
+    if scheduling.cpu_ids === nothing
         Agent.start_on_thread(runner, thread_id)
     else
-        cpu_id = @inbounds placement.cpu_ids[owner_ordinal]
+        cpu_id = @inbounds scheduling.cpu_ids[owner_ordinal]
         Agent.start_on_thread(runner, thread_id; cpuid=cpu_id)
     end
     return runner
@@ -2170,7 +2170,7 @@ function _arm_optical_execution!(
             "Agent execution owners can arm only from prepared",
         )
     _validate_execution_owner_coordinator_context(
-        executor.mode.placement)
+        executor.mode.scheduling)
     @inbounds for owner_ordinal in eachindex(executor.owners)
         _start_execution_owner_runner(
             executor, owner_ordinal)

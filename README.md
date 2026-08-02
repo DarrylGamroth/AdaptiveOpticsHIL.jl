@@ -113,13 +113,13 @@ oracle. An explicit `ExecutionOwnerConfiguration` selects either:
 
 - `DeterministicExecutionOwners()`, which drives the same bounded owner paths
   synchronously and can vary completion order without creating tasks; or
-- `AgentExecutionOwners(factory; placement)`, which creates one long-lived
+- `AgentExecutionOwners(factory; scheduling)`, which creates one long-lived
   Agrona-style Agent.jl duty-cycle agent per owner during arm and reuses it
   until nominal stop.
 
 The factory creates one independent Agent.jl idle strategy for every owner and
-one for the coordinator wait path. Scheduler-managed placement is portable and
-cooperative. `ThreadAssignedExecutionOwnerPlacement` assigns owners to unique
+one for the coordinator wait path. The scheduler-managed policy is portable and
+cooperative. `ThreadAssignedExecutionOwnerScheduling` assigns owners to unique
 Julia default-pool threads. This mode must be armed, started, and run from one
 sticky coordinator task on a different managed Julia thread; arm rejects a
 coordinator/owner thread collision. The coordinator may use the default or
@@ -423,8 +423,8 @@ drops/rejections, and quiescent lease/credit accounting. The artifact includes
 raw sparse HdrHistogram data, supported percentiles, the exact source and
 dependency revisions, machine/thread configuration, calibration, and claim
 limits. The benchmark does not qualify a transport, external RTC, GPU,
-multi-core placement, full optical propagation, or production instrument
-capacity. The
+multi-core scheduling or CPU affinity, full optical propagation, or production
+instrument capacity. The
 [maintained Gate 4A artifact](benchmarks/results/gate4a/2026-07-24-serial-boundary.toml)
 contains the current qualified baseline.
 

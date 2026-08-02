@@ -392,7 +392,7 @@ function agent_execution_configuration(contract)
     return execution_owner_configuration(
         AgentExecutionOwners(
             gate8_owner_idle_strategy_factory(contract);
-            placement=ThreadAssignedExecutionOwnerPlacement(
+            scheduling=ThreadAssignedExecutionOwnerScheduling(
                 thread_ids;
                 cpu_ids)),
         contract)
@@ -576,7 +576,7 @@ function execute_injected_owner_failure(
     optical_execution = execution_owner_configuration(
         AgentExecutionOwners(
             idle_strategy_factory;
-            placement=ThreadAssignedExecutionOwnerPlacement(
+            scheduling=ThreadAssignedExecutionOwnerScheduling(
                 gate8_owner_thread_ids(contract);
                 cpu_ids=gate8_owner_cpu_ids(contract))),
         contract)

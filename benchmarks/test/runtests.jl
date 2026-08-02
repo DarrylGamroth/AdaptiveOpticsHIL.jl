@@ -380,6 +380,8 @@ if "gate8" in SELECTED_BENCHMARK_TEST_GROUPS
         short_target)
 
     workload = Operational.workload_from_contract(contract)
+    @test _gate8_execution_owner_scheduling(contract) ==
+        contract[GATE8_FROZEN_EXECUTION_OWNER_PLACEMENT_FIELD]
     @test contract["minimum_calibrated_rate_hz"] == 4_500
     @test contract["minimum_calibrated_rate_hz"] >=
         2 * contract["target_rate_hz"]
