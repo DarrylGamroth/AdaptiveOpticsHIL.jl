@@ -1,6 +1,36 @@
 using AdaptiveOpticsHIL.Placement
 using AdaptiveOpticsHIL.Ports: OptionalResource, RequiredResource
+using AdaptiveOpticsSim.Backends: AbstractArrayBackend, AbstractComputeDevice
+using AdaptiveOpticsSim.Backends: AcceleratorComputeDevice, HostComputeDevice
 using AdaptiveOpticsSim.Plant: OpticalPathID
+
+struct PlacementTestAcceleratorBackend <: AbstractArrayBackend end
+
+mutable struct MutablePlacementTestBackend <: AbstractArrayBackend
+    marker::Vector{Int}
+end
+
+struct UnsupportedPlacementTestDevice <: AbstractComputeDevice end
+struct UnsupportedPlacementByteCount <:
+       AdaptiveOpticsHIL.Placement._AbstractByteCount end
+struct UnsupportedPlacementNUMANode <:
+       AdaptiveOpticsHIL.Placement._AbstractNUMANodeFact end
+struct UnsupportedPlacementResourceKind <:
+       AdaptiveOpticsHIL.Placement._AbstractExecutionResourceKind end
+struct UnsupportedPlacementCapabilityAvailability <:
+       AdaptiveOpticsHIL.Placement._AbstractCapabilityAvailability end
+struct UnsupportedPlacementSubject <:
+       AdaptiveOpticsHIL.Placement._AbstractPlacementSubject end
+struct UnsupportedPlacementHandoff <:
+       AdaptiveOpticsHIL.Placement._AbstractHandoffFact end
+struct UnsupportedPlacementOutputDisposition <:
+       AdaptiveOpticsHIL.Placement._AbstractAcquisitionOutputDisposition end
+struct UnsupportedPlacementConstraint <:
+       AdaptiveOpticsHIL.Placement._AbstractHardConstraint end
+struct UnsupportedPlacementPreference <:
+       AdaptiveOpticsHIL.Placement._AbstractPlacementPreference end
+struct UnsupportedPlacementCriticality <:
+       AdaptiveOpticsHIL.Ports.AbstractResourceCriticality end
 
 function placement_test_provenance(; source=:placement_test, version=1)
     return FactProvenance(source, version)
@@ -9,8 +39,8 @@ end
 function placement_test_resource(id::Symbol, domain::Symbol;
     capability_provenance=placement_test_provenance(),
     capabilities=(TargetCapability(:full_optical, CapabilitySupported()),),
-    capacity=KnownMemoryBytes(4096),
-    headroom=KnownMemoryBytes(512),
+    capacity=KnownByteCount(4096),
+    headroom=KnownByteCount(512),
     workers=2,
 )
     resource_id = ExecutionResourceID(id)
@@ -18,8 +48,8 @@ function placement_test_resource(id::Symbol, domain::Symbol;
         MemoryDomainID(domain), resource_id, capacity, headroom)
     return ExecutionResource(
         resource_id,
-        CPUExecutionResource(),
-        id,
+        CPUExecutionResourceKind(),
+        HostComputeDevice(),
         memory_domain,
         CPUWorkerFacts(workers, NUMANodeID(0)),
         CapabilitySnapshot(capability_provenance, capabilities))
@@ -32,15 +62,15 @@ function placement_test_accelerator(id::Symbol, domain::Symbol;
     resource_id = ExecutionResourceID(id)
     return ExecutionResource(
         resource_id,
-        AcceleratorExecutionResource(),
-        id,
+        AcceleratorExecutionResourceKind(),
+        AcceleratorComputeDevice(PlacementTestAcceleratorBackend(), UInt32(0)),
         MemoryDomain(MemoryDomainID(domain), resource_id,
-            KnownMemoryBytes(8192), KnownMemoryBytes(1024)),
+            KnownByteCount(8192), KnownByteCount(1024)),
         AcceleratorExecutionFacts(AcceleratorContextID(Symbol(id, :_context))),
         CapabilitySnapshot(capability_provenance, capabilities))
 end
 
-placement_test_path(name::Symbol) = PathGroupSubject(OpticalPathID(name))
+placement_test_path(name::Symbol) = PathExecutionGroupSubject(OpticalPathID(name))
 placement_test_output(name::Symbol) = AcquisitionOutputSubject(OpticalPathID(name))
 
 @testset "Placement identifiers and explicit unknown values" begin
@@ -49,23 +79,117 @@ placement_test_output(name::Symbol) = AcquisitionOutputSubject(OpticalPathID(nam
     @test isless(ExecutionResourceID(:cpu), ExecutionResourceID(:gpu))
     @test_throws PlacementError ExecutionResourceID(Symbol())
     @test_throws PlacementError MemoryDomainID(Symbol())
-    @test_throws PlacementError ReservedContextID(Symbol())
+    @test_throws PlacementError ReservedCoordinationContextID(Symbol())
     @test PlacementFactVersion(1).value == 1
     @test_throws PlacementError PlacementFactVersion(0)
+    @test_throws PlacementError PlacementFactVersion(UInt32(0))
     @test_throws PlacementError PlacementFactVersion(true)
     @test FactProvenance(:test, 2).version == PlacementFactVersion(2)
     @test_throws PlacementError FactProvenance(Symbol(), 1)
 
-    known = KnownMemoryBytes(0)
-    unknown = UnknownMemoryBytes()
-    @test memory_bytes(known) == 0
-    @test memory_bytes(unknown) === nothing
-    @test_throws PlacementError KnownMemoryBytes(-1)
-    @test_throws PlacementError KnownMemoryBytes(true)
+    known = KnownByteCount(0)
+    unknown = UnknownByteCount()
+    @test byte_count(known) == 0
+    @test byte_count(unknown) === nothing
+    @test_throws PlacementError KnownByteCount(-1)
+    @test_throws PlacementError KnownByteCount(true)
     @test CPUWorkerFacts(3).numa_node == UnknownNUMANode()
     @test CPUWorkerFacts(3, NUMANodeID(1)).worker_count == 3
     @test_throws PlacementError CPUWorkerFacts(0)
     @test_throws PlacementError NUMANodeID(-1)
+end
+
+@testset "Placement constructors and closed value families" begin
+    provenance = placement_test_provenance()
+    capability = TargetCapability(:full_optical, CapabilitySupported())
+    duplicate_capabilities = (capability, capability)
+    @test_throws PlacementError CapabilitySnapshot(
+        provenance, duplicate_capabilities)
+    @test_throws PlacementError TargetCapability(
+        :unsupported, UnsupportedPlacementCapabilityAvailability())
+    @test_throws PlacementError CPUWorkerFacts(1,
+        UnsupportedPlacementNUMANode())
+    @test_throws PlacementError MemoryDomain(
+        MemoryDomainID(:unsupported), ExecutionResourceID(:cpu),
+        UnsupportedPlacementByteCount(), KnownByteCount(0))
+    @test_throws PlacementError byte_count(UnsupportedPlacementByteCount())
+
+    cpu = placement_test_resource(:cpu, :host;
+        capability_provenance=provenance)
+    inventory = ResourceInventory((cpu,))
+    @test_throws MethodError ResourceInventory(
+        (cpu,), (), FactProvenance(:bypass, 99))
+    @test_throws MethodError PlacementFacts(
+        inventory, (), (), FactProvenance(:bypass, 99), nothing)
+    @test_throws MethodError PlacementPolicyValues((), (), (), ())
+
+    unsupported_subject = UnsupportedPlacementSubject()
+    @test_throws PlacementError ResourceEstimate(
+        unsupported_subject, ExecutionResourceID(:cpu), provenance,
+        KnownByteCount(1), KnownByteCount(1))
+    @test_throws PlacementError RequireExecutionResource(
+        unsupported_subject, ExecutionResourceID(:cpu))
+    @test_throws PlacementError RequireMemoryDomain(
+        unsupported_subject, MemoryDomainID(:host))
+    @test_throws PlacementError RequireCapability(
+        unsupported_subject, :full_optical)
+    @test_throws PlacementError PreferExecutionResource(
+        unsupported_subject, ExecutionResourceID(:cpu), 0)
+    @test_throws PlacementError ExplicitPlacementAssignment(
+        unsupported_subject, ExecutionResourceID(:cpu))
+    @test_throws PlacementError PlacementFacts(
+        inventory, (), (UnsupportedPlacementHandoff(),))
+    @test_throws PlacementError handoff_subject(UnsupportedPlacementHandoff())
+    @test_throws PlacementError handoff_payload_bytes(UnsupportedPlacementHandoff())
+    @test_throws PlacementError handoff_maximum_in_flight(
+        UnsupportedPlacementHandoff())
+    @test_throws PlacementError handoff_provenance(UnsupportedPlacementHandoff())
+    @test_throws PlacementError PlacementPolicyValues(
+        hard_constraints=(UnsupportedPlacementConstraint(),))
+    @test_throws PlacementError PlacementPolicyValues(
+        preferences=(UnsupportedPlacementPreference(),))
+    @test_throws PlacementError PlacementPolicyValues(
+        output_dispositions=(UnsupportedPlacementOutputDisposition(),))
+    @test_throws PlacementError output_subject(
+        UnsupportedPlacementOutputDisposition())
+    @test_throws PlacementError output_criticality(
+        UnsupportedPlacementOutputDisposition())
+    @test_throws PlacementError output_consumer_resource(
+        UnsupportedPlacementOutputDisposition())
+    @test_throws PlacementError output_consumer_memory_domain(
+        UnsupportedPlacementOutputDisposition())
+    @test_throws PlacementError placement_subject(
+        UnsupportedPlacementOutputDisposition())
+    @test_throws PlacementError placement_subject(
+        UnsupportedPlacementConstraint())
+    @test_throws PlacementError placement_subject(
+        UnsupportedPlacementPreference())
+    @test_throws PlacementError placement_subject_path(unsupported_subject)
+    @test_throws PlacementError DeviceReadyOutput(
+        placement_test_output(:science), UnsupportedPlacementCriticality())
+
+    @test_throws PlacementError ExecutionResource(
+        ExecutionResourceID(:unsupported_kind),
+        UnsupportedPlacementResourceKind(), HostComputeDevice(),
+        MemoryDomain(MemoryDomainID(:unsupported_kind),
+            ExecutionResourceID(:unsupported_kind), KnownByteCount(10),
+            KnownByteCount(1)), CPUWorkerFacts(1),
+        CapabilitySnapshot(provenance, ()))
+
+    exported_names = Set(names(AdaptiveOpticsHIL.Placement))
+    for name in (
+        :_AbstractByteCount,
+        :_AbstractNUMANodeFact,
+        :_AbstractExecutionResourceKind,
+        :_AbstractCapabilityAvailability,
+        :_AbstractPlacementSubject,
+        :_AbstractHandoffFact,
+        :_AbstractAcquisitionOutputDisposition,
+        :_AbstractHardConstraint,
+        :_AbstractPlacementPreference,
+    )
+        @test name ∉ exported_names
+    end
 end
 
 @testset "Placement resource inventory" begin
@@ -74,9 +198,9 @@ end
     gpu = placement_test_accelerator(:gpu, :gpu_memory;
         capability_provenance=provenance)
     contexts = [
-        ReservedCoordinationContext(ReservedContextID(:coordinator),
+        ReservedCoordinationContext(ReservedCoordinationContextID(:coordinator),
             ExecutionResourceID(:cpu)),
-        ReservedCoordinationContext(ReservedContextID(:gpu_submit),
+        ReservedCoordinationContext(ReservedCoordinationContextID(:gpu_submit),
             ExecutionResourceID(:gpu)),
     ]
     inventory = ResourceInventory([gpu, cpu], reverse(contexts))
@@ -84,17 +208,18 @@ end
     @test execution_resource_id.(resource_inventory_resources(inventory)) ==
         (ExecutionResourceID(:cpu), ExecutionResourceID(:gpu))
     @test reserved_context_id.(resource_inventory_contexts(inventory)) ==
-        (ReservedContextID(:coordinator), ReservedContextID(:gpu_submit))
+        (ReservedCoordinationContextID(:coordinator), ReservedCoordinationContextID(:gpu_submit))
     @test resource_inventory_capability_provenance(inventory) == provenance
     @test execution_resource_kind(first(resource_inventory_resources(inventory))) ==
-        CPUExecutionResource()
-    @test execution_resource_device(last(resource_inventory_resources(inventory))) == :gpu
+        CPUExecutionResourceKind()
+    @test execution_resource_device(last(resource_inventory_resources(inventory))) ==
+        AcceleratorComputeDevice(PlacementTestAcceleratorBackend(), UInt32(0))
     @test execution_resource_memory_domain(cpu).id == MemoryDomainID(:host)
     @test execution_resource_facts(cpu).numa_node == NUMANodeID(0)
     @test memory_domain_capacity(execution_resource_memory_domain(cpu)) ==
-        KnownMemoryBytes(4096)
+        KnownByteCount(4096)
     @test memory_domain_headroom(execution_resource_memory_domain(cpu)) ==
-        KnownMemoryBytes(512)
+        KnownByteCount(512)
 
     resources = ExecutionResource[cpu]
     snapshot = ResourceInventory(resources)
@@ -128,31 +253,63 @@ end
             capability_provenance=placement_test_provenance(source=:other)),
     ])
     @test_throws PlacementError ResourceInventory(
-        [cpu], [ReservedCoordinationContext(ReservedContextID(:missing),
+        [cpu], [ReservedCoordinationContext(ReservedCoordinationContextID(:missing),
             ExecutionResourceID(:not_an_inventory_resource))])
     @test_throws PlacementError ResourceInventory(
         [cpu], [
-            ReservedCoordinationContext(ReservedContextID(:duplicate),
+            ReservedCoordinationContext(ReservedCoordinationContextID(:duplicate),
                 ExecutionResourceID(:cpu)),
-            ReservedCoordinationContext(ReservedContextID(:duplicate),
+            ReservedCoordinationContext(ReservedCoordinationContextID(:duplicate),
                 ExecutionResourceID(:cpu)),
         ])
     @test_throws PlacementError MemoryDomain(
         MemoryDomainID(:bad), ExecutionResourceID(:cpu),
-        KnownMemoryBytes(1), KnownMemoryBytes(2))
+        KnownByteCount(1), KnownByteCount(2))
     @test_throws PlacementError ExecutionResource(
-        ExecutionResourceID(:wrong_owner), CPUExecutionResource(), :wrong_owner,
+        ExecutionResourceID(:wrong_owner), CPUExecutionResourceKind(),
+        HostComputeDevice(),
         execution_resource_memory_domain(cpu), CPUWorkerFacts(1),
         CapabilitySnapshot(provenance, ()))
     @test_throws PlacementError ExecutionResource(
-        ExecutionResourceID(:cpu), AcceleratorExecutionResource(), :cpu,
+        ExecutionResourceID(:cpu), AcceleratorExecutionResourceKind(),
+        AcceleratorComputeDevice(PlacementTestAcceleratorBackend(), UInt32(0)),
         MemoryDomain(MemoryDomainID(:wrong_facts), ExecutionResourceID(:cpu),
-            KnownMemoryBytes(10), KnownMemoryBytes(1)), CPUWorkerFacts(1),
+            KnownByteCount(10), KnownByteCount(1)), CPUWorkerFacts(1),
         CapabilitySnapshot(provenance, ()))
     @test_throws PlacementError ExecutionResource(
-        ExecutionResourceID(:mutable), CPUExecutionResource(), [1],
+        ExecutionResourceID(:mutable), CPUExecutionResourceKind(), [1],
         MemoryDomain(MemoryDomainID(:mutable), ExecutionResourceID(:mutable),
-            KnownMemoryBytes(10), KnownMemoryBytes(1)), CPUWorkerFacts(1),
+            KnownByteCount(10), KnownByteCount(1)), CPUWorkerFacts(1),
+        CapabilitySnapshot(provenance, ()))
+    @test_throws PlacementError ExecutionResource(
+        ExecutionResourceID(:nested_mutable), AcceleratorExecutionResourceKind(),
+        AcceleratorComputeDevice(MutablePlacementTestBackend([1]), UInt32(0)),
+        MemoryDomain(MemoryDomainID(:nested_mutable),
+            ExecutionResourceID(:nested_mutable), KnownByteCount(10),
+            KnownByteCount(1)),
+        AcceleratorExecutionFacts(AcceleratorContextID(:nested_mutable)),
+        CapabilitySnapshot(provenance, ()))
+    @test_throws PlacementError ExecutionResource(
+        ExecutionResourceID(:cpu_mismatch), CPUExecutionResourceKind(),
+        AcceleratorComputeDevice(PlacementTestAcceleratorBackend(), UInt32(0)),
+        MemoryDomain(MemoryDomainID(:cpu_mismatch),
+            ExecutionResourceID(:cpu_mismatch), KnownByteCount(10),
+            KnownByteCount(1)), CPUWorkerFacts(1),
+        CapabilitySnapshot(provenance, ()))
+    @test_throws PlacementError ExecutionResource(
+        ExecutionResourceID(:gpu_mismatch), AcceleratorExecutionResourceKind(),
+        HostComputeDevice(),
+        MemoryDomain(MemoryDomainID(:gpu_mismatch),
+            ExecutionResourceID(:gpu_mismatch), KnownByteCount(10),
+            KnownByteCount(1)),
+        AcceleratorExecutionFacts(AcceleratorContextID(:gpu_mismatch)),
+        CapabilitySnapshot(provenance, ()))
+    @test_throws PlacementError ExecutionResource(
+        ExecutionResourceID(:unsupported_device), CPUExecutionResourceKind(),
+        UnsupportedPlacementTestDevice(),
+        MemoryDomain(MemoryDomainID(:unsupported_device),
+            ExecutionResourceID(:unsupported_device), KnownByteCount(10),
+            KnownByteCount(1)), CPUWorkerFacts(1),
         CapabilitySnapshot(provenance, ()))
 end
 
@@ -187,15 +344,15 @@ end
     wfs = placement_test_path(:wfs)
     estimates = [
         ResourceEstimate(science, ExecutionResourceID(:gpu), provenance,
-            KnownMemoryBytes(30), KnownMemoryBytes(12)),
+            KnownByteCount(30), KnownByteCount(12)),
         ResourceEstimate(wfs, ExecutionResourceID(:cpu), provenance,
-            UnknownMemoryBytes(), KnownMemoryBytes(2)),
+            UnknownByteCount(), KnownByteCount(2)),
     ]
     handoffs = [
         AcquisitionOutputHandoff(placement_test_output(:science),
-            KnownMemoryBytes(64), 2, provenance),
-        AtmospherePathInputHandoff(science, KnownMemoryBytes(128), 3, provenance),
-        CommandReplicaHandoff(science, UnknownMemoryBytes(), 1, provenance),
+            KnownByteCount(64), 2, provenance),
+        AtmospherePathInputHandoff(science, KnownByteCount(128), 3, provenance),
+        CommandReplicaHandoff(science, UnknownByteCount(), 1, provenance),
     ]
     facts = PlacementFacts(inventory, reverse(estimates), reverse(handoffs))
     @test resource_estimate_subject.(placement_estimates(facts)) == (science, wfs)
@@ -204,49 +361,49 @@ end
     @test placement_estimate_provenance(facts) == provenance
     @test placement_handoff_provenance(facts) == provenance
     @test total_estimated_memory_bytes(placement_estimates(facts)[1]) ==
-        KnownMemoryBytes(42)
+        KnownByteCount(42)
     @test total_estimated_memory_bytes(placement_estimates(facts)[2]) ==
-        UnknownMemoryBytes()
-    @test handoff_payload_bytes(placement_handoffs(facts)[2]) == UnknownMemoryBytes()
+        UnknownByteCount()
+    @test handoff_payload_bytes(placement_handoffs(facts)[2]) == UnknownByteCount()
     @test handoff_maximum_in_flight(placement_handoffs(facts)[1]) == 3
     @test handoff_provenance(placement_handoffs(facts)[3]) == provenance
 
     push!(estimates, ResourceEstimate(science, ExecutionResourceID(:cpu), provenance,
-        KnownMemoryBytes(1), KnownMemoryBytes(1)))
+        KnownByteCount(1), KnownByteCount(1)))
     @test length(placement_estimates(facts)) == 2
     @test_throws PlacementError PlacementFacts(inventory, [
         ResourceEstimate(science, ExecutionResourceID(:cpu), provenance,
-            KnownMemoryBytes(1), KnownMemoryBytes(1)),
+            KnownByteCount(1), KnownByteCount(1)),
         ResourceEstimate(science, ExecutionResourceID(:cpu), provenance,
-            KnownMemoryBytes(2), KnownMemoryBytes(2)),
+            KnownByteCount(2), KnownByteCount(2)),
     ])
     @test_throws PlacementError PlacementFacts(inventory, [
         ResourceEstimate(science, ExecutionResourceID(:missing), provenance,
-            KnownMemoryBytes(1), KnownMemoryBytes(1)),
+            KnownByteCount(1), KnownByteCount(1)),
     ])
     @test_throws PlacementError PlacementFacts(inventory, [
         ResourceEstimate(science, ExecutionResourceID(:cpu), provenance,
-            KnownMemoryBytes(1), KnownMemoryBytes(1)),
+            KnownByteCount(1), KnownByteCount(1)),
         ResourceEstimate(wfs, ExecutionResourceID(:cpu),
-            placement_test_provenance(source=:other), KnownMemoryBytes(1),
-            KnownMemoryBytes(1)),
+            placement_test_provenance(source=:other), KnownByteCount(1),
+            KnownByteCount(1)),
     ])
     @test_throws PlacementError PlacementFacts(inventory, (), [
-        AtmospherePathInputHandoff(science, KnownMemoryBytes(1), 1, provenance),
-        AtmospherePathInputHandoff(science, KnownMemoryBytes(1), 1, provenance),
+        AtmospherePathInputHandoff(science, KnownByteCount(1), 1, provenance),
+        AtmospherePathInputHandoff(science, KnownByteCount(1), 1, provenance),
     ])
     @test_throws PlacementError PlacementFacts(inventory, (), [
-        AtmospherePathInputHandoff(science, KnownMemoryBytes(1), 1, provenance),
-        CommandReplicaHandoff(science, KnownMemoryBytes(1), 1,
+        AtmospherePathInputHandoff(science, KnownByteCount(1), 1, provenance),
+        CommandReplicaHandoff(science, KnownByteCount(1), 1,
             placement_test_provenance(source=:other)),
     ])
     @test_throws PlacementError AtmospherePathInputHandoff(
-        science, KnownMemoryBytes(1), 0, provenance)
+        science, KnownByteCount(1), 0, provenance)
     @test_throws PlacementError ResourceEstimate(
         science, ExecutionResourceID(:cpu), provenance,
-        KnownMemoryBytes(typemax(UInt64)), KnownMemoryBytes(1))
+        KnownByteCount(typemax(UInt64)), KnownByteCount(1))
     @test_throws PlacementError AtmospherePathInputHandoff(
-        science, KnownMemoryBytes(typemax(UInt64)), 2, provenance)
+        science, KnownByteCount(typemax(UInt64)), 2, provenance)
 end
 
 @testset "Placement policy values" begin
@@ -274,7 +431,7 @@ end
             ExplicitPlacementAssignment(CommandAuthoritySubject(), gpu),
         ],
         output_dispositions=[
-            ConsumerOutput(science_output, cpu, host, RequiredResource()),
+            ExplicitConsumerOutput(science_output, cpu, host, RequiredResource()),
             DeviceReadyOutput(wfs_output, OptionalResource()),
         ])
     @test placement_subject.(hard_constraints(values)) == (science, science, wfs)
@@ -309,7 +466,7 @@ end
                 MemoryDomainID(:missing))]))
     @test_throws PlacementError PlacementInputs(
         PlacementFacts(inventory), PlacementPolicyValues(
-            output_dispositions=[ConsumerOutput(science_output,
+            output_dispositions=[ExplicitConsumerOutput(science_output,
                 ExecutionResourceID(:cpu), MemoryDomainID(:gpu_memory),
                 RequiredResource())]))
 
@@ -331,7 +488,7 @@ end
     ])
     @test_throws PlacementError PlacementPolicyValues(output_dispositions=[
         DeviceReadyOutput(science_output, RequiredResource()),
-        ConsumerOutput(science_output, cpu, host, RequiredResource()),
+        ExplicitConsumerOutput(science_output, cpu, host, RequiredResource()),
     ])
     @test_throws PlacementError RequireCapability(science, Symbol())
     @test_throws PlacementError PreferExecutionResource(science, cpu, -1)

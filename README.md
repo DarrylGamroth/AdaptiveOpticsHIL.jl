@@ -167,15 +167,16 @@ The root exports only the `Placement` namespace; its API remains qualified.
 
 ```julia
 using AdaptiveOpticsHIL.Placement
+using AdaptiveOpticsSim.Backends: HostComputeDevice
 
 provenance = FactProvenance(:prepared_core_facts, 1)
 cpu_id = ExecutionResourceID(:cpu)
 cpu = ExecutionResource(
     cpu_id,
-    CPUExecutionResource(),
-    :host_cpu,
+    CPUExecutionResourceKind(),
+    HostComputeDevice(),
     MemoryDomain(MemoryDomainID(:host_memory), cpu_id,
-        KnownMemoryBytes(32 * 1024^3), KnownMemoryBytes(4 * 1024^3)),
+        KnownByteCount(32 * 1024^3), KnownByteCount(4 * 1024^3)),
     CPUWorkerFacts(8, NUMANodeID(0)),
     CapabilitySnapshot(provenance, [
         TargetCapability(:full_optical, CapabilitySupported()),
@@ -186,7 +187,7 @@ inventory = ResourceInventory([cpu])
 An inventory keeps canonical, caller-independent snapshots of resource and
 memory-domain identities, supplied CPU/NUMA or accelerator-context facts,
 reserved coordination contexts, and exact capability provenance.
-`UnknownMemoryBytes()` and `CapabilityUnknown()` are explicit values, never
+`UnknownByteCount()` and `CapabilityUnknown()` are explicit values, never
 optimistic zero-capacity or supported defaults. A Gate 9A inventory can
 contain CPU resources and at most one accelerator, without assuming a backend
 family.

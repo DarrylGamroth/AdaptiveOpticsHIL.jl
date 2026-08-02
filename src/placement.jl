@@ -10,22 +10,24 @@ Agent owner, or change run lifecycle state.
 module Placement
 
 using AdaptiveOpticsSim.Plant: OpticalPathID
+using AdaptiveOpticsSim.Backends: AbstractComputeDevice
+using AdaptiveOpticsSim.Backends: AcceleratorComputeDevice, HostComputeDevice
 
 import ..AdaptiveOpticsHIL: AdaptiveOpticsHILError
-using ..Ports: AbstractResourceCriticality
+using ..Ports: AbstractResourceCriticality, OptionalResource, RequiredResource
 
 export PlacementError
-export ExecutionResourceID, MemoryDomainID, ReservedContextID
+export ExecutionResourceID, MemoryDomainID, ReservedCoordinationContextID
 export PlacementFactVersion, FactProvenance
-export AbstractMemoryBytes, KnownMemoryBytes, UnknownMemoryBytes
-export memory_bytes
-export AbstractNUMANodeFact, NUMANodeID, UnknownNUMANode
+export KnownByteCount, UnknownByteCount
+export byte_count
+export NUMANodeID, UnknownNUMANode
 export CPUWorkerFacts, AcceleratorContextID, AcceleratorExecutionFacts
-export AbstractExecutionResourceKind, CPUExecutionResource
-export AcceleratorExecutionResource, ExecutionResource
+export CPUExecutionResourceKind
+export AcceleratorExecutionResourceKind, ExecutionResource
 export execution_resource_id, execution_resource_kind, execution_resource_device
 export execution_resource_memory_domain, execution_resource_facts
-export AbstractCapabilityAvailability, CapabilitySupported, CapabilityUnsupported
+export CapabilitySupported, CapabilityUnsupported
 export CapabilityUnknown, TargetCapability, CapabilitySnapshot
 export capability_name, capability_availability, capability_provenance
 export MemoryDomain, memory_domain_id, memory_domain_owner
@@ -33,24 +35,24 @@ export memory_domain_capacity, memory_domain_headroom
 export ReservedCoordinationContext, reserved_context_id, reserved_context_resource
 export ResourceInventory, resource_inventory_resources, resource_inventory_contexts
 export resource_inventory_capability_provenance
-export AbstractPlacementSubject, PathGroupSubject, AtmosphereAuthoritySubject
+export PathExecutionGroupSubject, AtmosphereAuthoritySubject
 export CommandAuthoritySubject, AcquisitionOutputSubject
 export placement_subject_path
 export ResourceEstimate, resource_estimate_subject, resource_estimate_resource
 export resource_estimate_provenance, resident_memory_bytes, workspace_memory_bytes
 export total_estimated_memory_bytes
-export AbstractHandoffFact, AtmospherePathInputHandoff
+export AtmospherePathInputHandoff
 export CommandReplicaHandoff, AcquisitionOutputHandoff
 export handoff_subject, handoff_payload_bytes, handoff_maximum_in_flight
 export handoff_provenance
 export PlacementFacts, placement_inventory, placement_estimates, placement_handoffs
 export placement_estimate_provenance, placement_handoff_provenance
-export AbstractAcquisitionOutputDisposition, DeviceReadyOutput
-export ConsumerOutput, output_subject, output_criticality
+export DeviceReadyOutput
+export ExplicitConsumerOutput, output_subject, output_criticality
 export output_consumer_resource, output_consumer_memory_domain
-export AbstractHardConstraint, RequireExecutionResource, RequireMemoryDomain
+export RequireExecutionResource, RequireMemoryDomain
 export RequireCapability
-export AbstractPlacementPreference, PreferExecutionResource
+export PreferExecutionResource
 export ExplicitPlacementAssignment
 export placement_subject, assigned_execution_resource
 export PlacementPolicyValues, hard_constraints, placement_preferences
@@ -63,6 +65,9 @@ struct PlacementError <: AdaptiveOpticsHILError
     reason::Symbol
     msg::String
 end
+
+struct _PlacementConstructionToken end
+const _PLACEMENT_CONSTRUCTION_TOKEN = _PlacementConstructionToken()
 
 @inline _is_bool(::Bool) = true # COV_EXCL_LINE
 @inline _is_bool(::Integer) = false # COV_EXCL_LINE
@@ -80,9 +85,9 @@ end
 @inline function _checked_nonnegative_uint64(value::Integer, component::Symbol,
     label::AbstractString)
     _is_bool(value) && throw(PlacementError(
-        component, :invalid_memory_bytes, "$label must be an integer, not Bool"))
+        component, :invalid_byte_count, "$label must be an integer, not Bool"))
     0 <= value <= typemax(UInt64) || throw(PlacementError(
-        component, :invalid_memory_bytes,
+        component, :invalid_byte_count,
         "$label must be a nonnegative UInt64-compatible byte count"))
     return UInt64(value)
 end
@@ -133,15 +138,15 @@ struct MemoryDomainID
 end
 
 """Stable declared identity of one reserved HIL coordination context."""
-struct ReservedContextID
+struct ReservedCoordinationContextID
     name::Symbol
 
-    function ReservedContextID(name::Symbol)
+    function ReservedCoordinationContextID(name::Symbol)
         return new(_require_name(name, :reserved_context, "reserved-context identity"))
     end
 end
 
-const _PlacementSymbolID = Union{ExecutionResourceID,MemoryDomainID,ReservedContextID}
+const _PlacementSymbolID = Union{ExecutionResourceID,MemoryDomainID,ReservedCoordinationContextID}
 
 Base.:(==)(left::T, right::T) where {T<:_PlacementSymbolID} = left.name == right.name
 Base.isequal(left::T, right::T) where {T<:_PlacementSymbolID} = isequal(left.name, right.name)
@@ -158,7 +163,12 @@ end
 struct PlacementFactVersion
     value::UInt32
 
-    PlacementFactVersion(value::UInt32) = new(value)
+    function PlacementFactVersion(value::UInt32)
+        iszero(value) && throw(PlacementError(
+            :placement_fact, :invalid_version,
+            "placement-fact version must be positive"))
+        return new(value)
+    end
 end
 
 PlacementFactVersion(value::Integer) = PlacementFactVersion(
@@ -202,46 +212,55 @@ Base.isless(left::FactProvenance, right::FactProvenance) =
         (String(right.source), right.version.value))
 
 """Explicit known-or-unknown byte quantity; unknown is never zero bytes."""
-abstract type AbstractMemoryBytes end
+abstract type _AbstractByteCount end
 
-struct KnownMemoryBytes <: AbstractMemoryBytes
+struct KnownByteCount <: _AbstractByteCount
     value::UInt64
 
-    KnownMemoryBytes(value::UInt64) = new(value)
+    KnownByteCount(value::UInt64) = new(value)
 end
 
-KnownMemoryBytes(value::Integer) = KnownMemoryBytes(
-    _checked_nonnegative_uint64(value, :memory_bytes, "memory byte count"))
+KnownByteCount(value::Integer) = KnownByteCount(
+    _checked_nonnegative_uint64(value, :byte_count, "byte count"))
 
 """A byte quantity that has not been measured or derived by the caller."""
-struct UnknownMemoryBytes <: AbstractMemoryBytes end
+struct UnknownByteCount <: _AbstractByteCount end
 
-memory_bytes(value::KnownMemoryBytes) = value.value
-memory_bytes(::UnknownMemoryBytes) = nothing
+@inline _validate_byte_count(::KnownByteCount) = nothing
+@inline _validate_byte_count(::UnknownByteCount) = nothing
+@inline _validate_byte_count(::_AbstractByteCount) = throw(PlacementError(
+    :byte_count, :unsupported_byte_count,
+    "byte counts must use KnownByteCount or UnknownByteCount"))
 
-Base.:(==)(left::KnownMemoryBytes, right::KnownMemoryBytes) = left.value == right.value
-Base.isequal(left::KnownMemoryBytes, right::KnownMemoryBytes) = isequal(left.value, right.value)
-Base.hash(value::KnownMemoryBytes, seed::UInt) = hash(value.value, hash(KnownMemoryBytes, seed))
-Base.:(==)(::UnknownMemoryBytes, ::UnknownMemoryBytes) = true
-Base.isequal(::UnknownMemoryBytes, ::UnknownMemoryBytes) = true
-Base.hash(::UnknownMemoryBytes, seed::UInt) = hash(UnknownMemoryBytes, seed)
+byte_count(value::KnownByteCount) = value.value
+byte_count(::UnknownByteCount) = nothing
+byte_count(::_AbstractByteCount) = throw(PlacementError(
+    :byte_count, :unsupported_byte_count,
+    "byte counts must use KnownByteCount or UnknownByteCount"))
 
-@inline function _sum_memory_bytes(left::KnownMemoryBytes, right::KnownMemoryBytes,
+Base.:(==)(left::KnownByteCount, right::KnownByteCount) = left.value == right.value
+Base.isequal(left::KnownByteCount, right::KnownByteCount) = isequal(left.value, right.value)
+Base.hash(value::KnownByteCount, seed::UInt) = hash(value.value, hash(KnownByteCount, seed))
+Base.:(==)(::UnknownByteCount, ::UnknownByteCount) = true
+Base.isequal(::UnknownByteCount, ::UnknownByteCount) = true
+Base.hash(::UnknownByteCount, seed::UInt) = hash(UnknownByteCount, seed)
+
+@inline function _sum_byte_counts(left::KnownByteCount, right::KnownByteCount,
     component::Symbol)
     left.value <= typemax(UInt64) - right.value || throw(PlacementError(
         component, :memory_arithmetic_overflow,
-        "memory-byte arithmetic exceeds UInt64 range"))
-    return KnownMemoryBytes(left.value + right.value)
+        "byte-count arithmetic exceeds UInt64 range"))
+    return KnownByteCount(left.value + right.value)
 end
 
-@inline _sum_memory_bytes(::AbstractMemoryBytes, ::AbstractMemoryBytes,
-    ::Symbol) = UnknownMemoryBytes()
+@inline _sum_byte_counts(::_AbstractByteCount, ::_AbstractByteCount,
+    ::Symbol) = UnknownByteCount()
 
 """One supplied or explicitly unknown NUMA-node fact."""
-abstract type AbstractNUMANodeFact end
+abstract type _AbstractNUMANodeFact end
 
 """A supplied NUMA node identity for one CPU execution resource."""
-struct NUMANodeID <: AbstractNUMANodeFact
+struct NUMANodeID <: _AbstractNUMANodeFact
     value::UInt64
 
     NUMANodeID(value::UInt64) = new(value)
@@ -251,7 +270,13 @@ NUMANodeID(value::Integer) = NUMANodeID(
     _checked_nonnegative_uint64(value, :numa_node, "NUMA-node identity"))
 
 """Explicit absence of an observed NUMA-node assignment."""
-struct UnknownNUMANode <: AbstractNUMANodeFact end
+struct UnknownNUMANode <: _AbstractNUMANodeFact end
+
+@inline _validate_numa_node(::NUMANodeID) = nothing
+@inline _validate_numa_node(::UnknownNUMANode) = nothing
+@inline _validate_numa_node(::_AbstractNUMANodeFact) = throw(PlacementError(
+    :cpu_worker_facts, :unsupported_numa_node,
+    "NUMA-node facts must use NUMANodeID or UnknownNUMANode"))
 
 Base.:(==)(left::NUMANodeID, right::NUMANodeID) = left.value == right.value
 Base.isequal(left::NUMANodeID, right::NUMANodeID) = isequal(left.value, right.value)
@@ -261,12 +286,13 @@ Base.isequal(::UnknownNUMANode, ::UnknownNUMANode) = true
 Base.hash(::UnknownNUMANode, seed::UInt) = hash(UnknownNUMANode, seed)
 
 """Caller-supplied CPU worker count and NUMA-node fact for one resource."""
-struct CPUWorkerFacts{N<:AbstractNUMANodeFact}
+struct CPUWorkerFacts{N<:_AbstractNUMANodeFact}
     worker_count::Int
     numa_node::N
 
     function CPUWorkerFacts(worker_count::Integer,
-        numa_node::N=UnknownNUMANode()) where {N<:AbstractNUMANodeFact}
+        numa_node::N=UnknownNUMANode()) where {N<:_AbstractNUMANodeFact}
+        _validate_numa_node(numa_node)
         return new{N}(_checked_positive_int(
             worker_count, :cpu_worker_facts, "CPU worker count"), numa_node)
     end
@@ -296,30 +322,44 @@ struct AcceleratorExecutionFacts
     context::AcceleratorContextID
 end
 
-"""Resource class used only to state CPU versus accelerator placement facts."""
-abstract type AbstractExecutionResourceKind end
+"""Closed resource-kind family for CPU versus accelerator inventory facts."""
+abstract type _AbstractExecutionResourceKind end
 
-"""A CPU execution resource with supplied CPU-worker and NUMA facts."""
-struct CPUExecutionResource <: AbstractExecutionResourceKind end
+"""Identifies an execution resource as CPU-hosted."""
+struct CPUExecutionResourceKind <: _AbstractExecutionResourceKind end
 
-"""One accelerator execution resource; Gate 9A admits at most one."""
-struct AcceleratorExecutionResource <: AbstractExecutionResourceKind end
+"""Identifies an execution resource as accelerator-hosted."""
+struct AcceleratorExecutionResourceKind <: _AbstractExecutionResourceKind end
+
+@inline _validate_resource_kind(::CPUExecutionResourceKind) = nothing
+@inline _validate_resource_kind(::AcceleratorExecutionResourceKind) = nothing
+@inline _validate_resource_kind(::_AbstractExecutionResourceKind) =
+    throw(PlacementError(:execution_resource, :unsupported_resource_kind,
+        "execution-resource kind must be CPUExecutionResourceKind or AcceleratorExecutionResourceKind"))
 
 """Explicit availability status for one named target capability."""
-abstract type AbstractCapabilityAvailability end
+abstract type _AbstractCapabilityAvailability end
 
-struct CapabilitySupported <: AbstractCapabilityAvailability end
-struct CapabilityUnsupported <: AbstractCapabilityAvailability end
-struct CapabilityUnknown <: AbstractCapabilityAvailability end
+struct CapabilitySupported <: _AbstractCapabilityAvailability end
+struct CapabilityUnsupported <: _AbstractCapabilityAvailability end
+struct CapabilityUnknown <: _AbstractCapabilityAvailability end
+
+@inline _validate_capability_availability(::CapabilitySupported) = nothing
+@inline _validate_capability_availability(::CapabilityUnsupported) = nothing
+@inline _validate_capability_availability(::CapabilityUnknown) = nothing
+@inline _validate_capability_availability(::_AbstractCapabilityAvailability) =
+    throw(PlacementError(:target_capability, :unsupported_capability_availability,
+        "capability availability must be supported, unsupported, or unknown"))
 
 """One named capability result in a versioned target-capability snapshot."""
-struct TargetCapability{A<:AbstractCapabilityAvailability}
+struct TargetCapability{A<:_AbstractCapabilityAvailability}
     name::Symbol
     availability::A
 
     function TargetCapability(name::Symbol, availability::A) where {
-        A<:AbstractCapabilityAvailability,
+        A<:_AbstractCapabilityAvailability,
     }
+        _validate_capability_availability(availability)
         return new{A}(_require_name(name, :target_capability,
             "target-capability name"), availability)
     end
@@ -334,6 +374,9 @@ capability_availability(capability::TargetCapability) = capability.availability
 struct CapabilitySnapshot
     provenance::FactProvenance
     capabilities::Tuple
+
+    CapabilitySnapshot(provenance::FactProvenance, capabilities::Tuple,
+        ::_PlacementConstructionToken) = new(provenance, capabilities)
 end
 
 capability_provenance(snapshot::CapabilitySnapshot) = snapshot.provenance
@@ -356,10 +399,11 @@ function _canonical_capabilities(capabilities)
 end
 
 CapabilitySnapshot(provenance::FactProvenance, capabilities) =
-    CapabilitySnapshot(provenance, _canonical_capabilities(capabilities))
+    CapabilitySnapshot(provenance, _canonical_capabilities(capabilities),
+        _PLACEMENT_CONSTRUCTION_TOKEN)
 
 """One memory domain owned by exactly one execution resource."""
-struct MemoryDomain{C<:AbstractMemoryBytes,H<:AbstractMemoryBytes}
+struct MemoryDomain{C<:_AbstractByteCount,H<:_AbstractByteCount}
     id::MemoryDomainID
     owner::ExecutionResourceID
     capacity::C
@@ -367,18 +411,20 @@ struct MemoryDomain{C<:AbstractMemoryBytes,H<:AbstractMemoryBytes}
 
     function MemoryDomain(id::MemoryDomainID, owner::ExecutionResourceID,
         capacity::C, headroom::H) where {
-        C<:AbstractMemoryBytes,H<:AbstractMemoryBytes,
+        C<:_AbstractByteCount,H<:_AbstractByteCount,
     }
+        _validate_byte_count(capacity)
+        _validate_byte_count(headroom)
         _validate_memory_domain_capacity(capacity, headroom)
         return new{C,H}(id, owner, capacity, headroom)
     end
 end
 
-@inline _validate_memory_domain_capacity(::AbstractMemoryBytes,
-    ::AbstractMemoryBytes) = nothing
+@inline _validate_memory_domain_capacity(::_AbstractByteCount,
+    ::_AbstractByteCount) = nothing
 
-@inline function _validate_memory_domain_capacity(capacity::KnownMemoryBytes,
-    headroom::KnownMemoryBytes)
+@inline function _validate_memory_domain_capacity(capacity::KnownByteCount,
+    headroom::KnownByteCount)
     headroom.value <= capacity.value || throw(PlacementError(
         :memory_domain, :headroom_exceeds_capacity,
         "memory-domain headroom cannot exceed capacity"))
@@ -392,7 +438,7 @@ memory_domain_headroom(domain::MemoryDomain) = domain.headroom
 
 """One reserved coordination context assigned to an execution resource."""
 struct ReservedCoordinationContext
-    id::ReservedContextID
+    id::ReservedCoordinationContextID
     resource::ExecutionResourceID
 end
 
@@ -401,8 +447,8 @@ reserved_context_resource(context::ReservedCoordinationContext) = context.resour
 
 """One immutable execution-resource record in the placement inventory."""
 struct ExecutionResource{
-    K<:AbstractExecutionResourceKind,
-    D,
+    K<:_AbstractExecutionResourceKind,
+    D<:AbstractComputeDevice,
     F,
 }
     id::ExecutionResourceID
@@ -415,9 +461,10 @@ struct ExecutionResource{
     function ExecutionResource(id::ExecutionResourceID, kind::K, device::D,
         memory_domain::MemoryDomain, facts::F,
         capabilities::CapabilitySnapshot) where {
-        K<:AbstractExecutionResourceKind,D,F,
+        K<:_AbstractExecutionResourceKind,D<:AbstractComputeDevice,F,
     }
-        _validate_device_identity(device)
+        _validate_resource_kind(kind)
+        _validate_execution_resource_device(kind, device)
         _validate_execution_resource_facts(kind, facts)
         memory_domain.owner == id || throw(PlacementError(
             :execution_resource, :inconsistent_memory_domain_owner,
@@ -426,19 +473,34 @@ struct ExecutionResource{
     end
 end
 
-@inline _validate_device_identity(::Symbol) = nothing
-@inline function _validate_device_identity(device)
-    isimmutable(device) || throw(PlacementError(
-        :execution_resource, :mutable_compute_device,
-        "execution-resource device identities must be immutable values"))
+@inline _validate_execution_resource_device(::CPUExecutionResourceKind,
+    ::HostComputeDevice) = nothing
+
+@inline function _validate_execution_resource_device(
+    ::AcceleratorExecutionResourceKind, device::AcceleratorComputeDevice)
+    isbitstype(typeof(device)) || throw(PlacementError(
+        :execution_resource, :noncanonical_compute_device,
+        "accelerator compute-device values must be isbits canonical identities"))
     return nothing
 end
 
-@inline _validate_execution_resource_facts(::CPUExecutionResource,
+@inline _validate_execution_resource_device(::_AbstractExecutionResourceKind,
+    ::AbstractComputeDevice) = throw(PlacementError(
+        :execution_resource, :resource_kind_device_mismatch,
+        "CPU resources require HostComputeDevice and accelerator resources require AcceleratorComputeDevice"))
+
+function ExecutionResource(id::ExecutionResourceID,
+    kind::_AbstractExecutionResourceKind, device,
+    memory_domain::MemoryDomain, facts, capabilities::CapabilitySnapshot)
+    throw(PlacementError(:execution_resource, :unsupported_compute_device,
+        "execution resources require an AdaptiveOpticsSim exact compute-device value"))
+end
+
+@inline _validate_execution_resource_facts(::CPUExecutionResourceKind,
     ::CPUWorkerFacts) = nothing
-@inline _validate_execution_resource_facts(::AcceleratorExecutionResource,
+@inline _validate_execution_resource_facts(::AcceleratorExecutionResourceKind,
     ::AcceleratorExecutionFacts) = nothing
-@inline _validate_execution_resource_facts(::AbstractExecutionResourceKind,
+@inline _validate_execution_resource_facts(::_AbstractExecutionResourceKind,
     ::Any) = throw(PlacementError(:execution_resource, :invalid_resource_facts,
         "resource facts do not match the declared execution-resource kind"))
 
@@ -450,8 +512,8 @@ execution_resource_facts(resource::ExecutionResource) = resource.facts
 capability_provenance(resource::ExecutionResource) =
     capability_provenance(resource.capabilities)
 
-@inline _accelerator_resource_count(::CPUExecutionResource) = 0
-@inline _accelerator_resource_count(::AcceleratorExecutionResource) = 1
+@inline _accelerator_resource_count(::CPUExecutionResourceKind) = 0
+@inline _accelerator_resource_count(::AcceleratorExecutionResourceKind) = 1
 
 @inline _is_execution_resource(::ExecutionResource) = true
 @inline _is_execution_resource(::Any) = false
@@ -519,13 +581,19 @@ struct ResourceInventory
     resources::Tuple
     contexts::Tuple
     capability_provenance::FactProvenance
+
+    ResourceInventory(resources::Tuple, contexts::Tuple,
+        capability_provenance::FactProvenance,
+        ::_PlacementConstructionToken) =
+        new(resources, contexts, capability_provenance)
 end
 
 function ResourceInventory(resources, contexts=())
     canonical_resources = _canonical_resources(resources)
     canonical_contexts = _canonical_contexts(contexts, canonical_resources)
     return ResourceInventory(canonical_resources, canonical_contexts,
-        _common_capability_provenance(canonical_resources))
+        _common_capability_provenance(canonical_resources),
+        _PLACEMENT_CONSTRUCTION_TOKEN)
 end
 
 resource_inventory_resources(inventory::ResourceInventory) = inventory.resources
@@ -534,31 +602,35 @@ resource_inventory_capability_provenance(inventory::ResourceInventory) =
     inventory.capability_provenance
 
 """One placement subject; subject values do not resolve a resource."""
-abstract type AbstractPlacementSubject end
+abstract type _AbstractPlacementSubject end
 
 """The complete path and acquisition group identified by one optical path."""
-struct PathGroupSubject <: AbstractPlacementSubject
+struct PathExecutionGroupSubject <: _AbstractPlacementSubject
     path::OpticalPathID
 end
 
 """The unique atmosphere-authority placement subject in one Gate 9A plant."""
-struct AtmosphereAuthoritySubject <: AbstractPlacementSubject end
+struct AtmosphereAuthoritySubject <: _AbstractPlacementSubject end
 
 """The unique command-authority placement subject in one Gate 9A plant."""
-struct CommandAuthoritySubject <: AbstractPlacementSubject end
+struct CommandAuthoritySubject <: _AbstractPlacementSubject end
 
 """The output disposition for the complete group identified by one path."""
-struct AcquisitionOutputSubject <: AbstractPlacementSubject
+struct AcquisitionOutputSubject <: _AbstractPlacementSubject
     path::OpticalPathID
 end
 
-placement_subject_path(subject::PathGroupSubject) = subject.path
+placement_subject_path(subject::PathExecutionGroupSubject) = subject.path
 placement_subject_path(subject::AcquisitionOutputSubject) = subject.path
-placement_subject_path(::AbstractPlacementSubject) = nothing
+placement_subject_path(::AtmosphereAuthoritySubject) = nothing
+placement_subject_path(::CommandAuthoritySubject) = nothing
+placement_subject_path(::_AbstractPlacementSubject) = throw(PlacementError(
+    :placement_subject, :unsupported_placement_subject,
+    "placement subjects must use a supported complete-group, authority, or output subject"))
 
-Base.:(==)(left::PathGroupSubject, right::PathGroupSubject) = left.path == right.path
-Base.isequal(left::PathGroupSubject, right::PathGroupSubject) = isequal(left.path, right.path)
-Base.hash(value::PathGroupSubject, seed::UInt) = hash(value.path, hash(PathGroupSubject, seed))
+Base.:(==)(left::PathExecutionGroupSubject, right::PathExecutionGroupSubject) = left.path == right.path
+Base.isequal(left::PathExecutionGroupSubject, right::PathExecutionGroupSubject) = isequal(left.path, right.path)
+Base.hash(value::PathExecutionGroupSubject, seed::UInt) = hash(value.path, hash(PathExecutionGroupSubject, seed))
 Base.:(==)(left::AcquisitionOutputSubject, right::AcquisitionOutputSubject) =
     left.path == right.path
 Base.isequal(left::AcquisitionOutputSubject, right::AcquisitionOutputSubject) =
@@ -566,22 +638,30 @@ Base.isequal(left::AcquisitionOutputSubject, right::AcquisitionOutputSubject) =
 Base.hash(value::AcquisitionOutputSubject, seed::UInt) =
     hash(value.path, hash(AcquisitionOutputSubject, seed))
 
-@inline _placement_subject_key(subject::PathGroupSubject) = (UInt8(1), String(subject.path.name))
+@inline _placement_subject_key(subject::PathExecutionGroupSubject) = (UInt8(1), String(subject.path.name))
 @inline _placement_subject_key(::AtmosphereAuthoritySubject) = (UInt8(2), "")
 @inline _placement_subject_key(::CommandAuthoritySubject) = (UInt8(3), "")
 @inline _placement_subject_key(subject::AcquisitionOutputSubject) = (UInt8(4), String(subject.path.name))
+@inline _placement_subject_key(::_AbstractPlacementSubject) =
+    throw(PlacementError(:placement_subject, :unsupported_placement_subject,
+        "placement subjects must use a supported complete-group, authority, or output subject"))
 
-Base.isless(left::AbstractPlacementSubject, right::AbstractPlacementSubject) =
+Base.isless(left::_AbstractPlacementSubject, right::_AbstractPlacementSubject) =
     isless(_placement_subject_key(left), _placement_subject_key(right))
 
-@inline _is_placement_subject(::AbstractPlacementSubject) = true
-@inline _is_placement_subject(::Any) = false
+@inline _validate_placement_subject(::PathExecutionGroupSubject) = nothing
+@inline _validate_placement_subject(::AtmosphereAuthoritySubject) = nothing
+@inline _validate_placement_subject(::CommandAuthoritySubject) = nothing
+@inline _validate_placement_subject(::AcquisitionOutputSubject) = nothing
+@inline _validate_placement_subject(::_AbstractPlacementSubject) =
+    throw(PlacementError(:placement_subject, :unsupported_placement_subject,
+        "placement subjects must use a supported complete-group, authority, or output subject"))
 
 """Resource-byte estimate for one subject on one candidate resource."""
 struct ResourceEstimate{
-    S<:AbstractPlacementSubject,
-    R<:AbstractMemoryBytes,
-    W<:AbstractMemoryBytes,
+    S<:_AbstractPlacementSubject,
+    R<:_AbstractByteCount,
+    W<:_AbstractByteCount,
 }
     subject::S
     resource::ExecutionResourceID
@@ -592,11 +672,14 @@ struct ResourceEstimate{
     function ResourceEstimate(subject::S, resource::ExecutionResourceID,
         provenance::FactProvenance, resident_bytes::R,
         workspace_bytes::W) where {
-        S<:AbstractPlacementSubject,
-        R<:AbstractMemoryBytes,
-        W<:AbstractMemoryBytes,
+        S<:_AbstractPlacementSubject,
+        R<:_AbstractByteCount,
+        W<:_AbstractByteCount,
     }
-        _sum_memory_bytes(resident_bytes, workspace_bytes, :resource_estimate)
+        _validate_placement_subject(subject)
+        _validate_byte_count(resident_bytes)
+        _validate_byte_count(workspace_bytes)
+        _sum_byte_counts(resident_bytes, workspace_bytes, :resource_estimate)
         return new{S,R,W}(subject, resource, provenance, resident_bytes,
             workspace_bytes)
     end
@@ -607,7 +690,7 @@ resource_estimate_resource(estimate::ResourceEstimate) = estimate.resource
 resource_estimate_provenance(estimate::ResourceEstimate) = estimate.provenance
 resident_memory_bytes(estimate::ResourceEstimate) = estimate.resident_bytes
 workspace_memory_bytes(estimate::ResourceEstimate) = estimate.workspace_bytes
-total_estimated_memory_bytes(estimate::ResourceEstimate) = _sum_memory_bytes(
+total_estimated_memory_bytes(estimate::ResourceEstimate) = _sum_byte_counts(
     estimate.resident_bytes, estimate.workspace_bytes, :resource_estimate)
 
 @inline _is_resource_estimate(::ResourceEstimate) = true
@@ -638,10 +721,10 @@ function _common_estimate_provenance(estimates::Tuple)
     return provenance
 end
 
-@inline _validate_handoff_footprint(::UnknownMemoryBytes, ::Int,
+@inline _validate_handoff_footprint(::UnknownByteCount, ::Int,
     ::Symbol) = nothing
 
-@inline function _validate_handoff_footprint(payload_bytes::KnownMemoryBytes,
+@inline function _validate_handoff_footprint(payload_bytes::KnownByteCount,
     maximum_in_flight::Int, component::Symbol)
     payload_bytes.value <= div(typemax(UInt64), UInt64(maximum_in_flight)) ||
         throw(PlacementError(
@@ -651,45 +734,47 @@ end
 end
 
 """Caller-supplied abstract transfer requirement; it allocates no handoff."""
-abstract type AbstractHandoffFact end
+abstract type _AbstractHandoffFact end
 
-struct AtmospherePathInputHandoff{B<:AbstractMemoryBytes} <: AbstractHandoffFact
-    destination::PathGroupSubject
+struct AtmospherePathInputHandoff{B<:_AbstractByteCount} <: _AbstractHandoffFact
+    destination::PathExecutionGroupSubject
     payload_bytes::B
     maximum_in_flight::Int
     provenance::FactProvenance
 
-    function AtmospherePathInputHandoff(destination::PathGroupSubject,
+    function AtmospherePathInputHandoff(destination::PathExecutionGroupSubject,
         payload_bytes::B, maximum_in_flight::Integer,
-        provenance::FactProvenance) where {B<:AbstractMemoryBytes}
+        provenance::FactProvenance) where {B<:_AbstractByteCount}
         checked_in_flight = _checked_positive_int(
             maximum_in_flight, :atmosphere_path_input_handoff,
             "maximum in-flight handoffs")
+        _validate_byte_count(payload_bytes)
         _validate_handoff_footprint(payload_bytes, checked_in_flight,
             :atmosphere_path_input_handoff)
         return new{B}(destination, payload_bytes, checked_in_flight, provenance)
     end
 end
 
-struct CommandReplicaHandoff{B<:AbstractMemoryBytes} <: AbstractHandoffFact
-    destination::PathGroupSubject
+struct CommandReplicaHandoff{B<:_AbstractByteCount} <: _AbstractHandoffFact
+    destination::PathExecutionGroupSubject
     payload_bytes::B
     maximum_in_flight::Int
     provenance::FactProvenance
 
-    function CommandReplicaHandoff(destination::PathGroupSubject,
+    function CommandReplicaHandoff(destination::PathExecutionGroupSubject,
         payload_bytes::B, maximum_in_flight::Integer,
-        provenance::FactProvenance) where {B<:AbstractMemoryBytes}
+        provenance::FactProvenance) where {B<:_AbstractByteCount}
         checked_in_flight = _checked_positive_int(
             maximum_in_flight, :command_replica_handoff,
             "maximum in-flight handoffs")
+        _validate_byte_count(payload_bytes)
         _validate_handoff_footprint(payload_bytes, checked_in_flight,
             :command_replica_handoff)
         return new{B}(destination, payload_bytes, checked_in_flight, provenance)
     end
 end
 
-struct AcquisitionOutputHandoff{B<:AbstractMemoryBytes} <: AbstractHandoffFact
+struct AcquisitionOutputHandoff{B<:_AbstractByteCount} <: _AbstractHandoffFact
     source::AcquisitionOutputSubject
     payload_bytes::B
     maximum_in_flight::Int
@@ -697,10 +782,11 @@ struct AcquisitionOutputHandoff{B<:AbstractMemoryBytes} <: AbstractHandoffFact
 
     function AcquisitionOutputHandoff(source::AcquisitionOutputSubject,
         payload_bytes::B, maximum_in_flight::Integer,
-        provenance::FactProvenance) where {B<:AbstractMemoryBytes}
+        provenance::FactProvenance) where {B<:_AbstractByteCount}
         checked_in_flight = _checked_positive_int(
             maximum_in_flight, :acquisition_output_handoff,
             "maximum in-flight handoffs")
+        _validate_byte_count(payload_bytes)
         _validate_handoff_footprint(payload_bytes, checked_in_flight,
             :acquisition_output_handoff)
         return new{B}(source, payload_bytes, checked_in_flight, provenance)
@@ -710,23 +796,48 @@ end
 handoff_subject(handoff::AtmospherePathInputHandoff) = handoff.destination
 handoff_subject(handoff::CommandReplicaHandoff) = handoff.destination
 handoff_subject(handoff::AcquisitionOutputHandoff) = handoff.source
-handoff_payload_bytes(handoff::AbstractHandoffFact) = handoff.payload_bytes
-handoff_maximum_in_flight(handoff::AbstractHandoffFact) = handoff.maximum_in_flight
-handoff_provenance(handoff::AbstractHandoffFact) = handoff.provenance
+handoff_subject(::_AbstractHandoffFact) = throw(PlacementError(
+    :handoff_fact, :unsupported_handoff_fact,
+    "handoff facts must use a supported typed handoff value"))
 
-@inline _is_handoff_fact(::AbstractHandoffFact) = true
+handoff_payload_bytes(handoff::AtmospherePathInputHandoff) = handoff.payload_bytes
+handoff_payload_bytes(handoff::CommandReplicaHandoff) = handoff.payload_bytes
+handoff_payload_bytes(handoff::AcquisitionOutputHandoff) = handoff.payload_bytes
+handoff_maximum_in_flight(handoff::AtmospherePathInputHandoff) =
+    handoff.maximum_in_flight
+handoff_maximum_in_flight(handoff::CommandReplicaHandoff) =
+    handoff.maximum_in_flight
+handoff_maximum_in_flight(handoff::AcquisitionOutputHandoff) =
+    handoff.maximum_in_flight
+handoff_provenance(handoff::AtmospherePathInputHandoff) = handoff.provenance
+handoff_provenance(handoff::CommandReplicaHandoff) = handoff.provenance
+handoff_provenance(handoff::AcquisitionOutputHandoff) = handoff.provenance
+
+handoff_payload_bytes(::_AbstractHandoffFact) = throw(PlacementError(
+    :handoff_fact, :unsupported_handoff_fact,
+    "handoff facts must use a supported typed handoff value"))
+handoff_maximum_in_flight(::_AbstractHandoffFact) = throw(PlacementError(
+    :handoff_fact, :unsupported_handoff_fact,
+    "handoff facts must use a supported typed handoff value"))
+handoff_provenance(::_AbstractHandoffFact) = throw(PlacementError(
+    :handoff_fact, :unsupported_handoff_fact,
+    "handoff facts must use a supported typed handoff value"))
+
+@inline _is_handoff_fact(::AtmospherePathInputHandoff) = true
+@inline _is_handoff_fact(::CommandReplicaHandoff) = true
+@inline _is_handoff_fact(::AcquisitionOutputHandoff) = true
 @inline _is_handoff_fact(::Any) = false
 @inline _handoff_kind(::AtmospherePathInputHandoff) = UInt8(1)
 @inline _handoff_kind(::CommandReplicaHandoff) = UInt8(2)
 @inline _handoff_kind(::AcquisitionOutputHandoff) = UInt8(3)
-@inline _handoff_key(handoff::AbstractHandoffFact) =
+@inline _handoff_key(handoff::_AbstractHandoffFact) =
     (_handoff_kind(handoff), _placement_subject_key(handoff_subject(handoff)))
 
 function _canonical_handoffs(handoffs)
     snapshot = collect(handoffs)
     all(_is_handoff_fact, snapshot) || throw(PlacementError(
         :placement_facts, :invalid_handoff_fact,
-        "handoff requirements must use typed AbstractHandoffFact values"))
+        "handoff requirements must use a supported typed handoff fact"))
     sort!(snapshot; by=_handoff_key)
     for index in 2:length(snapshot)
         _handoff_key(snapshot[index - 1]) == _handoff_key(snapshot[index]) &&
@@ -752,6 +863,13 @@ struct PlacementFacts
     handoffs::Tuple
     estimate_provenance::Union{Nothing,FactProvenance}
     handoff_provenance::Union{Nothing,FactProvenance}
+
+    PlacementFacts(inventory::ResourceInventory, estimates::Tuple,
+        handoffs::Tuple,
+        estimate_provenance::Union{Nothing,FactProvenance},
+        handoff_provenance::Union{Nothing,FactProvenance},
+        ::_PlacementConstructionToken) = new(inventory, estimates, handoffs,
+        estimate_provenance, handoff_provenance)
 end
 
 function PlacementFacts(inventory::ResourceInventory, estimates=(), handoffs=())
@@ -765,7 +883,8 @@ function PlacementFacts(inventory::ResourceInventory, estimates=(), handoffs=())
             "every resource estimate must name an inventory resource"))
     return PlacementFacts(inventory, canonical_estimates, canonical_handoffs,
         _common_estimate_provenance(canonical_estimates),
-        _common_handoff_provenance(canonical_handoffs))
+        _common_handoff_provenance(canonical_handoffs),
+        _PLACEMENT_CONSTRUCTION_TOKEN)
 end
 
 placement_inventory(facts::PlacementFacts) = facts.inventory
@@ -775,34 +894,73 @@ placement_estimate_provenance(facts::PlacementFacts) = facts.estimate_provenance
 placement_handoff_provenance(facts::PlacementFacts) = facts.handoff_provenance
 
 """Output placement policy for one complete acquisition group."""
-abstract type AbstractAcquisitionOutputDisposition end
+abstract type _AbstractAcquisitionOutputDisposition end
+
+@inline _validate_resource_criticality(::RequiredResource) = nothing
+@inline _validate_resource_criticality(::OptionalResource) = nothing
+@inline _validate_resource_criticality(::AbstractResourceCriticality) =
+    throw(PlacementError(:acquisition_output_disposition,
+        :unsupported_resource_criticality,
+        "output criticality must use RequiredResource or OptionalResource"))
 
 struct DeviceReadyOutput{C<:AbstractResourceCriticality} <:
-       AbstractAcquisitionOutputDisposition
+       _AbstractAcquisitionOutputDisposition
     subject::AcquisitionOutputSubject
     criticality::C
+
+    function DeviceReadyOutput(subject::AcquisitionOutputSubject,
+        criticality::C) where {C<:AbstractResourceCriticality}
+        _validate_resource_criticality(criticality)
+        return new{C}(subject, criticality)
+    end
 end
 
-struct ConsumerOutput{C<:AbstractResourceCriticality} <:
-       AbstractAcquisitionOutputDisposition
+struct ExplicitConsumerOutput{C<:AbstractResourceCriticality} <:
+       _AbstractAcquisitionOutputDisposition
     subject::AcquisitionOutputSubject
     consumer_resource::ExecutionResourceID
     consumer_memory_domain::MemoryDomainID
     criticality::C
+
+    function ExplicitConsumerOutput(subject::AcquisitionOutputSubject,
+        consumer_resource::ExecutionResourceID,
+        consumer_memory_domain::MemoryDomainID,
+        criticality::C) where {C<:AbstractResourceCriticality}
+        _validate_resource_criticality(criticality)
+        return new{C}(subject, consumer_resource, consumer_memory_domain,
+            criticality)
+    end
 end
 
-output_subject(disposition::AbstractAcquisitionOutputDisposition) = disposition.subject
-output_criticality(disposition::AbstractAcquisitionOutputDisposition) =
-    disposition.criticality
+output_subject(disposition::DeviceReadyOutput) = disposition.subject
+output_subject(disposition::ExplicitConsumerOutput) = disposition.subject
+output_subject(::_AbstractAcquisitionOutputDisposition) = throw(PlacementError(
+    :acquisition_output_disposition, :unsupported_output_disposition,
+    "acquisition outputs must use DeviceReadyOutput or ExplicitConsumerOutput"))
+output_criticality(disposition::DeviceReadyOutput) = disposition.criticality
+output_criticality(disposition::ExplicitConsumerOutput) = disposition.criticality
+output_criticality(::_AbstractAcquisitionOutputDisposition) =
+    throw(PlacementError(:acquisition_output_disposition,
+        :unsupported_output_disposition,
+        "acquisition outputs must use DeviceReadyOutput or ExplicitConsumerOutput"))
 output_consumer_resource(::DeviceReadyOutput) = nothing
 output_consumer_memory_domain(::DeviceReadyOutput) = nothing
-output_consumer_resource(disposition::ConsumerOutput) = disposition.consumer_resource
-output_consumer_memory_domain(disposition::ConsumerOutput) =
+output_consumer_resource(disposition::ExplicitConsumerOutput) = disposition.consumer_resource
+output_consumer_memory_domain(disposition::ExplicitConsumerOutput) =
     disposition.consumer_memory_domain
+output_consumer_resource(::_AbstractAcquisitionOutputDisposition) =
+    throw(PlacementError(:acquisition_output_disposition,
+        :unsupported_output_disposition,
+        "acquisition outputs must use DeviceReadyOutput or ExplicitConsumerOutput"))
+output_consumer_memory_domain(::_AbstractAcquisitionOutputDisposition) =
+    throw(PlacementError(:acquisition_output_disposition,
+        :unsupported_output_disposition,
+        "acquisition outputs must use DeviceReadyOutput or ExplicitConsumerOutput"))
 
-@inline _is_output_disposition(::AbstractAcquisitionOutputDisposition) = true
+@inline _is_output_disposition(::DeviceReadyOutput) = true
+@inline _is_output_disposition(::ExplicitConsumerOutput) = true
 @inline _is_output_disposition(::Any) = false
-@inline _output_key(disposition::AbstractAcquisitionOutputDisposition) =
+@inline _output_key(disposition::_AbstractAcquisitionOutputDisposition) =
     _placement_subject_key(output_subject(disposition))
 
 function _canonical_output_dispositions(dispositions)
@@ -820,66 +978,98 @@ function _canonical_output_dispositions(dispositions)
 end
 
 """A concrete hard placement constraint; it cannot be weakened by a preference."""
-abstract type AbstractHardConstraint end
+abstract type _AbstractHardConstraint end
 
-struct RequireExecutionResource{S<:AbstractPlacementSubject} <: AbstractHardConstraint
+struct RequireExecutionResource{S<:_AbstractPlacementSubject} <: _AbstractHardConstraint
     subject::S
     resource::ExecutionResourceID
+
+    function RequireExecutionResource(subject::S,
+        resource::ExecutionResourceID) where {S<:_AbstractPlacementSubject}
+        _validate_placement_subject(subject)
+        return new{S}(subject, resource)
+    end
 end
 
-struct RequireMemoryDomain{S<:AbstractPlacementSubject} <: AbstractHardConstraint
+struct RequireMemoryDomain{S<:_AbstractPlacementSubject} <: _AbstractHardConstraint
     subject::S
     domain::MemoryDomainID
+
+    function RequireMemoryDomain(subject::S,
+        domain::MemoryDomainID) where {S<:_AbstractPlacementSubject}
+        _validate_placement_subject(subject)
+        return new{S}(subject, domain)
+    end
 end
 
-struct RequireCapability{S<:AbstractPlacementSubject} <: AbstractHardConstraint
+struct RequireCapability{S<:_AbstractPlacementSubject} <: _AbstractHardConstraint
     subject::S
     capability::Symbol
 
     function RequireCapability(subject::S, capability::Symbol) where {
-        S<:AbstractPlacementSubject,
+        S<:_AbstractPlacementSubject,
     }
-        return new{S}(_require_capability_subject(subject), _require_name(
+        _validate_placement_subject(subject)
+        return new{S}(subject, _require_name(
             capability, :hard_constraint, "required capability name"))
     end
 end
 
-@inline _require_capability_subject(subject::S) where {S<:AbstractPlacementSubject} = subject
-
 """A deterministic preference; it does not select a resource itself."""
-abstract type AbstractPlacementPreference end
+abstract type _AbstractPlacementPreference end
 
-struct PreferExecutionResource{S<:AbstractPlacementSubject} <:
-       AbstractPlacementPreference
+struct PreferExecutionResource{S<:_AbstractPlacementSubject} <:
+       _AbstractPlacementPreference
     subject::S
     resource::ExecutionResourceID
     rank::Int
 
     function PreferExecutionResource(subject::S, resource::ExecutionResourceID,
-        rank::Integer) where {S<:AbstractPlacementSubject}
+        rank::Integer) where {S<:_AbstractPlacementSubject}
+        _validate_placement_subject(subject)
         return new{S}(subject, resource, _checked_nonnegative_int(
             rank, :placement_preference, "preference rank"))
     end
 end
 
 """One caller-selected placement assignment, without a plan lifecycle."""
-struct ExplicitPlacementAssignment{S<:AbstractPlacementSubject}
+struct ExplicitPlacementAssignment{S<:_AbstractPlacementSubject}
     subject::S
     resource::ExecutionResourceID
+
+    function ExplicitPlacementAssignment(subject::S,
+        resource::ExecutionResourceID) where {S<:_AbstractPlacementSubject}
+        _validate_placement_subject(subject)
+        return new{S}(subject, resource)
+    end
 end
 
 placement_subject(value::ResourceEstimate) = value.subject
-placement_subject(value::AbstractAcquisitionOutputDisposition) = value.subject
-placement_subject(value::AbstractHardConstraint) = value.subject
-placement_subject(value::AbstractPlacementPreference) = value.subject
+placement_subject(value::DeviceReadyOutput) = value.subject
+placement_subject(value::ExplicitConsumerOutput) = value.subject
+placement_subject(value::RequireExecutionResource) = value.subject
+placement_subject(value::RequireMemoryDomain) = value.subject
+placement_subject(value::RequireCapability) = value.subject
+placement_subject(value::PreferExecutionResource) = value.subject
 placement_subject(value::ExplicitPlacementAssignment) = value.subject
 placement_subject(value::AtmospherePathInputHandoff) = value.destination
 placement_subject(value::CommandReplicaHandoff) = value.destination
 placement_subject(value::AcquisitionOutputHandoff) = value.source
+placement_subject(::_AbstractAcquisitionOutputDisposition) =
+    throw(PlacementError(:placement_subject, :unsupported_output_disposition,
+        "acquisition outputs must use DeviceReadyOutput or ExplicitConsumerOutput"))
+placement_subject(::_AbstractHardConstraint) =
+    throw(PlacementError(:placement_subject, :unsupported_hard_constraint,
+        "hard constraints must use a supported typed constraint"))
+placement_subject(::_AbstractPlacementPreference) =
+    throw(PlacementError(:placement_subject, :unsupported_preference,
+        "placement preferences must use PreferExecutionResource"))
 
 assigned_execution_resource(value::ExplicitPlacementAssignment) = value.resource
 
-@inline _is_hard_constraint(::AbstractHardConstraint) = true
+@inline _is_hard_constraint(::RequireExecutionResource) = true
+@inline _is_hard_constraint(::RequireMemoryDomain) = true
+@inline _is_hard_constraint(::RequireCapability) = true
 @inline _is_hard_constraint(::Any) = false
 @inline _constraint_kind(::RequireExecutionResource) = UInt8(1)
 @inline _constraint_kind(::RequireMemoryDomain) = UInt8(2)
@@ -887,7 +1077,7 @@ assigned_execution_resource(value::ExplicitPlacementAssignment) = value.resource
 @inline _constraint_name(constraint::RequireExecutionResource) = String(constraint.resource.name)
 @inline _constraint_name(constraint::RequireMemoryDomain) = String(constraint.domain.name)
 @inline _constraint_name(constraint::RequireCapability) = String(constraint.capability)
-@inline _constraint_key(constraint::AbstractHardConstraint) =
+@inline _constraint_key(constraint::_AbstractHardConstraint) =
     (_placement_subject_key(placement_subject(constraint)),
         _constraint_kind(constraint), _constraint_name(constraint))
 
@@ -895,7 +1085,7 @@ function _canonical_constraints(constraints)
     snapshot = collect(constraints)
     all(_is_hard_constraint, snapshot) || throw(PlacementError(
         :placement_policy, :invalid_hard_constraint,
-        "hard constraints must use typed AbstractHardConstraint values"))
+        "hard constraints must use a supported typed constraint"))
     sort!(snapshot; by=_constraint_key)
     for index in 2:length(snapshot)
         _constraint_key(snapshot[index - 1]) == _constraint_key(snapshot[index]) &&
@@ -905,7 +1095,7 @@ function _canonical_constraints(constraints)
     return Tuple(snapshot)
 end
 
-@inline _is_preference(::AbstractPlacementPreference) = true
+@inline _is_preference(::PreferExecutionResource) = true
 @inline _is_preference(::Any) = false
 @inline _preference_key(preference::PreferExecutionResource) =
     (_placement_subject_key(placement_subject(preference)),
@@ -915,7 +1105,7 @@ function _canonical_preferences(preferences)
     snapshot = collect(preferences)
     all(_is_preference, snapshot) || throw(PlacementError(
         :placement_policy, :invalid_preference,
-        "placement preferences must use typed AbstractPlacementPreference values"))
+        "placement preferences must use a supported typed preference"))
     sort!(snapshot; by=_preference_key)
     for index in 2:length(snapshot)
         _preference_key(snapshot[index - 1]) == _preference_key(snapshot[index]) &&
@@ -950,6 +1140,11 @@ struct PlacementPolicyValues
     preferences::Tuple
     assignments::Tuple
     output_dispositions::Tuple
+
+    PlacementPolicyValues(hard_constraints::Tuple, preferences::Tuple,
+        assignments::Tuple, output_dispositions::Tuple,
+        ::_PlacementConstructionToken) = new(hard_constraints, preferences,
+        assignments, output_dispositions)
 end
 
 function PlacementPolicyValues(; hard_constraints=(), preferences=(),
@@ -958,7 +1153,8 @@ function PlacementPolicyValues(; hard_constraints=(), preferences=(),
         _canonical_constraints(hard_constraints),
         _canonical_preferences(preferences),
         _canonical_assignments(assignments),
-        _canonical_output_dispositions(output_dispositions))
+        _canonical_output_dispositions(output_dispositions),
+        _PLACEMENT_CONSTRUCTION_TOKEN)
 end
 
 hard_constraints(values::PlacementPolicyValues) = values.hard_constraints
@@ -1026,7 +1222,7 @@ end
     return nothing
 end
 
-@inline function _validate_output_inventory(disposition::ConsumerOutput,
+@inline function _validate_output_inventory(disposition::ExplicitConsumerOutput,
     inventory::ResourceInventory)
     _require_inventory_resource(inventory, disposition.consumer_resource,
         :placement_inputs)
@@ -1048,15 +1244,12 @@ Immutable composition of placement facts and policy values. Construction only
 validates inventory references and domain ownership; it does not resolve or
 admit any assignment.
 """
-struct _PlacementInputsToken end
-const _PLACEMENT_INPUTS_TOKEN = _PlacementInputsToken()
-
 struct PlacementInputs
     facts::PlacementFacts
     policy::PlacementPolicyValues
 
     PlacementInputs(facts::PlacementFacts, policy::PlacementPolicyValues,
-        ::_PlacementInputsToken) = new(facts, policy)
+        ::_PlacementConstructionToken) = new(facts, policy)
 end
 
 function PlacementInputs(facts::PlacementFacts, policy::PlacementPolicyValues)
@@ -1074,7 +1267,7 @@ function PlacementInputs(facts::PlacementFacts, policy::PlacementPolicyValues)
     for disposition in acquisition_output_dispositions(policy)
         _validate_output_inventory(disposition, inventory)
     end
-    return PlacementInputs(facts, policy, _PLACEMENT_INPUTS_TOKEN)
+    return PlacementInputs(facts, policy, _PLACEMENT_CONSTRUCTION_TOKEN)
 end
 
 placement_facts(inputs::PlacementInputs) = inputs.facts
