@@ -9,6 +9,7 @@ const TEST_GROUP_FILES = (
     "ports" => "ports.jl",
     "serial" => "serial.jl",
     "execution" => "execution.jl",
+    "placement" => "placement.jl",
     "quality" => "quality.jl",
 )
 

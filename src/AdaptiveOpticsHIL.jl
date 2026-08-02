@@ -13,8 +13,9 @@ include("lifecycle.jl")
 include("ports.jl")
 include("execution.jl")
 include("serial.jl")
+include("placement.jl")
 
 export AdaptiveOpticsHILError, Execution, Lifecycle, Ownership, Ports, Serial
-export Timing
+export Timing, Placement
 
 end

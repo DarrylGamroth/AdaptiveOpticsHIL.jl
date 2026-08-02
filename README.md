@@ -158,6 +158,48 @@ completion-fault injection is not generalized by this transport-neutral
 package; hardware/backend tests must provide it where the vendor runtime
 supports a controlled fault.
 
+## Static placement inputs
+
+`AdaptiveOpticsHIL.Placement` defines the cold, immutable values that a later
+Gate 9A planner consumes. It deliberately does not discover hardware, choose
+an assignment, allocate transfer storage, bind Agent owners, or arm a run.
+The root exports only the `Placement` namespace; its API remains qualified.
+
+```julia
+using AdaptiveOpticsHIL.Placement
+
+provenance = FactProvenance(:prepared_core_facts, 1)
+cpu_id = ExecutionResourceID(:cpu)
+cpu = ExecutionResource(
+    cpu_id,
+    CPUExecutionResource(),
+    :host_cpu,
+    MemoryDomain(MemoryDomainID(:host_memory), cpu_id,
+        KnownMemoryBytes(32 * 1024^3), KnownMemoryBytes(4 * 1024^3)),
+    CPUWorkerFacts(8, NUMANodeID(0)),
+    CapabilitySnapshot(provenance, [
+        TargetCapability(:full_optical, CapabilitySupported()),
+    ]))
+inventory = ResourceInventory([cpu])
+```
+
+An inventory keeps canonical, caller-independent snapshots of resource and
+memory-domain identities, supplied CPU/NUMA or accelerator-context facts,
+reserved coordination contexts, and exact capability provenance.
+`UnknownMemoryBytes()` and `CapabilityUnknown()` are explicit values, never
+optimistic zero-capacity or supported defaults. A Gate 9A inventory can
+contain CPU resources and at most one accelerator, without assuming a backend
+family.
+
+`PlacementFacts` then snapshots resource estimates and abstract requirements
+for atmosphere-path input, command-replica, and acquisition-output handoffs.
+`PlacementPolicyValues` snapshots typed hard constraints, ranked preferences,
+explicit assignments, and required/optional output dispositions. Every
+collection is canonically ordered by stable identities, so input collection
+order cannot affect the future plan. The next Gate 9A issue owns deterministic
+planning, admission, handoff derivation, and plan identity; this value layer
+does not expose an unadmitted plan or an implicit host fallback.
+
 ## RTC-facing ports
 
 `AdaptiveOpticsHIL.Ports` composes the bounded primitives into three canonical
