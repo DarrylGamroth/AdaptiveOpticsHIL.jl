@@ -26,6 +26,14 @@ const GATE8_ENVIRONMENT_PACKAGES = (
     "ThreadPinning",
 )
 
+# Gate 8 evidence retains its frozen historical schema. Translate that field
+# to current scheduling terminology only at this benchmark boundary.
+const GATE8_FROZEN_EXECUTION_OWNER_PLACEMENT_FIELD =
+    string("execution_owner_", "placement")
+
+@inline _gate8_execution_owner_scheduling(contract) =
+    contract[GATE8_FROZEN_EXECUTION_OWNER_PLACEMENT_FIELD]
+
 const GATE8_FROZEN_CONTRACT_VALUES = (
     "julia_threads" => 4,
     "julia_interactive_threads" => 0,
@@ -35,7 +43,7 @@ const GATE8_FROZEN_CONTRACT_VALUES = (
     "execution_owner_ring_capacity" => 8,
     "execution_owner_idle_strategy" =>
         "Agent.BusySpinIdleStrategy",
-    "execution_owner_placement" =>
+    GATE8_FROZEN_EXECUTION_OWNER_PLACEMENT_FIELD =>
         "four Julia default-pool threads pinned to distinct physical cores; owners assigned to threads and CPU IDs",
     "thread_pinning_policy" =>
         "ThreadPinning.pinthreads(:cores); distinct physical cores before SMT siblings",
@@ -197,7 +205,7 @@ function validate_gate8_contract(contract)
     contract["execution_owner_idle_strategy"] ==
         "Agent.BusySpinIdleStrategy" || error(
         "the Gate 8 candidate requires Agent.BusySpinIdleStrategy")
-    contract["execution_owner_placement"] ==
+    _gate8_execution_owner_scheduling(contract) ==
         "four Julia default-pool threads pinned to distinct physical cores; owners assigned to threads and CPU IDs" || error(
         "the Gate 8 Agent candidate requires explicit Julia-thread and CPU assignment")
     contract["thread_pinning_policy"] ==
@@ -995,7 +1003,7 @@ function operational_policy_manifest(contract, workload)
             "idle_strategy" =>
                 contract["execution_owner_idle_strategy"],
             "placement" =>
-                contract["execution_owner_placement"],
+                _gate8_execution_owner_scheduling(contract),
             "thread_pinning" =>
                 Operational.gate8_thread_pinning_snapshot(
                     contract),

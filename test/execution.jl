@@ -30,8 +30,8 @@ const EXECUTION_TEST_SHUTDOWN_POLICY = RunShutdownPolicy(
     drain_timeout_ns=2_000_000_000)
 
 struct ExecutionTestUnsupportedMode <: AbstractExecutionOwnerMode end
-struct ExecutionTestUnsupportedPlacement <:
-    AbstractExecutionOwnerPlacement end
+struct ExecutionTestUnsupportedScheduling <:
+    AbstractExecutionOwnerScheduling end
 struct ExecutionTestUnsupportedIdle end
 (::ExecutionTestUnsupportedIdle)() = nothing
 
@@ -857,11 +857,11 @@ end
         AdaptiveOpticsHIL.Execution._new_agent_idle_strategy(
             default_agent_mode),
     ) isa YieldingIdleStrategy
-    @test default_agent_mode.placement isa
-        SchedulerManagedExecutionOwnerPlacement
+    @test default_agent_mode.scheduling isa
+        SchedulerManagedExecutionOwnerScheduling
     @test_throws ExecutionOwnerError AdaptiveOpticsHIL.Execution.
-        _validate_execution_owner_placement(
-            ExecutionTestUnsupportedPlacement())
+        _validate_execution_owner_scheduling(
+            ExecutionTestUnsupportedScheduling())
     name_probe = AdaptiveOpticsHIL.Execution._ExecutionOwnerAgent(
         nothing,
         1,
@@ -872,41 +872,41 @@ end
     @test Agent.name(name_probe) == "execution-test-owner"
     @test_throws AgentTerminationException Agent.on_error(
         name_probe, AgentTerminationException())
-    assigned_placement =
-        ThreadAssignedExecutionOwnerPlacement((2, 3))
-    @test assigned_placement.thread_ids == (2, 3)
-    @test assigned_placement.cpu_ids === nothing
-    pinned_placement = ThreadAssignedExecutionOwnerPlacement(
+    assigned_scheduling =
+        ThreadAssignedExecutionOwnerScheduling((2, 3))
+    @test assigned_scheduling.thread_ids == (2, 3)
+    @test assigned_scheduling.cpu_ids === nothing
+    pinned_scheduling = ThreadAssignedExecutionOwnerScheduling(
         (2, 3); cpu_ids=(4, 5))
-    @test pinned_placement.cpu_ids == (4, 5)
-    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerPlacement(())
-    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerPlacement([2, 3])
-    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerPlacement((2, 2))
-    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerPlacement(
+    @test pinned_scheduling.cpu_ids == (4, 5)
+    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerScheduling(())
+    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerScheduling([2, 3])
+    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerScheduling((2, 2))
+    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerScheduling(
         (2, 2), nothing)
-    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerPlacement((true,))
-    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerPlacement((2, "3"))
-    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerPlacement(
+    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerScheduling((true,))
+    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerScheduling((2, "3"))
+    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerScheduling(
         (2, 3); cpu_ids=(4,))
-    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerPlacement(
+    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerScheduling(
         (2, 3), (4,))
-    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerPlacement(
+    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerScheduling(
         (2, 3); cpu_ids=(4, 4))
-    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerPlacement(
+    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerScheduling(
         (2, 3); cpu_ids=(true, false))
-    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerPlacement(
+    @test_throws ExecutionOwnerError ThreadAssignedExecutionOwnerScheduling(
         (2, 3); cpu_ids=(4, "5"))
     if Base.get_extension(
             Agent, :AgentThreadPinningExt) === nothing
         missing_pinning_runner = AgentRunner(
             YieldingIdleStrategy(), nothing)
-        missing_pinning_placement =
-            ThreadAssignedExecutionOwnerPlacement(
+        missing_pinning_scheduling =
+            ThreadAssignedExecutionOwnerScheduling(
                 (Threads.threadid(),); cpu_ids=(0,))
         @test_throws ArgumentError AdaptiveOpticsHIL.Execution.
             _start_execution_owner_runner(
                 missing_pinning_runner,
-                missing_pinning_placement,
+                missing_pinning_scheduling,
                 1,
             )
         @test !Agent.is_started(missing_pinning_runner)
@@ -1210,7 +1210,7 @@ end
     @test missing_error isa ExecutionOwnerError
     @test missing_error.reason ==
         :missing_deterministic_completion
-    @test execution_owner_placement(missing_executor) === nothing
+    @test execution_owner_scheduling(missing_executor) === nothing
 
     capacity = execution_test_fixture()
     capacity_executor = prepare_execution_test_executor(
@@ -1745,32 +1745,32 @@ end
     if Threads.nthreads() < 4
         @test_skip "three overlapping owners require four Julia threads"
     else
-        placement_fixture = execution_test_fixture()
-        placement_error = captured_execution_test_error() do
+        scheduling_fixture = execution_test_fixture()
+        scheduling_error = captured_execution_test_error() do
             AdaptiveOpticsHIL.Execution._prepare_optical_execution(
                 execution_test_owner_configuration(
                     AgentExecutionOwners(
-                        placement=
-                            ThreadAssignedExecutionOwnerPlacement(
+                        scheduling=
+                            ThreadAssignedExecutionOwnerScheduling(
                                 execution_test_assigned_threads(2)));
                     outer_owner_count=3,
                 ),
-                placement_fixture.prepared,
-                placement_fixture.state,
-                placement_fixture.workspace,
+                scheduling_fixture.prepared,
+                scheduling_fixture.state,
+                scheduling_fixture.workspace,
                 RunSessionID(0x8a01),
                 EXECUTION_TEST_SHUTDOWN_POLICY,
             )
         end
-        @test placement_error isa ExecutionOwnerError
-        @test placement_error.reason ==
-            :owner_placement_cardinality
+        @test scheduling_error isa ExecutionOwnerError
+        @test scheduling_error.reason ==
+            :owner_scheduling_cardinality
 
         unstable_coordinator_reason = fetch(Threads.@spawn begin
             unstable_error = captured_execution_test_error() do
                 AdaptiveOpticsHIL.Execution.
                     _validate_execution_owner_coordinator_context(
-                        ThreadAssignedExecutionOwnerPlacement(
+                        ThreadAssignedExecutionOwnerScheduling(
                             (Threads.threadid(),)))
             end
             return unstable_error.reason
@@ -1788,8 +1788,8 @@ end
                 AdaptiveOpticsHIL.Execution._prepare_optical_execution(
                     execution_test_owner_configuration(
                         AgentExecutionOwners(
-                            placement=
-                                ThreadAssignedExecutionOwnerPlacement(
+                            scheduling=
+                                ThreadAssignedExecutionOwnerScheduling(
                                     (Threads.threadid(),)));
                         outer_owner_count=1,
                     ),
@@ -1869,7 +1869,7 @@ end
             agent_fixture,
             AgentExecutionOwners(
                 () -> BackoffIdleStrategy(32, 4, 1_000, 50_000);
-                placement=ThreadAssignedExecutionOwnerPlacement(
+                scheduling=ThreadAssignedExecutionOwnerScheduling(
                     execution_test_assigned_threads(3)));
             outer_owner_count=3,
             session=RunSessionID(0x8a02),
@@ -1881,9 +1881,9 @@ end
         )
         @test execution_owner_idle_strategy_factory(
             agent_executor)().max_spins == 32
-        @test execution_owner_placement(
+        @test execution_owner_scheduling(
             agent_executor) isa
-            ThreadAssignedExecutionOwnerPlacement
+            ThreadAssignedExecutionOwnerScheduling
         agent_serial_count = run_plant_events_until!(
             agent_serial.prepared,
             agent_serial.state,

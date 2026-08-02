@@ -11,6 +11,22 @@ const CANONICAL_ADAPTIVE_OPTICS_SIM_NAMESPACES = Set((
     "Plant",
 ))
 
+const ADAPTIVE_OPTICS_HIL_ROOT_EXPORTS = Set((
+    :AdaptiveOpticsHIL,
+    :AdaptiveOpticsHILError,
+    :Execution,
+    :Lifecycle,
+    :Ownership,
+    :Ports,
+    :Serial,
+    :Timing,
+))
+
+@testset "AdaptiveOpticsHIL root exports" begin
+    @test Set(names(AdaptiveOpticsHIL)) ==
+        ADAPTIVE_OPTICS_HIL_ROOT_EXPORTS
+end
+
 function adaptive_optics_sim_surface_files()
     root = normpath(joinpath(@__DIR__, ".."))
     files = [joinpath(root, "README.md")]
