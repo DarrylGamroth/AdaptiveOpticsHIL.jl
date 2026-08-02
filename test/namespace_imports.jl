@@ -17,6 +17,7 @@ const ADAPTIVE_OPTICS_HIL_ROOT_EXPORTS = Set((
     :Execution,
     :Lifecycle,
     :Ownership,
+    :Placement,
     :Ports,
     :Serial,
     :Timing,
