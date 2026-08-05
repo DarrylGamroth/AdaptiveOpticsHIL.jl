@@ -476,7 +476,7 @@ function EXECUTION_TEST_PLANT.prepare_acquisition_provider(
     result = EXECUTION_TEST_PLANT.path_result(path)
     T = eltype(result.values)
     detector = Detector(
-        integration_time=T(model.exposure_s),
+        exposure_duration=T(model.exposure_s),
         noise=NoiseNone(),
         qe=one(T),
         gain=one(T),
