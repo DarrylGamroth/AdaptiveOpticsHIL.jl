@@ -519,7 +519,7 @@ function execution_test_fixture(;
         L0=T(25),
         fractional_cn2=T[0.7, 0.3],
         wind_speed=T[7, 11],
-        wind_direction=T[20, 125],
+        wind_direction_deg=T[20, 125],
         altitude=T[0, 5_000],
         layer_ids=(:ground, :high),
         T=T,
