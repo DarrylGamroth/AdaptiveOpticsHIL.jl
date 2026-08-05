@@ -9,7 +9,7 @@ Agent = "f7939a7f-2bcc-4096-952b-c44031b5533b"
 Clocks = "6b5ade5d-6e95-4584-b343-73eec2e8782b"
 
 [sources]
-AdaptiveOpticsSim = {url = "https://github.com/DarrylGamroth/AdaptiveOpticsSim.jl.git", rev = "f12ae7beceaf460fb6953d4bb07874be5197d4ff"}
+AdaptiveOpticsSim = {url = "https://github.com/DarrylGamroth/AdaptiveOpticsSim.jl.git", rev = "702e368d18807c65882732bf937c078289e2331e"}
 Agent = {url = "https://github.com/DarrylGamroth/Agent.jl.git", rev = "71e3af4e5c112f0433e03d57a570bc74ffd05ccc"}
 Clocks = {url = "https://github.com/DarrylGamroth/Clocks.jl.git", rev = "1b705421648b70b6d171f8a95d6c2d16c2444d0b"}
 
